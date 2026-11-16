@@ -1013,6 +1013,22 @@ impl EventHandler {
                     );
                 }
 
+                // Same for the block commitment root, which replay handles
+                // exactly like a bank hash mismatch.
+                if bank.is_frozen()
+                    && bank.block_id() == Some(block.block_id)
+                    && let Err((expected_root, computed_root)) = bank.verify_commitment_root()
+                {
+                    panic!(
+                        "{my_pubkey}: Block {block:?} has been finalized, however we have a \
+                         commitment root mismatch. The cluster commitment root is {expected_root} \
+                         however we computed {computed_root}. At this point we will be unable to \
+                         recover. Ensure that you are running a supported Agave version for this \
+                         cluster, and restart from a snapshot > {}.",
+                        block.slot
+                    );
+                }
+
                 // Check if this block is rootable
                 (block.slot > old_root
                     && vctx.vote_history.voted(block.slot)
