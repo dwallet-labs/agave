@@ -45,6 +45,7 @@ solana-transaction = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+agave-feature-set = { workspace = true }
 agave-logger = { path = "../logger", features = ["agave-unstable-api"] }
 bencher = { workspace = true }
 rand = { workspace = true }

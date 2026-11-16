@@ -22,7 +22,9 @@ use {
     },
     crossbeam_channel::{Receiver, Sender, select_biased},
     solana_clock::Slot,
-    solana_entry::block_component::{BlockFooterV1, UpdateParentV1, VersionedBlockMarker},
+    solana_entry::block_component::{
+        BlockFooterV1, UpdateParentV1, VersionedBlockFooter, VersionedBlockMarker,
+    },
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
     solana_ledger::{
@@ -552,13 +554,15 @@ fn skew_block_producer_time_nanos(
 }
 
 /// Produces a block footer with the current timestamp; version; reward certs; and finalization cert.
-/// The bank_hash field is left as default and will be filled in after the bank freezes.
+/// The bank_hash field is left as default and will be filled in after the bank freezes. When the
+/// block commitment root feature is active the footer is V2, and its commitment_root is likewise
+/// left as default and filled in after the bank freezes.
 fn produce_block_footer(
     bank: &Bank,
     skip_reward_cert: Option<SkipRewardCertificate>,
     notar_reward_cert: Option<NotarRewardCertificate>,
     highest_finalized: Option<&ValidatedBlockFinalizationCert>,
-) -> BlockFooterV1 {
+) -> VersionedBlockFooter {
     let mut block_producer_time_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Misconfigured system clock; couldn't measure block producer time.")
@@ -586,14 +590,15 @@ fn produce_block_footer(
     let block_final_cert =
         highest_finalized.map(ValidatedBlockFinalizationCert::to_block_final_cert);
 
-    BlockFooterV1 {
+    let footer = BlockFooterV1 {
         bank_hash: Hash::default(),
         block_producer_time_nanos: block_producer_time_nanos as u64,
         block_user_agent: format!("agave/{}", version!()).into_bytes(),
         block_final_cert,
         skip_reward_cert,
         notar_reward_cert,
-    }
+    };
+    VersionedBlockFooter::new_for_feature(footer, bank.is_block_commitment_root_active())
 }
 
 fn produce_first_slot(
@@ -931,7 +936,7 @@ fn record_and_complete_block(
 
         let vote_account_update_stats = BlockComponentProcessor::update_bank_with_footer_fields(
             &bank,
-            i64::try_from(footer.block_producer_time_nanos)
+            i64::try_from(footer.block_producer_time_nanos())
                 .expect("locally produced block timestamp must fit in i64"),
             None, // Banks we produce do not need the bank hash mismatch check
             reward_cert,

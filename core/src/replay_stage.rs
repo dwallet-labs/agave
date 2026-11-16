@@ -1558,6 +1558,33 @@ impl ReplayStage {
                     continue;
                 }
 
+                // Block Commitment Root: a commitment root in the footer that
+                // differs from ours makes the block dead, as a bank hash
+                // mismatch does. Leader blocks carry no expected value.
+                if let Err((expected_root, computed_root)) = bank.verify_commitment_root() {
+                    warn!(
+                        "For slot {bank_slot} the leader said the commitment root should be: \
+                         {expected_root} however we computed: {computed_root}",
+                    );
+                    datapoint_warn!(
+                        "commitment_root_mismatch",
+                        ("slot", bank_slot, i64),
+                        ("expected", expected_root.to_string(), String),
+                        ("computed", computed_root.to_string(), String),
+                    );
+                    mark_replay_dead_slot(
+                        bank,
+                        &BlockstoreProcessorError::CommitmentRootMismatch(
+                            bank_slot,
+                            expected_root,
+                            computed_root,
+                        ),
+                        progress,
+                        &process_active_banks_context.dead_slot_context(),
+                    );
+                    continue;
+                }
+
                 let r_replay_stats = completed_replay.replay_stats.read().unwrap();
                 let r_replay_progress = completed_replay.replay_progress.read().unwrap();
                 debug!(
