@@ -1,3 +1,4 @@
+pub use crate::transaction_receipt::ReceiptRoots;
 use {
     crate::account_loader::LoadedTransaction,
     solana_message::inner_instruction::InnerInstructionsList,
@@ -37,6 +38,10 @@ pub struct TransactionExecutionDetails {
     /// deltas related to total account data size changes for this transaction.
     /// NOTE: set to None IFF `status` is not `Ok`.
     pub accounts_deltas: Option<AccountsDeltas>,
+    /// `instruction_trace_root` and `events_root` of the transaction's
+    /// receipt. Set IFF `status` is `Ok` and receipt roots were requested
+    /// (`TransactionProcessingConfig::compute_receipt_roots`).
+    pub receipt_roots: Option<ReceiptRoots>,
 }
 
 impl TransactionExecutionDetails {

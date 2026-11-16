@@ -1,6 +1,6 @@
 use {
     crate::{
-        bank::{Bank, BankId, TransactionBalancesSet},
+        bank::{Bank, BankId, ReceiptOrder, TransactionBalancesSet},
         dependency_tracker::DependencyTracker,
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_balances::compile_collected_balances,
@@ -127,6 +127,10 @@ pub fn execute_batch<'a>(
             ExecutionRecordingConfig::new_single_setting(transaction_status_sender.is_some()),
             timings,
             log_messages_bytes_limit,
+            // Replay: the indexes are the positions of the transactions in
+            // the slot's entries, so receipts are in block order whatever the
+            // order in which the scheduler commits batches.
+            ReceiptOrder::BlockPositions(&transaction_indexes),
             pre_commit_callback,
         )?;
 

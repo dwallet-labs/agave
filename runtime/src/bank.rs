@@ -258,6 +258,9 @@ pub(crate) mod partitioned_epoch_rewards;
 mod recent_blockhashes_account;
 mod sysvar_cache;
 pub(crate) mod tests;
+pub mod transaction_receipts;
+
+pub use transaction_receipts::ReceiptOrder;
 
 pub const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
 const INITIAL_RATE: u64 = 80_000_000_000_000;
@@ -718,6 +721,7 @@ impl PartialEq for Bank {
             expected_bank_hash: _,
             block_commitment,
             expected_commitment_root: _,
+            transaction_receipts: _,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
             block_component_processor: _,
@@ -1027,6 +1031,11 @@ pub struct Bank {
     /// processing the footer; verified once the bank is frozen.
     expected_commitment_root: RwLock<Option<Hash>>,
 
+    /// Receipts of the transactions committed to this bank (Transaction
+    /// Receipt Tree), filled only while the `transaction_receipt_tree`
+    /// feature is active. Not part of snapshots: a snapshot bank is frozen.
+    transaction_receipts: transaction_receipts::ReceiptAccumulator,
+
     /// Accounts stats for computing the bank hash
     bank_hash_stats: AtomicBankHashStats,
 
@@ -1088,10 +1097,16 @@ impl TxExecutionGuard<'_> {
         sanitized_txs: &[impl TransactionWithMeta],
         processing_results: Vec<TransactionProcessingResult>,
         processed_counts: &ProcessedTransactionCounts,
+        receipt_order: ReceiptOrder,
         timings: &mut ExecuteTimings,
     ) -> Vec<TransactionCommitResult> {
-        self.bank
-            .commit_transactions(sanitized_txs, processing_results, processed_counts, timings)
+        self.bank.commit_transactions(
+            sanitized_txs,
+            processing_results,
+            processed_counts,
+            receipt_order,
+            timings,
+        )
     }
 }
 
@@ -1296,6 +1311,7 @@ impl Bank {
             expected_bank_hash: RwLock::new(None),
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
+            transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -1547,6 +1563,7 @@ impl Bank {
             expected_bank_hash: RwLock::new(None),
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
+            transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -2309,6 +2326,7 @@ impl Bank {
             expected_bank_hash: RwLock::new(None),
             block_commitment: RwLock::new(fields.block_commitment),
             expected_commitment_root: RwLock::new(None),
+            transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
             is_alpenglow: AtomicBool::new(false),
             transaction_execution_gate: CachePadded::new(TransactionExecutionGate::default()),
@@ -4097,6 +4115,8 @@ impl Bank {
                 strict_nonce_size_check: true,
                 drop_noop_transactions: true,
                 drop_bail_out_transactions: true,
+                // Set from the feature set in `do_load_and_execute_transactions`.
+                compute_receipt_roots: false,
             },
         );
 
@@ -4294,9 +4314,12 @@ impl Bank {
         max_age: usize,
         timings: &mut ExecuteTimings,
         error_counters: &mut TransactionErrorMetrics,
-        processing_config: TransactionProcessingConfig,
+        mut processing_config: TransactionProcessingConfig,
     ) -> LoadAndExecuteTransactionsOutput {
         let sanitized_txs = batch.sanitized_transactions();
+        // Decided here, from the bank's feature set, so that block production
+        // and replay always agree.
+        processing_config.compute_receipt_roots = self.is_transaction_receipt_tree_active();
 
         let (check_results, check_us) = measure_us!(self.check_transactions_before_execution(
             sanitized_txs,
@@ -4582,11 +4605,14 @@ impl Bank {
         self.bank_hash_stats.accumulate(&stats);
     }
 
+    /// Commits the results of a batch. `receipt_order` places the batch's
+    /// transaction receipts in the block (see [`ReceiptOrder`]).
     pub fn commit_transactions(
         &self,
         sanitized_txs: &[impl TransactionWithMeta],
         processing_results: Vec<TransactionProcessingResult>,
         processed_counts: &ProcessedTransactionCounts,
+        receipt_order: ReceiptOrder,
         timings: &mut ExecuteTimings,
     ) -> Vec<TransactionCommitResult> {
         assert!(
@@ -4674,6 +4700,8 @@ impl Bank {
             measure_us!(self.update_transaction_statuses(sanitized_txs, &processing_results));
 
         self.filter_program_errors_and_collect_fee_details(&processing_results);
+
+        self.accumulate_transaction_receipts(sanitized_txs, &processing_results, receipt_order);
 
         timings.saturating_add_in_place(ExecuteTimingType::StoreUs, store_accounts_us);
         timings.saturating_add_in_place(
@@ -4804,17 +4832,21 @@ impl Bank {
             recording_config,
             timings,
             log_messages_bytes_limit,
+            ReceiptOrder::CommitOrder,
             None::<fn(&_) -> _>,
         )
         .unwrap()
     }
 
+    /// Like [`Self::load_execute_and_commit_transactions`], for replay:
+    /// `receipt_order` places the receipts of the batch in the block.
     pub fn load_execute_and_commit_transactions_with_pre_commit_callback(
         &self,
         batch: &TransactionBatch<impl TransactionWithMeta>,
         recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         log_messages_bytes_limit: Option<usize>,
+        receipt_order: ReceiptOrder,
         pre_commit_callback: impl FnOnce(&[TransactionProcessingResult]) -> Result<()>,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
@@ -4822,6 +4854,7 @@ impl Bank {
             recording_config,
             timings,
             log_messages_bytes_limit,
+            receipt_order,
             Some(pre_commit_callback),
         )
     }
@@ -4832,6 +4865,7 @@ impl Bank {
         recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         log_messages_bytes_limit: Option<usize>,
+        receipt_order: ReceiptOrder,
         pre_commit_callback: Option<impl FnOnce(&[TransactionProcessingResult]) -> Result<()>>,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         let execution_guard = self.try_enter_transaction_execution();
@@ -4855,6 +4889,8 @@ impl Bank {
                     strict_nonce_size_check: false,
                     drop_noop_transactions: false,
                     drop_bail_out_transactions: false,
+                    // Set from the feature set in `do_load_and_execute_transactions`.
+                    compute_receipt_roots: false,
                 },
             )
         } else {
@@ -4870,6 +4906,7 @@ impl Bank {
                 batch.sanitized_transactions(),
                 processing_results,
                 &processed_counts,
+                receipt_order,
                 timings,
             )
         } else {

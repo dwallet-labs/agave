@@ -375,6 +375,8 @@ impl Consumer {
                     strict_nonce_size_check: true,
                     drop_noop_transactions: true,
                     drop_bail_out_transactions: true,
+                    // Set by the bank from its feature set.
+                    compute_receipt_roots: false,
                 }
             ));
         execute_and_commit_timings.load_execute_us = load_execute_us;
@@ -762,6 +764,94 @@ mod tests {
         bank.store_account(&account_address, &account);
 
         account
+    }
+
+    /// Transaction Receipt Tree, block production: several workers record and
+    /// commit batches concurrently, so commit order is not block order. The
+    /// receipts must follow the order in which the batches were recorded
+    /// (the order of the entries in the block): the same as executing the
+    /// recorded transactions one by one in that order.
+    #[test]
+    fn test_leader_receipts_in_record_order() {
+        const NUM_WORKERS: usize = 4;
+        const BATCHES_PER_WORKER: usize = 8;
+        const TXS_PER_BATCH: usize = 2;
+
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        for feature_id in [
+            agave_feature_set::block_commitment_root::id(),
+            agave_feature_set::transaction_receipt_tree::id(),
+        ] {
+            solana_runtime::genesis_utils::activate_feature(&mut genesis_config, feature_id);
+        }
+        let num_txs = NUM_WORKERS * BATCHES_PER_WORKER * TXS_PER_BATCH;
+        let payers: Vec<_> = (0..num_txs).map(|_| Keypair::new()).collect();
+        for payer in &payers {
+            genesis_config.add_account(
+                payer.pubkey(),
+                AccountSharedData::empty(1_000_000, &system_program::id()),
+            );
+        }
+        let (bank, _bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        assert!(bank.is_transaction_receipt_tree_active());
+        let blockhash = bank.last_blockhash();
+        let txs: Vec<_> = payers
+            .iter()
+            .enumerate()
+            .map(|(i, payer)| {
+                // Some transfers fail and are still recorded and committed.
+                let lamports = if i % 7 == 6 { 2_000_000 } else { 1_000 };
+                system_transaction::transfer(payer, &Pubkey::new_unique(), lamports, blockhash)
+            })
+            .collect();
+
+        // The validator always tracks transaction indexes.
+        let (record_sender, mut record_receiver) = record_channels(true);
+        record_receiver.restart(bank.bank_id());
+        let recorder = TransactionRecorder::new(record_sender);
+        std::thread::scope(|scope| {
+            for worker_txs in txs.chunks(BATCHES_PER_WORKER * TXS_PER_BATCH) {
+                let consumer = Consumer::new(Committer::new(None, None), recorder.clone(), None);
+                let bank = bank.clone();
+                scope.spawn(move || {
+                    for batch in worker_txs.chunks(TXS_PER_BATCH) {
+                        let output = consumer.process_and_record_transactions(
+                            &bank,
+                            &sanitize_transactions(batch.to_vec()),
+                        );
+                        assert!(
+                            output
+                                .execute_and_commit_transactions_output
+                                .commit_transactions_result
+                                .is_ok()
+                        );
+                    }
+                });
+            }
+        });
+        record_receiver.shutdown();
+        let recorded: Vec<VersionedTransaction> = record_receiver
+            .drain()
+            .flat_map(|record| record.transactions)
+            .collect();
+        assert_eq!(recorded.len(), num_txs);
+
+        let receipts = bank.transaction_receipt_leaf_hashes();
+        assert_eq!(receipts.len(), num_txs);
+
+        let reference = Bank::new_for_tests(&genesis_config);
+        for tx in recorded {
+            let _ = reference.process_entry_transactions(vec![tx]);
+        }
+        assert_eq!(receipts, reference.transaction_receipt_leaf_hashes());
+        assert_eq!(bank.receipts_root(), reference.receipts_root());
     }
 
     #[test]
