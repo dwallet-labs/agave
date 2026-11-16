@@ -83,6 +83,7 @@ pub struct FeatureSnapshot {
     pub invoke_signed_v2: bool,
     pub loaderv3_programdata_size_floor: bool,
     pub block_commitment_root: bool,
+    pub accounts_delta_root: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -189,6 +190,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             invoke_signed_v2: is_active(&invoke_signed_v2::ID),
             loaderv3_programdata_size_floor: is_active(&loaderv3_programdata_size_floor::ID),
             block_commitment_root: is_active(&block_commitment_root::ID),
+            accounts_delta_root: is_active(&accounts_delta_root::ID),
         }
     }
 }
@@ -1622,6 +1624,17 @@ pub mod block_commitment_root {
     solana_pubkey::declare_id!("Hp4uawW6zBVP4aeue5A5tNFiPopvRMwCS8pp3E8BaszE");
 }
 
+/// Accounts Delta Root (draft SIMD, number not yet assigned).
+///
+/// Commits to the post-block state of every account changed in the block
+/// with `accounts_delta_root`, slot 2 of the commitment vector of
+/// `block_commitment_root`. Has no effect unless `block_commitment_root` is
+/// also active. Placeholder key: replace with the real feature key once the
+/// SIMD is accepted.
+pub mod accounts_delta_root {
+    solana_pubkey::declare_id!("8RSGq3ZhGWtbeSpgACfMWj91qHh8BQYZQ44xwbsmSKTJ");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2771,6 +2784,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             block_commitment_root::id(),
             "SIMD-XXXX: Block commitment root",
+        ),
+        (
+            accounts_delta_root::id(),
+            "SIMD-XXXX: Accounts delta root",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
