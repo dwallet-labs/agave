@@ -24,12 +24,26 @@ use {
 /// the conversion allocates nothing. The exhaustive destructuring below is
 /// deliberate: if a field is added to any of the internal types, this stops
 /// compiling instead of silently dropping data on the plugin boundary.
+///
+/// TODO(simd-block-commitment-root): the plugin interface
+/// (`agave-geyser-plugin-interface`, an external crate) has no footer V2 yet.
+/// Until it gains one, a V2 footer is passed to plugins as its V1 fields and
+/// its `commitment_root` is not exposed.
 fn convert_block_footer(
     footer: &block_component::VersionedBlockFooter,
 ) -> block_footer::VersionedBlockFooter<'_> {
     match footer {
         block_component::VersionedBlockFooter::V1(block_component::BlockFooterV1 {
             bank_hash,
+            block_producer_time_nanos,
+            block_user_agent,
+            block_final_cert,
+            skip_reward_cert,
+            notar_reward_cert,
+        })
+        | block_component::VersionedBlockFooter::V2(block_component::BlockFooterV2 {
+            bank_hash,
+            commitment_root: _,
             block_producer_time_nanos,
             block_user_agent,
             block_final_cert,

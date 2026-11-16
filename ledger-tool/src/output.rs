@@ -17,8 +17,8 @@ use {
     },
     solana_clock::{Slot, UnixTimestamp},
     solana_entry::block_component::{
-        BlockComponent, BlockFooterV1, BlockMarkerV1, VersionedBlockFooter, VersionedBlockHeader,
-        VersionedBlockMarker, VersionedUpdateParent,
+        BlockComponent, BlockFooterV1, BlockMarkerV1, VersionedBlockHeader, VersionedBlockMarker,
+        VersionedUpdateParent,
     },
     solana_hash::Hash,
     solana_ledger::{
@@ -307,6 +307,9 @@ pub struct CliNotarRewards {
 #[serde(rename_all = "camelCase")]
 pub struct CliPopulatedFooter {
     bank_hash: String,
+    /// Present for footer version 2 (Block Commitment Root).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    commitment_root: Option<String>,
     block_producer_time_nanos: u64,
     block_user_agent: String,
     final_cert: Option<CliFinalCert>,
@@ -562,9 +565,9 @@ fn cli_populated_block_marker_from(
     let VersionedBlockMarker::V1(block_marker) = marker;
     match block_marker {
         BlockMarkerV1::BlockFooter(footer) => {
-            let VersionedBlockFooter::V1(footer) = footer.into_inner();
+            let (footer, commitment_root) = footer.into_inner().into_v1_and_commitment_root();
             Ok(CliPopulatedBlockMarker::BlockFooter(
-                cli_populated_footer_from_marker(footer)?,
+                cli_populated_footer_from_marker(footer, commitment_root)?,
             ))
         }
         BlockMarkerV1::BlockHeader(header) => {
@@ -595,7 +598,10 @@ fn cli_populated_block_marker_from(
     }
 }
 
-fn cli_populated_footer_from_marker(footer: BlockFooterV1) -> Result<CliPopulatedFooter> {
+fn cli_populated_footer_from_marker(
+    footer: BlockFooterV1,
+    commitment_root: Option<Hash>,
+) -> Result<CliPopulatedFooter> {
     let BlockFooterV1 {
         bank_hash,
         block_producer_time_nanos,
@@ -640,6 +646,7 @@ fn cli_populated_footer_from_marker(footer: BlockFooterV1) -> Result<CliPopulate
 
     Ok(CliPopulatedFooter {
         bank_hash: bank_hash.to_string(),
+        commitment_root: commitment_root.map(|root| root.to_string()),
         block_producer_time_nanos,
         block_user_agent: String::from_utf8_lossy(&block_user_agent).into_owned(),
         final_cert,

@@ -307,6 +307,9 @@ pub enum BlockstoreProcessorError {
     #[error("bank hash mismatch at slot {0}: expected {1}, got {2}")]
     BankHashMismatch(Slot, Hash, Hash),
 
+    #[error("commitment root mismatch at slot {0}: expected {1}, got {2}")]
+    CommitmentRootMismatch(Slot, Hash, Hash),
+
     #[error("failed to request transaction-history purge for slot {0}: {1}")]
     FailedToRequestTransactionHistoryPurge(Slot, #[source] TransactionStatusSenderError),
 
@@ -2444,6 +2447,22 @@ pub fn process_single_slot(
             slot,
             expected_hash,
             computed_hash,
+        ));
+    }
+
+    // Block Commitment Root: the footer's commitment root must match the one
+    // computed at freeze. A mismatch is handled exactly like a bank hash
+    // mismatch.
+    if let Err((expected_root, computed_root)) = bank.verify_commitment_root() {
+        warn!(
+            "slot {slot} commitment root mismatch expected {expected_root} computed \
+             {computed_root}"
+        );
+        mark_dead_if_primary_access(blockstore, slot);
+        return Err(BlockstoreProcessorError::CommitmentRootMismatch(
+            slot,
+            expected_root,
+            computed_root,
         ));
     }
 
@@ -5572,7 +5591,9 @@ pub mod tests {
         };
         assert_eq!(slot, bank1.slot());
         assert_eq!(bank_id, bank1.bank_id());
-        let VersionedBlockFooter::V1(block_footer) = *block_footer;
+        let VersionedBlockFooter::V1(block_footer) = *block_footer else {
+            panic!("expected a V1 block footer");
+        };
         assert_eq!(block_footer.bank_hash, Hash::new_from_array([42; 32]));
         assert_eq!(
             block_footer.block_producer_time_nanos,

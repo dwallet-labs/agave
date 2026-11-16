@@ -19,7 +19,7 @@ use {
     log::*,
     solana_clock::Slot,
     solana_entry::{
-        block_component::{BlockFooterV1, VersionedBlockMarker},
+        block_component::{VersionedBlockFooter, VersionedBlockMarker},
         entry::Entry,
         poh::Poh,
         recorder_message::RecorderMessage,
@@ -106,6 +106,9 @@ pub enum PohRecorderError {
 
     #[error("bank {0} did not freeze before block footer timeout")]
     BankFreezeTimeout(Slot),
+
+    #[error("bank {0} block footer version does not match its block commitment root state")]
+    FooterCommitmentRootMismatch(Slot),
 
     #[error("couldn't reset bank during fast leader handover slot {0} -> slot {1}")]
     ResetBankError(Slot, Slot),
@@ -634,12 +637,13 @@ impl PohRecorder {
         self.start_bank_leader_id = *bank.leader_id();
     }
 
-    /// Waits for the bank to freeze and sends the block footer with the bank hash.
+    /// Waits for the bank to freeze and sends the block footer with the bank hash
+    /// (and, for footer V2, the commitment root).
     /// Returns once the footer has been handed to broadcast, or errors if the
     /// bank cannot freeze quickly enough to populate the footer's bank hash.
     fn wait_for_freeze_and_send_footer(
         &self,
-        mut footer: BlockFooterV1,
+        mut footer: VersionedBlockFooter,
         working_bank: &WorkingBank,
     ) -> Result<()> {
         // Wake replay as soon as the slot reaches max tick height so it can freeze the bank
@@ -670,10 +674,35 @@ impl PohRecorder {
             ));
         }
 
-        // Send out the block footer - we now have the bank hash
-        footer.bank_hash = working_bank.bank.hash();
+        // Send out the block footer - we now have the bank hash, and the
+        // commitment root, which is computed at the same point of freezing.
+        footer.set_bank_hash(working_bank.bank.hash());
+        match (
+            footer.commitment_root(),
+            working_bank.bank.commitment_root(),
+        ) {
+            (Some(_), Some(commitment_root)) => {
+                let is_set = footer.set_commitment_root(commitment_root);
+                debug_assert!(is_set);
+            }
+            (None, None) => (),
+            (footer_root, bank_root) => {
+                // Both are derived from the bank's feature set, so this is a
+                // programming error. Do not publish a block that every other
+                // validator would reject.
+                error!(
+                    "slot = {} block production failure. footer version {} with commitment root \
+                     {footer_root:?} but bank commitment root {bank_root:?}",
+                    working_bank.bank.slot(),
+                    footer.version(),
+                );
+                return Err(PohRecorderError::FooterCommitmentRootMismatch(
+                    working_bank.bank.slot(),
+                ));
+            }
+        }
 
-        let footer = VersionedBlockMarker::from_block_footer(footer);
+        let footer = VersionedBlockMarker::from_versioned_block_footer(footer);
         let footer_message = (
             RecorderMessage::Marker(footer),
             working_bank.max_tick_height - 1,
@@ -695,7 +724,7 @@ impl PohRecorder {
     // Flush cache will delay flushing the cache for a bank until it past the WorkingBank::min_tick_height
     // On a record flush will flush the cache at the WorkingBank::min_tick_height, since a record
     // occurs after the min_tick_height was generated
-    fn flush_cache(&mut self, tick: bool, footer: Option<BlockFooterV1>) -> Result<()> {
+    fn flush_cache(&mut self, tick: bool, footer: Option<VersionedBlockFooter>) -> Result<()> {
         // check_tick_height is called before flush cache, so it cannot overrun the bank
         // so a bank that is so late that it's slot fully generated before it starts recording
         // will fail instead of broadcasting any ticks
@@ -1073,7 +1102,7 @@ impl PohRecorder {
     pub fn tick_alpenglow(
         &mut self,
         slot_max_tick_height: u64,
-        footer: BlockFooterV1,
+        footer: VersionedBlockFooter,
     ) -> Result<()> {
         let (poh_entry, tick_lock_contention_us) = measure_us!({
             let mut poh_l = self.poh.lock().unwrap();
@@ -1209,7 +1238,11 @@ mod tests {
         super::*,
         crossbeam_channel::bounded,
         solana_clock::DEFAULT_TICKS_PER_SLOT,
-        solana_entry::entry::{self, EntrySlice},
+        solana_entry::{
+            block_component::{BlockFooterV1, BlockMarkerV1},
+            entry::{self, EntrySlice},
+            recorder_message::RecorderMessage,
+        },
         solana_leader_schedule::SlotLeader,
         solana_ledger::{
             blockstore::Blockstore,
@@ -1360,7 +1393,7 @@ mod tests {
         assert!(matches!(err, PohRecorderError::SendError(_)));
     }
 
-    fn test_footer() -> BlockFooterV1 {
+    fn test_footer_v1() -> BlockFooterV1 {
         BlockFooterV1 {
             bank_hash: Hash::default(),
             block_producer_time_nanos: 0,
@@ -1369,6 +1402,10 @@ mod tests {
             skip_reward_cert: None,
             notar_reward_cert: None,
         }
+    }
+
+    fn test_footer() -> VersionedBlockFooter {
+        VersionedBlockFooter::V1(test_footer_v1())
     }
 
     fn new_alpenglow_recorder_for_bank(
@@ -1444,6 +1481,85 @@ mod tests {
         ));
         assert!(poh_recorder.has_bank());
         assert!(!poh_recorder.tick_cache.is_empty());
+    }
+
+    /// Ticks the final alpenglow tick of `bank` with `footer`, freezing the
+    /// bank concurrently, and returns the footer handed to broadcast.
+    fn tick_alpenglow_and_receive_footer(
+        bank: Arc<Bank>,
+        footer: VersionedBlockFooter,
+    ) -> Result<VersionedBlockFooter> {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(
+            Blockstore::open(ledger_path.path()).expect("Expected to be able to open ledger"),
+        );
+        let (mut poh_recorder, entry_receiver) =
+            new_alpenglow_recorder_for_bank(bank.clone(), blockstore);
+        let bank_to_freeze = bank.clone();
+        let freezer = std::thread::spawn(move || {
+            while bank_to_freeze.tick_height() < bank_to_freeze.max_tick_height() {
+                std::hint::spin_loop();
+            }
+            bank_to_freeze.freeze();
+        });
+        let result = poh_recorder.tick_alpenglow(bank.max_tick_height(), footer);
+        freezer.join().unwrap();
+        result?;
+        Ok(entry_receiver
+            .try_iter()
+            .find_map(|(_bank, (message, _tick_height))| match message {
+                RecorderMessage::Marker(VersionedBlockMarker::V1(BlockMarkerV1::BlockFooter(
+                    footer,
+                ))) => Some(footer.into_inner()),
+                _ => None,
+            })
+            .expect("footer must be sent"))
+    }
+
+    #[test]
+    fn test_alpenglow_footer_filled_after_freeze() {
+        // Feature inactive: V1 footer with the bank hash.
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        assert!(!bank.is_block_commitment_root_active());
+        let footer = tick_alpenglow_and_receive_footer(
+            bank.clone(),
+            VersionedBlockFooter::new_for_feature(test_footer_v1(), false),
+        )
+        .unwrap();
+        assert_eq!(footer.version(), 1);
+        assert_eq!(footer.bank_hash(), bank.hash());
+        assert_eq!(footer.commitment_root(), None);
+
+        // Feature active: V2 footer with the bank hash and commitment root.
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(2);
+        solana_runtime::genesis_utils::activate_feature(
+            &mut genesis_config,
+            agave_feature_set::block_commitment_root::id(),
+        );
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        assert!(bank.is_block_commitment_root_active());
+        let footer = tick_alpenglow_and_receive_footer(
+            bank.clone(),
+            VersionedBlockFooter::new_for_feature(test_footer_v1(), true),
+        )
+        .unwrap();
+        assert_eq!(footer.version(), 2);
+        assert_eq!(footer.bank_hash(), bank.hash());
+        assert!(bank.commitment_root().is_some());
+        assert_eq!(footer.commitment_root(), bank.commitment_root());
+
+        // A footer version that does not match the bank is not published.
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        assert_matches!(
+            tick_alpenglow_and_receive_footer(
+                bank.clone(),
+                VersionedBlockFooter::new_for_feature(test_footer_v1(), false),
+            ),
+            Err(PohRecorderError::FooterCommitmentRootMismatch(slot)) if slot == bank.slot()
+        );
     }
 
     #[test]
