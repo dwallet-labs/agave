@@ -82,6 +82,7 @@ pub struct FeatureSnapshot {
     pub increase_tx_v1_account_lock_limit: bool,
     pub invoke_signed_v2: bool,
     pub loaderv3_programdata_size_floor: bool,
+    pub block_commitment_root: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -187,6 +188,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             increase_tx_v1_account_lock_limit: is_active(&increase_tx_v1_account_lock_limit::ID),
             invoke_signed_v2: is_active(&invoke_signed_v2::ID),
             loaderv3_programdata_size_floor: is_active(&loaderv3_programdata_size_floor::ID),
+            block_commitment_root: is_active(&block_commitment_root::ID),
         }
     }
 }
@@ -1678,6 +1680,19 @@ pub mod loaderv3_programdata_size_floor {
     solana_pubkey::declare_id!("8whkDenELnfwYLirBc4Wb4H2Z1z5K7tiykpdxJS7cWg1");
 }
 
+/// Block Commitment Root (draft SIMD, number not yet assigned).
+///
+/// Adds `commitment_root` to the block footer (footer version 2), computes
+/// the 8-slot commitment vector at bank freeze, keeps the block history
+/// accumulator in the bank and in snapshots, and binds `bank_hash` and
+/// `commitment_root` into the final leaf of the double merkle block id.
+/// Placeholder key: replace with the real feature key once the SIMD is
+/// accepted. Activation must not precede the switch to double merkle block
+/// ids (Alpenglow).
+pub mod block_commitment_root {
+    solana_pubkey::declare_id!("Hp4uawW6zBVP4aeue5A5tNFiPopvRMwCS8pp3E8BaszE");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2823,6 +2838,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             loaderv3_programdata_size_floor::id(),
             "Apply a minimum loaded data size to loader-v3 ProgramData accounts",
+        ),
+        (
+            block_commitment_root::id(),
+            "SIMD-XXXX: Block commitment root",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
