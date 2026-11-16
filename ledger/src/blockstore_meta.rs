@@ -8,6 +8,7 @@ use {
     bitflags::bitflags,
     smallvec::SmallVec,
     solana_clock::{Slot, UnixTimestamp},
+    solana_entry::block_component::FooterBinding,
     solana_hash::{HASH_BYTES, Hash},
     std::{
         fmt::{self, Debug, Display},
@@ -877,9 +878,25 @@ pub struct DoubleMerkleMeta {
     ///   `proofs[i * get_proof_size(fec_set_count + 1) * SIZE_OF_MERKLE_PROOF_ENTRY
     ///      ..(i + 1) * get_proof_size(fec_set_count + 1) * SIZE_OF_MERKLE_PROOF_ENTRY]`
     pub(crate) proofs: Vec<u8>,
+
+    /// `(bank_hash, commitment_root)` of the block footer, when the final
+    /// (parent info) leaf binds them (Block Commitment Root SIMD: the block's
+    /// footer is V2). `None` for blocks whose final leaf binds only the parent
+    /// info, and for entries written before this field existed.
+    #[wincode(with = "DefaultOnEmptyRead<Option<(Hash, Hash)>>")]
+    pub(crate) footer_binding: Option<(Hash, Hash)>,
 }
 
 impl DoubleMerkleMeta {
+    /// Returns the footer values bound into the final leaf, if any.
+    pub fn footer_binding(&self) -> Option<FooterBinding> {
+        self.footer_binding
+            .map(|(bank_hash, commitment_root)| FooterBinding {
+                bank_hash,
+                commitment_root,
+            })
+    }
+
     /// Returns the number of fec sets in the block.
     pub fn fec_set_count(&self) -> u32 {
         self.fec_set_count

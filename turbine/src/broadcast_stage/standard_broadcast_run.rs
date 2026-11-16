@@ -11,15 +11,19 @@ use {
     solana_cost_model::shred_limit::{
         DEFAULT_MAX_CODE_SHREDS_PER_SLOT, DEFAULT_MAX_DATA_SHREDS_PER_SLOT,
     },
-    solana_entry::block_component::{BlockComponent, VersionedBlockMarker, VersionedUpdateParent},
+    solana_entry::block_component::{
+        BlockComponent, FooterBinding, VersionedBlockMarker, VersionedUpdateParent,
+    },
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{ProcessShredsStats, Shred, ShredType, Shredder, merkle_tree::MerkleTree},
+        shred::{
+            ProcessShredsStats, Shred, ShredType, Shredder,
+            merkle_tree::{MerkleTree, double_merkle_final_leaf},
+        },
     },
     solana_runtime::bank::Bank,
-    solana_sha256_hasher::hashv,
     solana_time_utils::AtomicInterval,
     std::{collections::VecDeque, sync::RwLock},
 };
@@ -39,6 +43,11 @@ pub struct StandardBroadcastRun {
     // Parent slot and block id committed into the double-merkle block id. This
     // can change after an UpdateParent marker.
     parent_for_double_merkle: Block,
+    // Footer values bound into the double-merkle block id (Block Commitment
+    // Root): those of the second-to-last component of the slot, if it is a
+    // V2 footer, exactly as receivers find them. Holds the bindings of the
+    // last two components shredded, most recent last.
+    recent_component_footer_bindings: [Option<FooterBinding>; 2],
     chained_merkle_root: Hash,
     carryover_message: Option<WorkingBankMessage>,
     double_merkle_leaves: Vec<Hash>,
@@ -67,6 +76,12 @@ enum BroadcastError {
     TooManyShreds,
 }
 
+/// The footer values a block id binds if `component` is a V2 block footer.
+fn component_footer_binding(component: &BlockComponent) -> Option<FooterBinding> {
+    let VersionedBlockMarker::V1(marker) = component.as_marker()?;
+    marker.as_block_footer()?.block_id_binding()
+}
+
 impl StandardBroadcastRun {
     pub(super) fn new(
         shred_version: u16,
@@ -85,6 +100,7 @@ impl StandardBroadcastRun {
                 slot: Slot::MAX,
                 block_id: BlockId::default(),
             },
+            recent_component_footer_bindings: [None; 2],
             chained_merkle_root: Hash::default(),
             double_merkle_leaves: vec![],
             carryover_message: None,
@@ -169,6 +185,7 @@ impl StandardBroadcastRun {
             slot: bank.parent_slot(),
             block_id: parent_block_id,
         };
+        self.recent_component_footer_bindings = [None; 2];
         self.chained_merkle_root = chained_merkle_root;
         self.double_merkle_leaves.clear();
         self.next_shred_index = 0u32;
@@ -236,6 +253,12 @@ impl StandardBroadcastRun {
                     self.next_code_index,
                     process_stats,
                 );
+        // Every component starts a new shred and ends with a DATA_COMPLETE
+        // shred, which is how receivers delimit components.
+        self.recent_component_footer_bindings = [
+            self.recent_component_footer_bindings[1],
+            component_footer_binding(component),
+        ];
         shreds.iter().for_each(|shred| {
             process_stats.record_shred(shred);
             let next_index = match shred.shred_type() {
@@ -287,13 +310,17 @@ impl StandardBroadcastRun {
         self.parent_for_double_merkle = parent_for_double_merkle;
     }
 
-    /// Leaf that binds the current replay parent into the double-merkle block id.
+    /// Leaf that binds the current replay parent into the double-merkle block
+    /// id, together with the footer's `bank_hash` and `commitment_root` when
+    /// the footer (the second-to-last component, the last being the
+    /// alpentick) is V2.
     fn parent_info_leaf(&self, fec_set_count: u32) -> Hash {
-        hashv(&[
-            &self.parent_for_double_merkle.slot.to_le_bytes(),
-            self.parent_for_double_merkle.block_id.as_bytes(),
-            &fec_set_count.to_le_bytes(),
-        ])
+        double_merkle_final_leaf(
+            self.parent_for_double_merkle.slot,
+            &self.parent_for_double_merkle.block_id.to_hash(),
+            fec_set_count,
+            self.recent_component_footer_bindings[0].as_ref(),
+        )
     }
 
     #[cfg(test)]
@@ -694,6 +721,7 @@ mod test {
             genesis_utils::{activate_feature, deactivate_features},
             slot_params::{slot_time_feature_gates, slot_time_feature_ids},
         },
+        solana_sha256_hasher::hashv,
         solana_signer::Signer,
         std::{assert_matches, ops::Deref, sync::Arc, time::Duration},
     };
@@ -1400,6 +1428,116 @@ mod test {
         let component = BlockComponent::new_entry_batch(entries).unwrap();
         let r = bs.component_to_shreds(&keypair, &component, 0, false, &mut stats);
         assert_matches!(r, Err(BroadcastError::TooManyShreds));
+    }
+
+    /// Block Commitment Root: the leader binds the footer's `bank_hash` and
+    /// `commitment_root` into the final leaf of the block id exactly as the
+    /// receiving blockstore does, and binds nothing for a V1 footer.
+    #[test_case(false ; "footer_v1")]
+    #[test_case(true ; "footer_v2")]
+    fn test_block_id_binds_footer(footer_v2: bool) {
+        use solana_entry::block_component::{BlockFooterV1, VersionedBlockFooter};
+        let (
+            blockstore,
+            genesis_config,
+            cluster_info,
+            parent_bank,
+            leader_keypair,
+            socket,
+            bank_forks,
+        ) = setup(DATA_SHREDS_PER_FEC_BLOCK as u64);
+        let bank = new_child_bank(&parent_bank, 1);
+        let (votor_event_sender, _votor_event_receiver) = bounded(1024);
+        let mut bs = StandardBroadcastRun::new(
+            0,
+            Arc::new(MigrationStatus::post_migration_status()),
+            votor_event_sender,
+            test_leader_schedule_cache(&bank),
+        );
+
+        let binding = FooterBinding {
+            bank_hash: Hash::new_unique(),
+            commitment_root: Hash::new_unique(),
+        };
+        let mut footer = VersionedBlockFooter::new_for_feature(
+            BlockFooterV1 {
+                bank_hash: Hash::default(),
+                block_producer_time_nanos: 0,
+                block_user_agent: vec![],
+                block_final_cert: None,
+                skip_reward_cert: None,
+                notar_reward_cert: None,
+            },
+            footer_v2,
+        );
+        footer.set_bank_hash(binding.bank_hash);
+        assert_eq!(
+            footer.set_commitment_root(binding.commitment_root),
+            footer_v2
+        );
+
+        let tick_height = bank.tick_height();
+        let items = [
+            (BroadcastItem::SlotStart, tick_height),
+            (
+                BroadcastItem::Component(BlockComponent::EntryBatch(create_ticks(
+                    1,
+                    0,
+                    genesis_config.hash(),
+                ))),
+                tick_height + 1,
+            ),
+            (
+                BroadcastItem::Component(BlockComponent::BlockMarker(
+                    VersionedBlockMarker::from_versioned_block_footer(footer),
+                )),
+                tick_height + 1,
+            ),
+            (
+                BroadcastItem::Component(BlockComponent::EntryBatch(create_ticks(
+                    1,
+                    0,
+                    Hash::new_unique(),
+                ))),
+                bank.max_tick_height(),
+            ),
+        ];
+        for (item, last_tick_height) in items {
+            bs.test_process_receive_results(
+                &leader_keypair,
+                &cluster_info,
+                &socket,
+                &blockstore,
+                ReceiveResults {
+                    item,
+                    bank: bank.clone(),
+                    last_tick_height,
+                },
+                &bank_forks,
+            )
+            .unwrap();
+        }
+        assert!(bs.completed);
+
+        let leader_block_id = bank.block_id().unwrap().to_hash();
+        assert!(blockstore.is_full(bank.slot()));
+        assert_eq!(
+            blockstore
+                .get_double_merkle_root(
+                    bank.slot(),
+                    solana_ledger::blockstore_meta::BlockLocation::Original,
+                )
+                .unwrap(),
+            Some(leader_block_id)
+        );
+        let (double_merkle_meta, _slot_meta) = blockstore
+            .get_parent_repair_metadata(bank.slot(), leader_block_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            double_merkle_meta.footer_binding(),
+            footer_v2.then_some(binding)
+        );
     }
 
     #[test]

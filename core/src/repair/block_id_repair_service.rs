@@ -608,6 +608,15 @@ impl BlockIdRepairService {
                 fec_set_count,
                 parent_info: (p_slot, p_block_id),
                 parent_proof: _,
+            }
+            // The footer binding was authenticated with the proof. The fetched
+            // shreds bind the same values again when they complete the slot,
+            // which recomputes the block id.
+            | BlockIdRepairResponse::ParentFecSetCountWithFooter {
+                fec_set_count,
+                parent_info: (p_slot, p_block_id),
+                footer_binding: _,
+                parent_proof: _,
             } => {
                 // Queue a request to repair the parent (filtered out later if we already have the parent)
                 state.push_pending_repair_event(RepairEvent::FetchBlock {

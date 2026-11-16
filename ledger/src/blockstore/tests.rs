@@ -28,7 +28,7 @@ use {
     solana_packet::PACKET_DATA_SIZE,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
-    solana_sha256_hasher::hash,
+    solana_sha256_hasher::{hash, hashv},
     solana_shred_version::version_from_hash,
     solana_signature::Signature,
     solana_transaction::Transaction,
@@ -6898,6 +6898,148 @@ fn test_add_transaction_status_to_batch() {
     );
 }
 
+/// Block Commitment Root: the final leaf of the double merkle tree binds the
+/// `bank_hash` and `commitment_root` of a V2 footer, read from the first
+/// shred of the second-to-last component. V1 footers keep the old leaf.
+#[test_case(false ; "footer_v1")]
+#[test_case(true ; "footer_v2")]
+fn test_double_merkle_root_binds_footer(footer_v2: bool) {
+    use solana_entry::block_component::{BlockFooterV1, BlockFooterV2, FooterBinding};
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+    let parent_slot = 4;
+    let slot = 5;
+    let parent_block_id = BlockId::new_unique();
+    let binding = FooterBinding {
+        bank_hash: Hash::new_unique(),
+        commitment_root: Hash::new_unique(),
+    };
+    let footer_v1 = BlockFooterV1 {
+        bank_hash: binding.bank_hash,
+        block_producer_time_nanos: 0,
+        block_user_agent: vec![7; 255],
+        block_final_cert: None,
+        skip_reward_cert: None,
+        notar_reward_cert: None,
+    };
+    let footer = if footer_v2 {
+        VersionedBlockMarker::from_block_footer_v2(BlockFooterV2::from_v1(
+            footer_v1,
+            binding.commitment_root,
+        ))
+    } else {
+        VersionedBlockMarker::from_block_footer(footer_v1)
+    };
+
+    let mut shreds = data_shreds(create_block_header_shreds(
+        slot,
+        parent_slot,
+        parent_block_id,
+    ));
+    let next_index = |shreds: &[Shred]| shreds.last().unwrap().index() + 1;
+    shreds.extend(data_shreds(create_entry_batch_shreds(
+        slot,
+        parent_slot,
+        make_slot_entries_with_transactions(5),
+        next_index(&shreds),
+        false,
+    )));
+    let footer_start = next_index(&shreds);
+    shreds.extend(data_shreds(
+        Shredder::new(slot, parent_slot, 0, 0)
+            .unwrap()
+            .make_merkle_shreds_from_component(
+                &Keypair::new(),
+                &BlockComponent::new_block_marker(footer),
+                false,
+                Hash::new_unique(),
+                footer_start,
+                footer_start,
+                &mut ProcessShredsStats::default(),
+            ),
+    ));
+    let alpentick = create_ticks(1, 1, Hash::new_unique());
+    shreds.extend(data_shreds(create_entry_batch_shreds(
+        slot,
+        parent_slot,
+        alpentick,
+        next_index(&shreds),
+        true,
+    )));
+
+    let fec_set_roots: Vec<Hash> = shreds
+        .iter()
+        .filter(|shred| shred.index() % (DATA_SHREDS_PER_FEC_BLOCK as u32) == 0)
+        .map(|shred| shred.merkle_root().unwrap())
+        .collect();
+    let fec_set_count = u32::try_from(fec_set_roots.len()).unwrap();
+    assert!(fec_set_count >= 4);
+
+    // Insert out of order: the footer is found from the completed data
+    // indexes, regardless of arrival order.
+    shreds.reverse();
+    blockstore.insert_shreds(shreds, true).unwrap();
+    assert!(blockstore.is_full(slot));
+
+    let expected_binding = footer_v2.then_some(binding);
+    let final_leaf = double_merkle_final_leaf(
+        parent_slot,
+        &parent_block_id.to_hash(),
+        fec_set_count,
+        expected_binding.as_ref(),
+    );
+    if !footer_v2 {
+        // Unchanged pre-SIMD leaf.
+        assert_eq!(
+            final_leaf,
+            hashv(&[
+                &parent_slot.to_le_bytes(),
+                parent_block_id.as_bytes(),
+                &fec_set_count.to_le_bytes(),
+            ])
+        );
+    }
+    let leaves: Vec<_> = fec_set_roots
+        .into_iter()
+        .chain(std::iter::once(final_leaf))
+        .map(Ok)
+        .collect();
+    let merkle_tree = MerkleTree::try_new(leaves.into_iter()).unwrap();
+    assert_eq!(
+        blockstore
+            .get_double_merkle_root(slot, BlockLocation::Original)
+            .unwrap(),
+        Some(*merkle_tree.root())
+    );
+
+    let double_merkle_meta = blockstore
+        .double_merkle_meta_cf
+        .get((slot, BlockLocation::Original))
+        .unwrap()
+        .unwrap();
+    assert_eq!(double_merkle_meta.footer_binding(), expected_binding);
+    assert_eq!(double_merkle_meta.fec_set_count(), fec_set_count);
+
+    // Serving repair rebuilds the tree (and its proofs) from the db alone and
+    // reaches the same root and binding.
+    let (meta_with_proofs, _slot_meta) = blockstore
+        .get_parent_repair_metadata(slot, *merkle_tree.root())
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta_with_proofs.footer_binding(), expected_binding);
+    let proof = meta_with_proofs.get_parent_info_proof().unwrap();
+    assert!(
+        verify_merkle_proof(
+            hash_as_merkle_proof_entry(&final_leaf),
+            fec_set_count as usize,
+            proof,
+            *merkle_tree.root(),
+        )
+        .is_ok()
+    );
+}
+
 #[test_case(false ; "original_location")]
 #[test_case(true ; "alternate_location")]
 fn test_get_double_merkle_root(use_alternate_location: bool) {
@@ -6924,11 +7066,8 @@ fn test_get_double_merkle_root(use_alternate_location: bool) {
     }
 
     let fec_set_count = u32::try_from(fec_set_roots.len()).unwrap();
-    let parent_info_hash = hashv(&[
-        &parent_slot.to_le_bytes(),
-        parent_block_id.as_ref(),
-        &fec_set_count.to_le_bytes(),
-    ]);
+    let parent_info_hash =
+        double_merkle_final_leaf(parent_slot, &parent_block_id, fec_set_count, None);
     let merkle_tree_leaves: Vec<_> = fec_set_roots
         .iter()
         .copied()

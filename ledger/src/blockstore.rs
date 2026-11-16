@@ -22,7 +22,7 @@ use {
             Shredder,
             filter::ShredRecoveryContext,
             merkle::{ErasureBatch, FecSetViolation},
-            merkle_tree::{MerkleTree, get_proof_size},
+            merkle_tree::{MerkleTree, double_merkle_final_leaf, get_proof_size},
         },
         sigverify_shreds::VerifiedShred,
         slot_stats::{ShredSource, SlotsStats},
@@ -50,9 +50,9 @@ use {
     solana_clock::{Slot, UnixTimestamp},
     solana_entry::{
         block_component::{
-            BlockComponent, ParsedBlockComponent, VersionedBlockFooter, VersionedBlockHeader,
+            BlockComponent, FooterBinding, ParsedBlockComponent, VersionedBlockHeader,
             VersionedBlockMarker, VersionedUpdateParent, finalization_certificates_from_footer,
-            genesis_certificate_from_shred,
+            footer_binding_from_component_prefix, genesis_certificate_from_shred,
         },
         block_component_parser,
         entry::{Entry, EntryView, create_ticks},
@@ -64,7 +64,6 @@ use {
     solana_metrics::datapoint_error,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, leader_schedule_utils::leader_slot_index},
-    solana_sha256_hasher::hashv,
     solana_signature::Signature,
     solana_signer::Signer,
     solana_svm_transaction::svm_message::SVMMessage,
@@ -1079,6 +1078,7 @@ impl Blockstore {
             double_merkle_root,
             fec_set_count: 1,   // Minimal valid value
             proofs: Vec::new(), // Empty proofs for testing
+            footer_binding: None,
         };
         self.double_merkle_meta_cf
             .put((slot, block_location), &meta)
@@ -2078,6 +2078,7 @@ impl Blockstore {
                 meta.last_index.expect("Slot is full"),
                 &shred_insertion_tracker.slot_meta_working_set,
                 &shred_insertion_tracker.merkle_root_metas,
+                &shred_insertion_tracker.just_inserted_shreds,
                 shred_insertion_tracker.write_batch,
             )?;
         }
@@ -2093,15 +2094,17 @@ impl Blockstore {
         last_index: u64,
         slot_metas: &HashMap<(BlockLocation, Slot), SlotMetaWorkingSetEntry>,
         merkle_root_metas: &HashMap<(BlockLocation, ErasureSetId), WorkingEntry<MerkleRootMeta>>,
+        just_inserted_shreds: &HashMap<(BlockLocation, ShredId), Shred>,
         write_batch: &mut WriteBatch,
     ) -> Result<()> {
         let fec_set_count = last_index as u32 / (DATA_SHREDS_PER_FEC_BLOCK as u32) + 1;
-        let merkle_tree = self.build_double_merkle_tree(
+        let (merkle_tree, footer_binding) = self.build_double_merkle_tree(
             slot,
             location,
             fec_set_count,
             Some(slot_metas),
             Some(merkle_root_metas),
+            Some(just_inserted_shreds),
         )?;
 
         let double_merkle_root = *merkle_tree.root();
@@ -2114,13 +2117,18 @@ impl Blockstore {
             double_merkle_root,
             fec_set_count,
             proofs,
+            footer_binding: footer_binding
+                .map(|binding| (binding.bank_hash, binding.commitment_root)),
         };
 
         self.double_merkle_meta_cf
             .put_in_batch(write_batch, (slot, location), &double_merkle_meta)
     }
 
-    /// Builds the double merkle tree for a completed block (expects the block to be full)
+    /// Builds the double merkle tree for a completed block (expects the block to be full).
+    ///
+    /// Also returns the footer values bound into the final leaf, if any (see
+    /// [`Self::get_footer_binding_from_tracker_or_db`]).
     fn build_double_merkle_tree(
         &self,
         slot: Slot,
@@ -2130,7 +2138,8 @@ impl Blockstore {
         merkle_root_metas: Option<
             &HashMap<(BlockLocation, ErasureSetId), WorkingEntry<MerkleRootMeta>>,
         >,
-    ) -> Result<MerkleTree> {
+        just_inserted_shreds: Option<&HashMap<(BlockLocation, ShredId), Shred>>,
+    ) -> Result<(MerkleTree, Option<FooterBinding>)> {
         // Get the parent info from tracker if specified first, then fall back to db
         let Some((Some(parent_slot), parent_block_id)) =
             self.get_parent_info_from_tracker_or_db(slot, location, slot_metas)?
@@ -2143,6 +2152,13 @@ impl Blockstore {
             return Err(BlockstoreError::ParentInfoUnavailable(slot, location));
         };
 
+        let footer_binding = self.get_footer_binding_from_tracker_or_db(
+            slot,
+            location,
+            slot_metas,
+            just_inserted_shreds,
+        )?;
+
         // Collect merkle roots for each FEC set
         let merkle_tree_leaves = (0..fec_set_count)
             .map(|i| {
@@ -2152,19 +2168,82 @@ impl Blockstore {
                     .map_err(|_| shred::Error::InvalidMerkleRoot)
                     .and_then(|mr| mr.ok_or(shred::Error::InvalidMerkleRoot))
             })
-            // Add parent info as the last leaf. The `fec_set_count` is bound
-            // into this leaf so that an adversary cannot convince a verifier
-            // that the count is off-by-one when the number of FEC sets is
-            // even (which makes the total leaf count odd and causes the last
-            // leaf to be hashed with itself during tree construction).
-            .chain(std::iter::once(Ok(hashv(&[
-                &parent_slot.to_le_bytes(),
-                parent_block_id.as_ref(),
-                &fec_set_count.to_le_bytes(),
-            ]))));
+            // Add parent info (and the footer binding, if any) as the last
+            // leaf. See `double_merkle_final_leaf`.
+            .chain(std::iter::once(Ok(double_merkle_final_leaf(
+                parent_slot,
+                &parent_block_id,
+                fec_set_count,
+                footer_binding.as_ref(),
+            ))));
 
-        MerkleTree::try_new_with_len(merkle_tree_leaves, fec_set_count as usize + 1)
-            .map_err(|_| BlockstoreError::MerkleTreeConstructionFailure(slot, location))
+        let merkle_tree =
+            MerkleTree::try_new_with_len(merkle_tree_leaves, fec_set_count as usize + 1)
+                .map_err(|_| BlockstoreError::MerkleTreeConstructionFailure(slot, location))?;
+        Ok((merkle_tree, footer_binding))
+    }
+
+    /// Reads the footer values that the block id binds (Block Commitment Root
+    /// SIMD, "Binding the Footer to the Block Id") for a full block.
+    ///
+    /// A valid block ends with the footer followed by the alpentick, so the
+    /// footer is the second-to-last block component. Components start at a
+    /// shred boundary and end with a `DATA_COMPLETE` shred, so the footer's
+    /// first shred is the one after the third-to-last completed data index
+    /// (or shred 0). `bank_hash` and `commitment_root` sit at fixed offsets at
+    /// the start of a V2 footer, so only that one shred is read.
+    ///
+    /// Returns `None` if that component is not a V2 footer (V1 footer, no
+    /// footer, or any other component); the final leaf then binds only the
+    /// parent info. Replay enforces which footer version is valid for the
+    /// block, and rejects blocks whose footer is not the second-to-last
+    /// component, so for every block replay accepts this finds the footer it
+    /// validated.
+    fn get_footer_binding_from_tracker_or_db(
+        &self,
+        slot: Slot,
+        location: BlockLocation,
+        slot_metas: Option<&HashMap<(BlockLocation, Slot), SlotMetaWorkingSetEntry>>,
+        just_inserted_shreds: Option<&HashMap<(BlockLocation, ShredId), Shred>>,
+    ) -> Result<Option<FooterBinding>> {
+        // The last three completed data indexes: ends of the final component,
+        // of the footer, and of the component before the footer.
+        let last_completed: Vec<u32> =
+            if let Some(working_entry) = slot_metas.and_then(|sm| sm.get(&(location, slot))) {
+                let entry = RefCell::borrow(&*working_entry.new_slot_meta);
+                entry.completed_data_indexes.iter().rev().take(3).collect()
+            } else if let Some(meta) = self.meta_from_location(slot, location)? {
+                meta.completed_data_indexes.iter().rev().take(3).collect()
+            } else {
+                return Ok(None);
+            };
+        if last_completed.len() < 2 {
+            // A single component: there is no footer before the final one.
+            return Ok(None);
+        }
+        let footer_start_index = last_completed
+            .get(2)
+            .map_or(0, |end_of_previous| end_of_previous.saturating_add(1));
+        let shred_id = ShredId::new(slot, footer_start_index, ShredType::Data);
+        let payload = match just_inserted_shreds {
+            Some(just_inserted_shreds) => {
+                self.get_shred_from_just_inserted_or_db(just_inserted_shreds, shred_id, location)
+            }
+            None => self
+                .get_data_shred_from_location(slot, u64::from(footer_start_index), location)?
+                .map(shred::Payload::from),
+        };
+        let Some(payload) = payload else {
+            // Unreachable for a full slot, which has all of its data shreds.
+            warn!(
+                "slot {slot} location {location}: missing data shred {footer_start_index} while \
+                 looking for the block footer"
+            );
+            return Ok(None);
+        };
+        Ok(shred::layout::get_data(&payload)
+            .ok()
+            .and_then(footer_binding_from_component_prefix))
     }
 
     /// Populates the proofs for the block at `slot` `location` into the `double_merkle_meta`
@@ -2174,10 +2253,11 @@ impl Blockstore {
         location: BlockLocation,
         double_merkle_meta: &mut DoubleMerkleMeta,
     ) -> Result<()> {
-        let merkle_tree = self.build_double_merkle_tree(
+        let (merkle_tree, _footer_binding) = self.build_double_merkle_tree(
             slot,
             location,
             double_merkle_meta.fec_set_count,
+            None,
             None,
             None,
         )?;
@@ -6436,10 +6516,10 @@ impl Blockstore {
         else {
             return Ok(vec![]);
         };
-        let Some(VersionedBlockFooter::V1(footer)) = marker.as_block_footer() else {
+        let Some(footer) = marker.as_block_footer() else {
             return Ok(vec![]);
         };
-        let Some(certificate) = footer.block_final_cert.clone() else {
+        let Some(certificate) = footer.block_final_cert().cloned() else {
             return Ok(vec![]);
         };
 

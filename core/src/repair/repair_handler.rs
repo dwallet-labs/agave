@@ -120,10 +120,21 @@ pub trait RepairHandler {
         let parent_block_id = slot_meta.parent_block_id;
         let parent_proof = double_merkle_meta.get_parent_info_proof()?.to_vec();
 
-        let response = BlockIdRepairResponse::ParentFecSetCount {
-            fec_set_count: double_merkle_meta.fec_set_count(),
-            parent_info: (parent_slot, parent_block_id),
-            parent_proof,
+        // Block Commitment Root: if the final leaf binds the footer's
+        // `bank_hash` and `commitment_root`, the requester needs both to
+        // recompute it.
+        let response = match double_merkle_meta.footer_binding() {
+            None => BlockIdRepairResponse::ParentFecSetCount {
+                fec_set_count: double_merkle_meta.fec_set_count(),
+                parent_info: (parent_slot, parent_block_id),
+                parent_proof,
+            },
+            Some(binding) => BlockIdRepairResponse::ParentFecSetCountWithFooter {
+                fec_set_count: double_merkle_meta.fec_set_count(),
+                parent_info: (parent_slot, parent_block_id),
+                footer_binding: (binding.bank_hash, binding.commitment_root),
+                parent_proof,
+            },
         };
         create_response_packet_batch(&response, from_addr, nonce)
     }
