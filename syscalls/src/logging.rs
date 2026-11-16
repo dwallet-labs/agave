@@ -23,6 +23,10 @@ impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallLog {
         let abi = invoke_context.abi();
         let memory_mapping = invoke_context.memory_contexts.memory_mapping()?;
         translate_string_and_do(memory_mapping, addr, len, abi, &mut |string: &str| {
+            // The receipt event is recorded independently of the log
+            // collector, which may be disabled or truncate (Transaction
+            // Receipt Tree SIMD, kind 1).
+            invoke_context.record_log_event(string.as_bytes())?;
             stable_log::program_log(&invoke_context.get_log_collector(), string);
             Ok(0)
         })?;
@@ -134,6 +138,11 @@ impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallLogData {
         for untranslated_field in untranslated_fields {
             fields.push(translate_vm_slice(untranslated_field, memory_mapping, abi)?);
         }
+
+        // The receipt event is recorded independently of the log collector,
+        // which may be disabled or truncate (Transaction Receipt Tree SIMD,
+        // kind 0).
+        invoke_context.record_log_data_event(&fields)?;
 
         let log_collector = invoke_context.get_log_collector();
 

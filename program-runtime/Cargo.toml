@@ -51,6 +51,7 @@ solana-instruction = { workspace = true }
 solana-instruction-error = { workspace = true, features = ["num-traits"] }
 solana-last-restart-slot = { workspace = true, features = ["wincode"] }
 solana-loader-v3-interface = { workspace = true }
+solana-merkle-tree = { workspace = true }
 solana-message = { workspace = true, optional = true }
 solana-program-entrypoint = { workspace = true }
 solana-pubkey = { workspace = true }

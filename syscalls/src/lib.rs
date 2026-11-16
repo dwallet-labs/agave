@@ -3303,6 +3303,74 @@ mod tests {
     }
 
     #[test]
+    fn test_syscall_log_events() {
+        use solana_merkle_tree::receipt_tree::{EventKind, log_data_payload};
+
+        prepare_mockup!(invoke_context, program_id, bpf_loader::id());
+        let message = b"receipt event";
+        let field_a = b"ab";
+        let field_b = b"";
+        let field_c = b"xyz";
+        // Fields of sol_log_data: three VmSlice<u8> {ptr, len} at 0x100000000.
+        let mut slices = Vec::new();
+        for (ptr, len) in [
+            (0x300000000u64, field_a.len()),
+            (0x300000000u64, field_b.len()),
+            (0x500000000u64, field_c.len()),
+        ] {
+            slices.extend_from_slice(&ptr.to_le_bytes());
+            slices.extend_from_slice(&(len as u64).to_le_bytes());
+        }
+        let config = Config::default();
+        let memory_mapping = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw const *slices.as_slice(), 0x100000000),
+                    MemoryRegion::new(&raw const *message.as_slice(), 0x200000000),
+                    MemoryRegion::new(&raw const *field_a.as_slice(), 0x300000000),
+                    MemoryRegion::new(&raw const *field_c.as_slice(), 0x500000000),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        invoke_context
+            .memory_contexts
+            .mock_set_mapping_abi_v1(memory_mapping);
+        invoke_context.mock_set_remaining(100_000);
+
+        // Nothing is recorded unless event recording is enabled.
+        assert!(!invoke_context.is_event_recording_enabled());
+        SyscallLog::rust(&mut invoke_context, 0x200000000, 13, 0, 0, 0).unwrap();
+        assert_eq!(invoke_context.take_recorded_events(), None);
+
+        invoke_context.enable_event_recording();
+        SyscallLogData::rust(&mut invoke_context, 0x100000000, 3, 0, 0, 0).unwrap();
+        SyscallLog::rust(&mut invoke_context, 0x200000000, 13, 0, 0, 0).unwrap();
+        // Formatted logging syscalls are not events in receipt version 1.
+        SyscallLogU64::rust(&mut invoke_context, 1, 2, 3, 4, 5).unwrap();
+        // A failing syscall records nothing.
+        invoke_context.mock_set_remaining(0);
+        assert!(SyscallLog::rust(&mut invoke_context, 0x200000000, 13, 0, 0, 0).is_err());
+
+        let events = invoke_context.take_recorded_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].program_id, program_id);
+        assert_eq!(events[0].index_in_trace, 0);
+        assert_eq!(events[0].kind, EventKind::LogData);
+        assert_eq!(
+            events[0].payload,
+            log_data_payload(&[field_a.as_slice(), field_b, field_c])
+        );
+        assert_eq!(events[1].program_id, program_id);
+        assert_eq!(events[1].kind, EventKind::Log);
+        assert_eq!(events[1].payload, message.to_vec());
+        // Taking the events empties the list but keeps recording enabled.
+        assert_eq!(invoke_context.take_recorded_events(), Some(vec![]));
+    }
+
+    #[test]
     fn test_syscall_sol_log_u64() {
         prepare_mockup!(invoke_context, program_id, bpf_loader::id());
         let cost = invoke_context.get_execution_cost().log_64_units;
