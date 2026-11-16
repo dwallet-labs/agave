@@ -6,7 +6,10 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
     solana_lattice_hash::lt_hash::LtHash,
-    solana_merkle_tree::commitment_tree::{AppendOnlyFrontier, FrontierError},
+    solana_merkle_tree::{
+        commitment_tree::{AppendOnlyFrontier, FrontierError},
+        epoch_boundary::EpochBoundary,
+    },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_stake_history::StakeHistoryItem,
@@ -88,6 +91,68 @@ impl TryFrom<SerdeBlockCommitment> for BlockCommitment {
             )?,
             commitment_root,
         })
+    }
+}
+
+/// Snapshot serde-safe epoch boundary state (Epoch Boundary Commitment
+/// SIMD): the inputs of the `epoch_boundary` value carried by the snapshot
+/// bank, from which the value is recomputed.
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct SerdeEpochBoundary {
+    /// Epoch of the snapshot bank.
+    pub epoch: Epoch,
+    /// Slot of the first block of that epoch on the snapshot bank's chain.
+    pub first_slot: u64,
+    /// Slot of the parent of that first block.
+    pub parent_slot: u64,
+    /// Block id of that parent.
+    pub parent_block_id: Hash,
+    /// Commitment root of that parent (zero if it had none).
+    pub parent_commitment_root: Hash,
+    /// Block history length of the first block of the epoch.
+    pub history_len: u64,
+}
+
+impl From<EpochBoundary> for SerdeEpochBoundary {
+    fn from(epoch_boundary: EpochBoundary) -> Self {
+        let EpochBoundary {
+            epoch,
+            first_slot,
+            parent_slot,
+            parent_block_id,
+            parent_commitment_root,
+            history_len,
+        } = epoch_boundary;
+        Self {
+            epoch,
+            first_slot,
+            parent_slot,
+            parent_block_id,
+            parent_commitment_root,
+            history_len,
+        }
+    }
+}
+
+impl From<SerdeEpochBoundary> for EpochBoundary {
+    fn from(serde: SerdeEpochBoundary) -> Self {
+        let SerdeEpochBoundary {
+            epoch,
+            first_slot,
+            parent_slot,
+            parent_block_id,
+            parent_commitment_root,
+            history_len,
+        } = serde;
+        Self {
+            epoch,
+            first_slot,
+            parent_slot,
+            parent_block_id,
+            parent_commitment_root,
+            history_len,
+        }
     }
 }
 
