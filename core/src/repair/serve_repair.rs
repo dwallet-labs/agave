@@ -228,7 +228,7 @@ impl BlockIdRepairType {
     feature = "stable-abi",
     derive(StableAbi, StableAbiSample, PartialEq),
     frozen_abi(
-        abi_digest = "CfbU7jxf8EKXfJYEveg2StWVK8MYbLovaQZitXsHMYLz",
+        abi_digest = "96ksQ8GHAtbpREdGk1s2zkoekxkSs2aAt6wZkkBvbbw6",
         abi_serializer = ["wincode"],
         test_roundtrip = "eq_and_wire",
     )
