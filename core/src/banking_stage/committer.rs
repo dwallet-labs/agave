@@ -4,7 +4,7 @@ use {
     solana_cost_model::cost_model::CostModel,
     solana_measure::measure_us,
     solana_runtime::{
-        bank::{Bank, ProcessedTransactionCounts},
+        bank::{Bank, ProcessedTransactionCounts, ReceiptOrder},
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_balances::compile_collected_balances,
         transaction_batch::TransactionBatch,
@@ -14,7 +14,9 @@ use {
     solana_svm::{
         transaction_balances::BalanceCollector,
         transaction_commit_result::{TransactionCommitResult, TransactionCommitResultExtensions},
-        transaction_processing_result::TransactionProcessingResult,
+        transaction_processing_result::{
+            TransactionProcessingResult, TransactionProcessingResultExtensions,
+        },
     },
     solana_transaction_error::TransactionError,
     std::{num::Saturating, sync::Arc},
@@ -62,10 +64,21 @@ impl Committer {
         execute_and_commit_timings: &mut LeaderExecuteAndCommitTimings,
         processed_counts: &ProcessedTransactionCounts,
     ) -> (u64, Vec<CommitTransactionDetails>) {
+        let block_positions = starting_transaction_index.map(|starting_transaction_index| {
+            Self::block_positions(&processing_results, starting_transaction_index)
+        });
+        let receipt_order = match block_positions.as_deref() {
+            Some(positions) => ReceiptOrder::BlockPositions(positions),
+            // Only when the record channel does not track transaction
+            // indexes, which the validator always enables (see
+            // `record_channels`): receipts then follow commit order.
+            None => ReceiptOrder::CommitOrder,
+        };
         let (commit_results, commit_time_us) = measure_us!(bank.commit_transactions(
             batch.sanitized_transactions(),
             processing_results,
             processed_counts,
+            receipt_order,
             &mut execute_and_commit_timings.execute_timings,
         ));
         execute_and_commit_timings.commit_us = commit_time_us;
@@ -91,6 +104,31 @@ impl Committer {
         });
         execute_and_commit_timings.post_commit_us = post_commit_us;
         (commit_time_us, commit_transaction_statuses)
+    }
+
+    /// Position in the block of every transaction of a recorded batch.
+    ///
+    /// The record channel gives the batch's processed transactions, the only
+    /// ones recorded, consecutive positions from `starting_transaction_index`,
+    /// in batch order. Unprocessed transactions are not committed and their
+    /// entry is unused.
+    fn block_positions(
+        processing_results: &[TransactionProcessingResult],
+        starting_transaction_index: usize,
+    ) -> Vec<usize> {
+        let mut next_position = starting_transaction_index;
+        processing_results
+            .iter()
+            .map(|processing_result| {
+                if processing_result.was_processed() {
+                    let position = next_position;
+                    next_position = next_position.saturating_add(1);
+                    position
+                } else {
+                    usize::MAX
+                }
+            })
+            .collect()
     }
 
     pub(super) fn transaction_details(

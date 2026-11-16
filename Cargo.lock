@@ -10886,6 +10886,7 @@ dependencies = [
  "solana-keypair",
  "solana-loader-v3-interface",
  "solana-loader-v4-interface",
+ "solana-merkle-tree",
  "solana-message",
  "solana-native-token",
  "solana-nonce",

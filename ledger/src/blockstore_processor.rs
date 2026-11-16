@@ -3543,6 +3543,70 @@ pub mod tests {
         assert_eq!(bank.last_blockhash(), blockhash);
     }
 
+    /// Transaction Receipt Tree: replay through the unified scheduler, which
+    /// may commit transactions out of block order on several handler threads,
+    /// yields the receipts in block order: the same as executing the
+    /// transactions one by one in block order.
+    #[test]
+    fn test_replay_receipts_in_block_order() {
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(1_000_000_000);
+        for feature_id in [
+            agave_feature_set::block_commitment_root::id(),
+            agave_feature_set::transaction_receipt_tree::id(),
+        ] {
+            solana_runtime::genesis_utils::activate_feature(&mut genesis_config, feature_id);
+        }
+        let payers: Vec<_> = (0..32).map(|_| Keypair::new()).collect();
+        for payer in &payers {
+            genesis_config.add_account(
+                payer.pubkey(),
+                AccountSharedData::empty(1_000_000, &solana_system_interface::program::id()),
+            );
+        }
+        let blockhash = genesis_config.hash();
+        let txs: Vec<_> = payers
+            .iter()
+            .enumerate()
+            .map(|(i, payer)| {
+                // Every 5th transfer fails (insufficient funds) and still has
+                // a receipt.
+                let lamports = if i % 5 == 4 { 2_000_000 } else { 1_000 };
+                system_transaction::transfer(payer, &Pubkey::new_unique(), lamports, blockhash)
+            })
+            .collect();
+
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        assert!(bank.is_transaction_receipt_tree_active());
+        assert_eq!(bank.last_blockhash(), blockhash);
+        let mut entries = Vec::new();
+        let mut hash = blockhash;
+        for (i, chunk) in txs.chunks(4).enumerate() {
+            // Entries of 1 and 4 transactions.
+            let chunks: Vec<Vec<_>> = if i % 2 == 0 {
+                chunk.iter().map(|tx| vec![tx.clone()]).collect()
+            } else {
+                vec![chunk.to_vec()]
+            };
+            for chunk in chunks {
+                let entry = next_entry(&hash, 1, chunk);
+                hash = entry.hash;
+                entries.push(entry);
+            }
+        }
+        process_entries_for_tests_with_scheduler(&bank, entries).unwrap();
+        let replayed = bank.transaction_receipt_leaf_hashes();
+        assert_eq!(replayed.len(), txs.len());
+
+        let (reference, _reference_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        for (i, tx) in txs.iter().enumerate() {
+            assert_eq!(reference.process_transaction(tx).is_ok(), i % 5 != 4);
+        }
+        assert_eq!(replayed, reference.transaction_receipt_leaf_hashes());
+        assert_eq!(bank.receipts_root(), reference.receipts_root());
+    }
+
     #[test]
     fn test_process_entries_2_txes_collision() {
         let GenesisConfigInfo {
