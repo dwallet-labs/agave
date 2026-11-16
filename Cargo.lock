@@ -9453,6 +9453,7 @@ dependencies = [
 name = "solana-poh"
 version = "5.0.0-alpha.0"
 dependencies = [
+ "agave-feature-set",
  "agave-logger",
  "agave-votor-messages",
  "arc-swap",
@@ -10257,6 +10258,7 @@ dependencies = [
  "solana-leader-schedule",
  "solana-loader-v3-interface",
  "solana-measure",
+ "solana-merkle-tree",
  "solana-message",
  "solana-metrics",
  "solana-native-token",

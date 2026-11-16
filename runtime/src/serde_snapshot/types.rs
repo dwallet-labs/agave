@@ -1,9 +1,12 @@
 use {
+    crate::bank::block_commitment::BlockCommitment,
     solana_account::AccountSharedData,
     solana_accounts_db::accounts_hash::AccountsLtHash,
     solana_clock::Epoch,
     solana_epoch_schedule::EpochSchedule,
+    solana_hash::Hash,
     solana_lattice_hash::lt_hash::LtHash,
+    solana_merkle_tree::commitment_tree::{AppendOnlyFrontier, FrontierError},
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_stake_history::StakeHistoryItem,
@@ -36,6 +39,55 @@ impl From<SerdeAccountsLtHash> for AccountsLtHash {
 impl From<AccountsLtHash> for SerdeAccountsLtHash {
     fn from(accounts_lt_hash: AccountsLtHash) -> Self {
         Self(accounts_lt_hash.0.0)
+    }
+}
+
+/// Snapshot serde-safe block commitment state (Block Commitment Root SIMD):
+/// the block history frontier of the snapshot bank and its commitment root.
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Debug, Clone, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct SerdeBlockCommitment {
+    /// Number of leaves in the block history of the snapshot bank.
+    pub history_leaf_count: u64,
+    /// Roots of the complete subtrees along the right edge of the block
+    /// history tree, largest first. One per set bit of `history_leaf_count`
+    /// (at most 64).
+    pub history_subtree_roots: Vec<Hash>,
+    /// `commitment_root` of the snapshot bank.
+    pub commitment_root: Hash,
+}
+
+impl From<BlockCommitment> for SerdeBlockCommitment {
+    fn from(block_commitment: BlockCommitment) -> Self {
+        let BlockCommitment {
+            block_history,
+            commitment_root,
+        } = block_commitment;
+        let (history_leaf_count, history_subtree_roots) = block_history.into_parts();
+        Self {
+            history_leaf_count,
+            history_subtree_roots,
+            commitment_root,
+        }
+    }
+}
+
+impl TryFrom<SerdeBlockCommitment> for BlockCommitment {
+    type Error = FrontierError;
+
+    fn try_from(serde: SerdeBlockCommitment) -> Result<Self, Self::Error> {
+        let SerdeBlockCommitment {
+            history_leaf_count,
+            history_subtree_roots,
+            commitment_root,
+        } = serde;
+        Ok(Self {
+            block_history: AppendOnlyFrontier::from_parts(
+                history_leaf_count,
+                history_subtree_roots,
+            )?,
+            commitment_root,
+        })
     }
 }
 

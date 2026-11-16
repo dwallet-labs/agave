@@ -909,6 +909,7 @@ mod serde_snapshot_tests {
             let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
             let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
             let block_id = Some(bank_fields.block_id);
+            let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
             serde_snapshot::serialize_bank_snapshot_into(
                 &mut writer,
                 bank_fields,
@@ -920,6 +921,7 @@ mod serde_snapshot_tests {
                     versioned_epoch_stakes,
                     accounts_lt_hash,
                     block_id,
+                    block_commitment,
                 },
             )
             .unwrap();
@@ -1033,6 +1035,111 @@ mod serde_snapshot_tests {
             bank.fee_rate_governor.lamports_per_signature,
             dbank.fee_rate_governor.lamports_per_signature
         );
+    }
+
+    /// Round-trips the Block Commitment Root state (block history frontier
+    /// and commitment root) of a bank through a snapshot, and checks that a
+    /// child of the restored bank extends the history as a child of the
+    /// original bank would.
+    #[test]
+    fn test_block_commitment_snapshot_round_trip() {
+        agave_logger::setup();
+        let leader_id = Pubkey::new_unique();
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_leader(500, &leader_id, LAMPORTS_PER_SOL);
+        crate::genesis_utils::activate_feature(
+            &mut genesis_config,
+            agave_feature_set::block_commitment_root::id(),
+        );
+
+        let (bank0, _bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        bank0.set_block_id(Some(BlockId::new_unique()));
+        bank0.freeze();
+        bank0.squash();
+        let bank1 = Bank::new_from_parent(bank0.clone(), *bank0.leader(), 1);
+        let block_id1 = BlockId::new_unique();
+        bank1.set_block_id(Some(block_id1));
+        bank1.freeze();
+        bank1.rc.accounts.add_root(bank1.bank_id());
+        bank1.force_flush_accounts_cache();
+        let commitment1 = bank1.block_commitment().unwrap();
+        assert_eq!(commitment1.block_history.leaf_count(), 1);
+
+        let deserialize = |buf: &[u8]| {
+            let mut reader = std::io::BufReader::new(buf);
+            let mut snapshot_streams = SnapshotStreams {
+                full_snapshot_stream: &mut reader,
+                incremental_snapshot_stream: None,
+            };
+            let (_accounts_dir, dbank_paths) = get_temp_accounts_paths(4).unwrap();
+            let copied_accounts = TempDir::new().unwrap();
+            let storage_and_next_append_vec_id =
+                copy_append_vecs(&bank1.rc.accounts.accounts_db, copied_accounts.path()).unwrap();
+            crate::serde_snapshot::bank_from_streams(
+                &mut snapshot_streams,
+                &dbank_paths,
+                storage_and_next_append_vec_id,
+                &genesis_config,
+                &RuntimeConfig::default(),
+                None,
+                None,
+                false,
+                ACCOUNTS_DB_CONFIG_FOR_TESTING,
+                None,
+                Arc::default(),
+            )
+            .unwrap()
+            .0
+        };
+
+        let mut buf = vec![];
+        crate::serde_snapshot::bank_to_stream(
+            &mut std::io::BufWriter::new(Cursor::new(&mut buf)),
+            &bank1,
+        )
+        .unwrap();
+        let dbank = Arc::new(deserialize(&buf));
+        assert_eq!(dbank.block_commitment(), Some(commitment1.clone()));
+        assert_eq!(dbank.commitment_root(), Some(commitment1.commitment_root));
+        assert_eq!(dbank.block_id(), Some(block_id1));
+
+        // The child of the restored bank appends history_leaf(bank1).
+        let bank2 = Bank::new_from_parent(dbank.clone(), *dbank.leader(), 2);
+        bank2.freeze();
+        assert_eq!(
+            bank2.block_commitment().unwrap().block_history,
+            commitment1.child_block_history(1, &block_id1.to_hash())
+        );
+
+        // A snapshot written before the field existed (it ends right after
+        // `block_id`) restores without block commitment state.
+        let mut bank_fields = bank1.get_fields_to_serialize();
+        let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
+        let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
+        let block_id = Some(bank_fields.block_id);
+        let mut old_buf = vec![];
+        serde_snapshot::serialize_bank_snapshot_into(
+            &mut old_buf,
+            bank_fields,
+            bank1.get_bank_hash_stats(),
+            ExtraFieldsToSerialize {
+                lamports_per_signature: bank1.fee_rate_governor.lamports_per_signature,
+                unused_incremental_snapshot_persistence: None,
+                unused_epoch_accounts_hash: None,
+                versioned_epoch_stakes,
+                accounts_lt_hash,
+                block_id,
+                block_commitment: None,
+            },
+        )
+        .unwrap();
+        // Drop the `None` tag of `block_commitment`.
+        assert_eq!(old_buf.pop(), Some(0));
+        let dbank = deserialize(&old_buf);
+        assert_eq!(dbank.block_commitment(), None);
+        assert_eq!(dbank.block_id(), Some(block_id1));
     }
 
     #[test]
