@@ -1,5 +1,8 @@
 use {
-    super::Bank,
+    super::{
+        Bank,
+        accounts_delta::{AccountsDeltaPrefixes, lt_hash_prefix},
+    },
     agave_worker_pool::{WorkerPool, WorkerPoolConfig},
     crossbeam_queue::SegQueue,
     crossbeam_utils::{
@@ -12,7 +15,10 @@ use {
     },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
+    solana_hash::Hash,
     solana_lattice_hash::lt_hash::LtHash,
+    solana_measure::measure_us,
+    solana_merkle_tree::accounts_delta::DELETED_ACCOUNT_HASH,
     solana_pubkey::Pubkey,
     std::{
         array,
@@ -199,6 +205,8 @@ impl Bank {
                 .finish(&mut accounts_lt_hash.0)
         };
         let finish_time = timer.elapsed();
+        let (num_accounts_delta_addresses, finish_accounts_delta_us) =
+            measure_us!(self.finish_accounts_delta());
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
         datapoint_info!(
@@ -206,6 +214,12 @@ impl Bank {
             ("slot", self.slot(), i64),
             ("num_updates", num_updates, i64),
             ("finish_us", finish_time.as_micros(), i64),
+            (
+                "num_accounts_delta_addresses",
+                num_accounts_delta_addresses,
+                i64
+            ),
+            ("finish_accounts_delta_us", finish_accounts_delta_us, i64),
             (
                 "seen_accounts_freelist_num_containers",
                 seen_accounts_freelist_stats.num_containers,
@@ -261,6 +275,10 @@ pub struct AccountsLtHashAsyncProgress {
     //  │0      │6 <-- unaligned │2054     │2176   │2182            │4230     │4352
     //
     accumulators: [Mutex<CachePadded<LtHash>>; MAX_ACCOUNTS_HASHER_THREADS],
+    /// Per-worker 32-byte prefixes of the hashed account versions, kept only if
+    /// the bank may need its accounts delta root (see `AccountsDeltaPrefixes`).
+    /// Like `accumulators`, each worker writes only its own element.
+    accounts_delta: Option<Box<[CachePadded<Mutex<AccountsDeltaPrefixes>>]>>,
     num_updates_pending: AtomicUsize,
     num_updates_total: AtomicU64,
     /// Flag to indicate if the bank has reached the end of the slot.
@@ -273,8 +291,21 @@ pub struct AccountsLtHashAsyncProgress {
 impl AccountsLtHashAsyncProgress {
     /// Creates a new AccountsLtHashAsyncProgress instance that is suitable for a new Bank.
     pub fn new() -> Self {
+        Self::new_collecting_accounts_delta(false)
+    }
+
+    /// Like `new()`, and if `collect_accounts_delta` is true, also keeps the
+    /// 32-byte prefix of every hashed account version for the accounts delta
+    /// root. Whether to collect must be decided before the bank's first
+    /// account update.
+    pub fn new_collecting_accounts_delta(collect_accounts_delta: bool) -> Self {
         Self {
             accumulators: array::from_fn(|_| Mutex::new(CachePadded::new(LtHash::identity()))),
+            accounts_delta: collect_accounts_delta.then(|| {
+                (0..MAX_ACCOUNTS_HASHER_THREADS)
+                    .map(|_| CachePadded::new(Mutex::new(AccountsDeltaPrefixes::default())))
+                    .collect()
+            }),
             num_updates_pending: AtomicUsize::new(0),
             num_updates_total: AtomicU64::new(0),
             is_at_end_of_slot: AtomicBool::new(false),
@@ -398,24 +429,85 @@ impl AccountsLtHashAsyncProgress {
         self.num_updates_total.load(Ordering::Relaxed)
     }
 
+    /// Whether this bank keeps the prefixes for the accounts delta root.
+    pub fn is_collecting_accounts_delta(&self) -> bool {
+        self.accounts_delta.is_some()
+    }
+
+    /// Takes the accounts delta prefixes of all workers, merged. `None` if this
+    /// bank does not collect them.
+    ///
+    /// Must be called after `finish()`, once every update has been hashed.
+    pub(super) fn take_accounts_delta_prefixes(&self) -> Option<AccountsDeltaPrefixes> {
+        debug_assert_eq!(self.num_updates_pending.load(Ordering::Relaxed), 0);
+        let workers = self.accounts_delta.as_ref()?;
+        let mut parts: Vec<_> = workers
+            .iter()
+            .map(|worker| mem::take(&mut *worker.lock().unwrap()))
+            .collect();
+        // Merge into the largest part to move the fewest entries. The result
+        // does not depend on the merge order.
+        let largest = parts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, part)| part.num_addresses())
+            .map(|(index, _)| index)
+            .expect("there is at least one worker");
+        let mut merged = parts.swap_remove(largest);
+        for part in parts {
+            merged.merge(part);
+        }
+        Some(merged)
+    }
+
     /// Processes `update` and mixes the result into `accum_lt_hash`.
     ///
     /// Note: Since an LtHash is large, `accum_lt_hash` is passed as an in-out parameter.
     /// This it to avoid Rust compiler bug that fails to perform return value optimization.
+    #[cfg(test)]
     fn process(accum_lt_hash: &mut LtHash, update: &AccountsLtHashUpdate) {
+        Self::process_and_collect(accum_lt_hash, None, update)
+    }
+
+    /// Like `process()`, and also records the 32-byte prefixes of the hashed
+    /// versions into `accounts_delta`, if given.
+    ///
+    /// This is the single place where every account update of a bank is hashed,
+    /// whichever path stored it, so it is where the accounts delta root takes its
+    /// account hashes: the prefix of the lattice hash computed here, without
+    /// hashing the account again. A version with zero lamports, or absent, has
+    /// the empty state and the zero prefix.
+    fn process_and_collect(
+        accum_lt_hash: &mut LtHash,
+        accounts_delta: Option<&mut AccountsDeltaPrefixes>,
+        update: &AccountsLtHashUpdate,
+    ) {
         let AccountsLtHashUpdate {
             address,
             prev_account,
             curr_account,
             has_large_version: _,
+            part,
         } = update;
+        let mut prev_prefix = DELETED_ACCOUNT_HASH;
         if let Some(prev_account) = prev_account {
             let prev_lt_hash = AccountsDb::lt_hash_account(prev_account, address);
             accum_lt_hash.mix_out(&prev_lt_hash.0);
+            prev_prefix = account_hash_prefix(prev_account.lamports(), &prev_lt_hash.0);
         }
+        let mut curr_prefix = DELETED_ACCOUNT_HASH;
         if let Some(curr_account) = curr_account {
             let curr_lt_hash = AccountsDb::lt_hash_account(curr_account, address);
             accum_lt_hash.mix_in(&curr_lt_hash.0);
+            curr_prefix = account_hash_prefix(curr_account.lamports(), &curr_lt_hash.0);
+        }
+        if let Some(accounts_delta) = accounts_delta {
+            if part.has_prev() {
+                accounts_delta.record_prev(address, prev_prefix);
+            }
+            if part.has_curr() {
+                accounts_delta.record_curr(address, curr_prefix);
+            }
         }
     }
 
@@ -618,6 +710,9 @@ impl BanksUpdates {
                     .num_updates_pending
                     .fetch_sub(1, Ordering::Relaxed);
                 let held = entry.get_mut();
+                // Both are whole updates: only spawning splits an update.
+                debug_assert_eq!(held.part, UpdatePart::Whole);
+                debug_assert_eq!(update.part, UpdatePart::Whole);
                 held.curr_account = update.curr_account;
                 // Keeping the held flag may split an update whose large version was
                 // overwritten, which costs one extra job.
@@ -658,6 +753,30 @@ struct AccountsLtHashUpdate {
     /// Whether a version's data reaches `SPLIT_ACCOUNT_DATA_LEN`. The producer sets it
     /// while it holds the accounts in cache, so dispatch never reads account data.
     has_large_version: bool,
+    /// Which versions of the account update this job stands for. A split update
+    /// is hashed as two jobs; the accounts delta must count each version once.
+    part: UpdatePart,
+}
+
+/// The versions of an account update that one hashing job stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdatePart {
+    /// Both the previous and the current version (`None` meaning empty).
+    Whole,
+    /// Only the previous version; the current one is hashed by another job.
+    PrevOnly,
+    /// Only the current version; the previous one is hashed by another job.
+    CurrOnly,
+}
+
+impl UpdatePart {
+    fn has_prev(self) -> bool {
+        matches!(self, Self::Whole | Self::PrevOnly)
+    }
+
+    fn has_curr(self) -> bool {
+        matches!(self, Self::Whole | Self::CurrOnly)
+    }
 }
 
 impl AccountsLtHashUpdate {
@@ -676,6 +795,7 @@ impl AccountsLtHashUpdate {
             has_large_version: is_large(&prev_account) || is_large(&curr_account),
             prev_account,
             curr_account,
+            part: UpdatePart::Whole,
         }
     }
 
@@ -685,12 +805,25 @@ impl AccountsLtHashUpdate {
 
     /// Moves the prev version into an update of its own and leaves the curr version.
     fn take_prev(&mut self) -> Self {
+        debug_assert_eq!(self.part, UpdatePart::Whole);
+        self.part = UpdatePart::CurrOnly;
         Self {
             address: self.address,
             prev_account: self.prev_account.take(),
             curr_account: None,
             has_large_version: false,
+            part: UpdatePart::PrevOnly,
         }
+    }
+}
+
+/// `account_hash` of a hashed account version: 32 zero bytes if it has zero
+/// lamports, otherwise the first 32 bytes of its lattice hash.
+fn account_hash_prefix(lamports: u64, lt_hash: &LtHash) -> Hash {
+    if lamports == 0 {
+        DELETED_ACCOUNT_HASH
+    } else {
+        lt_hash_prefix(lt_hash)
     }
 }
 
@@ -832,8 +965,17 @@ impl AccountsLtHashChunk {
     /// Hashes the updates into the accumulator of the worker with `worker_id`.
     fn hash(&self, worker_id: usize) {
         let mut accumulator = self.async_progress.accumulators[worker_id].lock().unwrap();
+        let mut accounts_delta = self
+            .async_progress
+            .accounts_delta
+            .as_ref()
+            .map(|workers| workers[worker_id].lock().unwrap());
         for update in &self.updates {
-            AccountsLtHashAsyncProgress::process(&mut accumulator, update);
+            AccountsLtHashAsyncProgress::process_and_collect(
+                &mut accumulator,
+                accounts_delta.as_deref_mut(),
+                update,
+            );
         }
     }
 }
@@ -1492,6 +1634,32 @@ mod tests {
         AccountsLtHashAsyncProgress::process(&mut lt_hash, &prev_half);
         AccountsLtHashAsyncProgress::process(&mut lt_hash, &curr_half);
         assert_eq!(lt_hash, expected_lt_hash);
+
+        // Each half records only its own version for the accounts delta, so
+        // the halves together record what the whole update records.
+        assert_eq!(prev_half.part, UpdatePart::PrevOnly);
+        assert_eq!(curr_half.part, UpdatePart::CurrOnly);
+        let mut whole_update = update(SPLIT_ACCOUNT_DATA_LEN, 1);
+        let address = whole_update.address;
+        let mut whole = AccountsDeltaPrefixes::default();
+        AccountsLtHashAsyncProgress::process_and_collect(
+            &mut LtHash::identity(),
+            Some(&mut whole),
+            &whole_update,
+        );
+        let mut halves = AccountsDeltaPrefixes::default();
+        let prev_half = whole_update.take_prev();
+        for half in [&whole_update, &prev_half] {
+            AccountsLtHashAsyncProgress::process_and_collect(
+                &mut LtHash::identity(),
+                Some(&mut halves),
+                half,
+            );
+        }
+        let whole = whole.into_accounts_delta().unwrap();
+        assert_eq!(whole, halves.into_accounts_delta().unwrap());
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole.entries()[0].address, address.to_bytes());
     }
 
     #[test]
@@ -1608,6 +1776,102 @@ mod tests {
         let mut lt_hash = LtHash::identity();
         async_progress.finish(&mut lt_hash);
         assert_eq!(lt_hash, expected_lt_hash);
+    }
+
+    /// The accounts delta prefixes collected through the pipeline (spawned,
+    /// queued and merged, split) resolve to each account's state before the
+    /// first and after the last update, whatever order the workers hash in.
+    #[test]
+    fn test_pipeline_collects_accounts_delta() {
+        use super::super::accounts_delta::account_hash;
+        let owner = Pubkey::default();
+        let version = |lamports, data_len| {
+            AccountSharedData::new_with_data(lamports, vec![lamports as u8; data_len], &owner)
+        };
+        // Every account starts with a version from a previous block, except
+        // every fifth one, which is created in this block.
+        let initial: Vec<_> = (0..90usize)
+            .map(|index| {
+                let data_len = 512 << (index % 9);
+                (
+                    Pubkey::new_unique(),
+                    (index % 5 != 0).then(|| version(100, data_len)),
+                )
+            })
+            .collect();
+        let mut accounts = initial.clone();
+        let async_progress = Arc::new(AccountsLtHashAsyncProgress::new_collecting_accounts_delta(
+            true,
+        ));
+        assert!(async_progress.is_collecting_accounts_delta());
+        let num_rounds = 4;
+        for (round, spawn) in (1..).zip([true, false, false, true]) {
+            let updates: Vec<_> = accounts
+                .iter_mut()
+                .enumerate()
+                .map(|(index, (address, last_version))| {
+                    let data_len = 512 << (index % 9);
+                    let curr = if round < num_rounds {
+                        Some(version(round, data_len))
+                    } else {
+                        // Last round: close a third of the accounts, restore a
+                        // third to their initial version, change the rest.
+                        match index % 3 {
+                            0 => None,
+                            1 => initial[index].1.clone(),
+                            _ => Some(version(round, data_len)),
+                        }
+                    };
+                    let prev = mem::replace(last_version, curr.clone());
+                    AccountsLtHashUpdate::new(*address, prev, curr)
+                })
+                .collect();
+            if spawn {
+                async_progress.add_deduped_count(updates.len());
+                async_progress.send_chunked(
+                    &accounts_lt_hash_manager().thread_pool,
+                    updates,
+                    OFF_CHAIN_CHUNK_LEN,
+                );
+            } else {
+                async_progress.enqueue_for_dedup(updates.len(), updates);
+            }
+        }
+        let mut lt_hash = LtHash::identity();
+        async_progress.finish(&mut lt_hash);
+        let delta = async_progress
+            .take_accounts_delta_prefixes()
+            .unwrap()
+            .into_accounts_delta()
+            .unwrap();
+
+        let hash_of = |address: &Pubkey, account: &Option<AccountSharedData>| {
+            account.as_ref().map_or(DELETED_ACCOUNT_HASH, |account| {
+                account_hash(account, address)
+            })
+        };
+        let mut expected: Vec<_> = initial
+            .iter()
+            .zip(&accounts)
+            .filter_map(|((address, before), (_, after))| {
+                let (before, after) = (hash_of(address, before), hash_of(address, after));
+                (before != after).then(|| {
+                    solana_merkle_tree::accounts_delta::DeltaEntry::new(address.to_bytes(), after)
+                })
+            })
+            .collect();
+        expected.sort();
+        // Closed accounts that were created in this block, and restored
+        // accounts, are not leaves.
+        assert!(expected.len() < accounts.len());
+        assert!(expected.iter().any(|entry| entry.is_deletion()));
+        assert_eq!(delta.entries(), expected.as_slice());
+        // The prefixes were taken once; a non-collecting progress has none.
+        assert!(
+            AccountsLtHashAsyncProgress::new()
+                .take_accounts_delta_prefixes()
+                .is_none()
+        );
     }
 
     /// Ensure freelist respects max size.

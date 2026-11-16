@@ -245,6 +245,7 @@ use {
     solana_svm::program_loader::load_program_with_pubkey,
 };
 
+pub mod accounts_delta;
 mod accounts_lt_hash;
 mod address_lookup_table;
 pub mod bank_hash_details;
@@ -718,6 +719,8 @@ impl PartialEq for Bank {
             expected_bank_hash: _,
             block_commitment,
             expected_commitment_root: _,
+            // Derived from the account updates; `block_commitment` commits to it.
+            accounts_delta: _,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
             block_component_processor: _,
@@ -1027,6 +1030,12 @@ pub struct Bank {
     /// processing the footer; verified once the bank is frozen.
     expected_commitment_root: RwLock<Option<Hash>>,
 
+    /// Accounts Delta Root: the accounts changed in this bank, sorted, and
+    /// their root. Computed when the bank is frozen with the
+    /// `block_commitment_root` and `accounts_delta_root` features active.
+    /// None otherwise, and for banks loaded from a snapshot.
+    accounts_delta: RwLock<Option<Arc<solana_merkle_tree::accounts_delta::AccountsDelta>>>,
+
     /// Accounts stats for computing the bank hash
     bank_hash_stats: AtomicBankHashStats,
 
@@ -1291,11 +1300,17 @@ impl Bank {
             transaction_account_lock_limit: None,
             fee_structure: FeeStructure::default(),
             accounts_lt_hash: Mutex::new(AccountsLtHash(LtHash::identity())),
-            accounts_lt_hash_async_progress: Arc::new(AccountsLtHashAsyncProgress::new()),
+            // A bank without a parent (genesis, tests) applies its feature set
+            // after its first account updates, so it always collects the
+            // accounts delta prefixes.
+            accounts_lt_hash_async_progress: Arc::new(
+                AccountsLtHashAsyncProgress::new_collecting_accounts_delta(true),
+            ),
             block_id: RwLock::new(None),
             expected_bank_hash: RwLock::new(None),
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
+            accounts_delta: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -1542,11 +1557,16 @@ impl Bank {
             transaction_account_lock_limit: parent.transaction_account_lock_limit,
             fee_structure: parent.fee_structure.clone(),
             accounts_lt_hash: Mutex::new(parent.accounts_lt_hash.lock().unwrap().clone()),
-            accounts_lt_hash_async_progress: Arc::new(AccountsLtHashAsyncProgress::new()),
+            accounts_lt_hash_async_progress: Arc::new(
+                AccountsLtHashAsyncProgress::new_collecting_accounts_delta(
+                    Self::collects_accounts_delta_after(&parent, epoch),
+                ),
+            ),
             block_id: RwLock::new(None),
             expected_bank_hash: RwLock::new(None),
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
+            accounts_delta: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -2309,6 +2329,7 @@ impl Bank {
             expected_bank_hash: RwLock::new(None),
             block_commitment: RwLock::new(fields.block_commitment),
             expected_commitment_root: RwLock::new(None),
+            accounts_delta: RwLock::new(None),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
             is_alpenglow: AtomicBool::new(false),
             transaction_execution_gate: CachePadded::new(TransactionExecutionGate::default()),

@@ -189,6 +189,7 @@ wincode = { workspace = true, features = ["smallvec"] }
 agave-logger = { path = "../logger", features = ["agave-unstable-api"] }
 agave-transaction-view = { workspace = true }
 bitvec = { workspace = true }
+blake3 = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true }
 libsecp256k1 = { workspace = true }
