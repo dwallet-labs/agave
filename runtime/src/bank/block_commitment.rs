@@ -292,13 +292,16 @@ impl Bank {
 
     /// Commitment slot 4: `epoch_boundary` (Epoch Boundary Commitment SIMD).
     ///
-    /// Extension point: not implemented yet, so the slot is inactive and
-    /// zero. The implementation must return [`INACTIVE_COMMITMENT_SLOT`]
-    /// unless its own feature is active for this bank. `inputs` carries the
-    /// parent bank (`P` when this bank is the first of its epoch) and
-    /// `H(B)`, whose leaf count is `history_len`.
-    pub fn commitment_slot_epoch_boundary(&self, _inputs: &CommitmentInputs) -> Hash {
-        INACTIVE_COMMITMENT_SLOT
+    /// [`INACTIVE_COMMITMENT_SLOT`] unless the `epoch_boundary_commitment`
+    /// feature is active for this bank and the bank has an epoch boundary
+    /// (see [`super::epoch_boundary`]). `inputs` carries the parent bank (`P`
+    /// when this bank is the first of its epoch) and `H(B)`, whose leaf count
+    /// is `history_len`. `freeze()` stores the same value as the bank's epoch
+    /// boundary state.
+    pub fn commitment_slot_epoch_boundary(&self, inputs: &CommitmentInputs) -> Hash {
+        self.compute_epoch_boundary(inputs.parent, inputs.block_history.leaf_count())
+            .map(|epoch_boundary| epoch_boundary.hash())
+            .unwrap_or(INACTIVE_COMMITMENT_SLOT)
     }
 }
 
