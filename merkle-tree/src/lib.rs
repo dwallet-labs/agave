@@ -2,5 +2,6 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 pub mod commitment_tree;
+pub mod epoch_boundary;
 pub mod merkle_tree;
 pub use merkle_tree::MerkleTree;
