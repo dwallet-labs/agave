@@ -248,6 +248,7 @@ use {
 mod accounts_lt_hash;
 mod address_lookup_table;
 pub mod bank_hash_details;
+pub mod block_commitment;
 pub mod builtins;
 mod check_transactions;
 pub mod entry_bytes_budget;
@@ -527,6 +528,7 @@ pub enum VATHealthError {
         accounts_lt_hash(pub),
         bank_hash_stats(pub),
         block_id(pub),
+        block_commitment(pub),
     )
 )]
 pub struct BankFieldsToDeserialize {
@@ -559,6 +561,9 @@ pub struct BankFieldsToDeserialize {
     pub(crate) accounts_lt_hash: AccountsLtHash,
     pub(crate) bank_hash_stats: BankHashStats,
     pub(crate) block_id: Option<BlockId>, // Option wrapper can be removed in version after v4.1
+    /// Block Commitment Root state of the snapshot bank, None if the feature
+    /// was not active for it (or the snapshot predates the feature).
+    pub(crate) block_commitment: Option<block_commitment::BlockCommitment>,
 }
 
 #[cfg(feature = "dev-context-only-utils")]
@@ -592,6 +597,7 @@ impl Default for BankFieldsToDeserialize {
             accounts_lt_hash: AccountsLtHash(LtHash::identity()),
             bank_hash_stats: BankHashStats::default(),
             block_id: Option::<BlockId>::default(),
+            block_commitment: None,
         }
     }
 }
@@ -632,6 +638,7 @@ pub struct BankFieldsToSerialize {
     pub versioned_epoch_stakes: HashMap<u64, VersionedEpochStakes>,
     pub accounts_lt_hash: AccountsLtHash,
     pub block_id: BlockId,
+    pub block_commitment: Option<block_commitment::BlockCommitment>,
 }
 
 // Can't derive PartialEq because RwLock doesn't implement PartialEq
@@ -709,6 +716,8 @@ impl PartialEq for Bank {
             accounts_lt_hash_async_progress: _,
             block_id,
             expected_bank_hash: _,
+            block_commitment,
+            expected_commitment_root: _,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
             block_component_processor: _,
@@ -750,6 +759,7 @@ impl PartialEq for Bank {
             && is_delta.load(Relaxed) == other.is_delta.load(Relaxed)
             && *accounts_lt_hash.lock().unwrap() == *other.accounts_lt_hash.lock().unwrap()
             && *block_id.read().unwrap() == *other.block_id.read().unwrap()
+            && *block_commitment.read().unwrap() == *other.block_commitment.read().unwrap()
             && is_alpenglow.load(Relaxed) == other.is_alpenglow()
     }
 }
@@ -786,6 +796,7 @@ impl BankFieldsToSerialize {
             versioned_epoch_stakes: HashMap::default(),
             accounts_lt_hash: AccountsLtHash(LtHash([0x7E57; LtHash::NUM_ELEMENTS])),
             block_id: BlockId::default(),
+            block_commitment: None,
         }
     }
 }
@@ -1006,6 +1017,15 @@ pub struct Bank {
     /// Expected bank hash provided by block footer (if any). Set when processing footer; verified
     /// later when the bank is frozen.
     expected_bank_hash: RwLock<Option<Hash>>,
+
+    /// Block Commitment Root state (block history frontier and commitment
+    /// root). Computed when the bank is frozen with the `block_commitment_root`
+    /// feature active, or loaded from a snapshot. None otherwise.
+    block_commitment: RwLock<Option<block_commitment::BlockCommitment>>,
+
+    /// Expected commitment root provided by the block footer (if any). Set when
+    /// processing the footer; verified once the bank is frozen.
+    expected_commitment_root: RwLock<Option<Hash>>,
 
     /// Accounts stats for computing the bank hash
     bank_hash_stats: AtomicBankHashStats,
@@ -1274,6 +1294,8 @@ impl Bank {
             accounts_lt_hash_async_progress: Arc::new(AccountsLtHashAsyncProgress::new()),
             block_id: RwLock::new(None),
             expected_bank_hash: RwLock::new(None),
+            block_commitment: RwLock::new(None),
+            expected_commitment_root: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -1523,6 +1545,8 @@ impl Bank {
             accounts_lt_hash_async_progress: Arc::new(AccountsLtHashAsyncProgress::new()),
             block_id: RwLock::new(None),
             expected_bank_hash: RwLock::new(None),
+            block_commitment: RwLock::new(None),
+            expected_commitment_root: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -2283,6 +2307,8 @@ impl Bank {
             bank_hash_stats: AtomicBankHashStats::new(&fields.bank_hash_stats),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
             expected_bank_hash: RwLock::new(None),
+            block_commitment: RwLock::new(fields.block_commitment),
+            expected_commitment_root: RwLock::new(None),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
             is_alpenglow: AtomicBool::new(false),
             transaction_execution_gate: CachePadded::new(TransactionExecutionGate::default()),
@@ -2376,6 +2402,7 @@ impl Bank {
             versioned_epoch_stakes: self.epoch_stakes.clone(),
             accounts_lt_hash: self.accounts_lt_hash.lock().unwrap().clone(),
             block_id: self.block_id().expect("block id must be set"),
+            block_commitment: self.block_commitment(),
         }
     }
 
@@ -3282,6 +3309,10 @@ impl Bank {
             // that rehash() can be called and *not* modify self.accounts_lt_hash.
             self.finish_accounts_lt_hash_updates();
             *hash = self.hash_internal_state();
+            // The commitment vector is computed at the same point as the bank
+            // hash, after the lattice hash is finished, and while the hash
+            // lock is held so that a frozen bank always has it.
+            *self.block_commitment.write().unwrap() = self.compute_block_commitment();
             self.rc
                 .accounts
                 .accounts_db

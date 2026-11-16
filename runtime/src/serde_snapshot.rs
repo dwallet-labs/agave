@@ -9,7 +9,10 @@ use std::{
 };
 use {
     crate::{
-        bank::{Bank, BankFieldsToDeserialize, BankFieldsToSerialize, BankHashStats, BankRc},
+        bank::{
+            Bank, BankFieldsToDeserialize, BankFieldsToSerialize, BankHashStats, BankRc,
+            block_commitment::BlockCommitment,
+        },
         epoch_stakes::{DeserializableVersionedEpochStakes, VersionedEpochStakes},
         runtime_config::RuntimeConfig,
     },
@@ -43,7 +46,7 @@ use {
         thread,
         time::Instant,
     },
-    types::{SerdeAccountsLtHash, UnusedRentCollector, UnusedStakes},
+    types::{SerdeAccountsLtHash, SerdeBlockCommitment, UnusedRentCollector, UnusedStakes},
     wincode::{
         ReadResult, SchemaRead, SchemaReadOwned, SchemaWrite, WriteResult,
         adapter::{DefaultOnEmptyRead, DiscardSeq},
@@ -249,7 +252,8 @@ impl From<DeserializableVersionedBank> for BankFieldsToDeserialize {
             versioned_epoch_stakes: vec![], // populated from ExtraFieldsToDeserialize
             accounts_lt_hash: AccountsLtHash(LT_HASH_CANARY), // populated from ExtraFieldsToDeserialize
             bank_hash_stats: BankHashStats::default(),        // populated from AccountsDbFields
-            block_id: None, // populated from ExtraFieldsToDeserialize
+            block_id: None,         // populated from ExtraFieldsToDeserialize
+            block_commitment: None, // populated from ExtraFieldsToDeserialize
         }
     }
 }
@@ -455,6 +459,10 @@ struct ExtraFieldsToDeserialize {
     accounts_lt_hash: Option<SerdeAccountsLtHash>,
     #[wincode(with = "DefaultOnEmptyRead<Option<BlockId>>")]
     block_id: Option<BlockId>,
+    /// Block Commitment Root state of the snapshot bank (block history
+    /// frontier and commitment root).
+    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeBlockCommitment>>")]
+    block_commitment: Option<SerdeBlockCommitment>,
 }
 
 /// Extra fields that are serialized at the end of snapshots.
@@ -483,6 +491,9 @@ pub struct ExtraFieldsToSerialize {
     pub versioned_epoch_stakes: HashMap<u64, VersionedEpochStakes>,
     pub accounts_lt_hash: Option<SerdeAccountsLtHash>,
     pub block_id: Option<BlockId>,
+    /// None when the Block Commitment Root feature is not active for the
+    /// snapshot bank.
+    pub block_commitment: Option<SerdeBlockCommitment>,
 }
 
 /// Deserializable counterpart of [`SerializableBankSnapshot`], read as one struct (wincode reads
@@ -527,6 +538,7 @@ impl DeserializableBankSnapshot {
             versioned_epoch_stakes,
             accounts_lt_hash,
             block_id,
+            block_commitment,
         } = extra_fields;
 
         bank_fields.fee_rate_governor = bank_fields
@@ -537,6 +549,14 @@ impl DeserializableBankSnapshot {
             .expect("snapshot must have accounts_lt_hash")
             .into();
         bank_fields.block_id = block_id;
+        bank_fields.block_commitment = block_commitment
+            .map(BlockCommitment::try_from)
+            .transpose()
+            .map_err(|_| {
+                wincode::ReadError::InvalidValue(
+                    "block commitment history subtree roots do not match the leaf count",
+                )
+            })?;
 
         Ok((bank_fields, accounts_db))
     }
@@ -631,6 +651,7 @@ where
     let versioned_epoch_stakes = std::mem::take(&mut bank_fields.versioned_epoch_stakes);
     let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
     let block_id = Some(bank_fields.block_id);
+    let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
     serialize_bank_snapshot_into(
         stream,
         bank_fields,
@@ -642,6 +663,7 @@ where
             versioned_epoch_stakes,
             accounts_lt_hash,
             block_id,
+            block_commitment,
         },
     )
 }

@@ -45,6 +45,24 @@ use {
     wincode::{SchemaRead, SchemaWrite},
 };
 
+/// Features that the test/dev genesis helpers in this module do not activate,
+/// although they activate every other feature.
+///
+/// `block_commitment_root` changes the block footer version that replay
+/// accepts and the derivation of the block id, so it is activated explicitly
+/// by the tests that exercise it (see `activate_feature`).
+pub const FEATURES_INACTIVE_IN_TEST_GENESIS: &[Pubkey] =
+    &[agave_feature_set::block_commitment_root::ID];
+
+/// `FeatureSet::all_enabled()` minus [`FEATURES_INACTIVE_IN_TEST_GENESIS`].
+pub fn all_enabled_test_feature_set() -> FeatureSet {
+    let mut feature_set = FeatureSet::all_enabled();
+    for feature_id in FEATURES_INACTIVE_IN_TEST_GENESIS {
+        feature_set.deactivate(feature_id);
+    }
+    feature_set
+}
+
 // Default amount received by the validator
 const VALIDATOR_LAMPORTS: u64 = 890_880;
 const MINT_KEYPAIR_SEED: [u8; 32] = [
@@ -148,7 +166,7 @@ pub fn create_genesis_config_with_default_rent(mint_lamports: u64) -> GenesisCon
         mint_lamports,
         &solana_pubkey::new_rand(), // validator_pubkey
         0,                          // validator_stake_lamports
-        &FeatureSet::all_enabled(),
+        &all_enabled_test_feature_set(),
         Rent::default(),
     )
 }
@@ -163,7 +181,7 @@ pub fn create_genesis_config_with_vote_accounts(
         voting_keypairs,
         stakes,
         ClusterType::Development,
-        FeatureSet::all_enabled(),
+        all_enabled_test_feature_set(),
     )
 }
 
@@ -173,7 +191,7 @@ pub fn create_genesis_config_with_tower_vote_accounts(
     voting_keypairs: &[impl Borrow<ValidatorVoteKeypairs>],
     stakes: Vec<u64>,
 ) -> GenesisConfigInfo {
-    let mut feature_set = FeatureSet::all_enabled();
+    let mut feature_set = all_enabled_test_feature_set();
     feature_set.deactivate(&agave_feature_set::alpenglow::id());
     create_genesis_config_with_vote_accounts_and_cluster_type(
         mint_lamports,
@@ -297,7 +315,7 @@ pub fn create_genesis_config_with_tower_leader(
     validator_stake_lamports: u64,
 ) -> GenesisConfigInfo {
     let mint_keypair = Keypair::from_seed(&MINT_KEYPAIR_SEED).unwrap();
-    let mut feature_set = FeatureSet::all_enabled();
+    let mut feature_set = all_enabled_test_feature_set();
     feature_set.deactivate(&agave_feature_set::alpenglow::id());
     create_genesis_config_with_leader_with_mint_keypair_and_feature_set(
         mint_keypair,
@@ -320,7 +338,7 @@ pub fn create_genesis_config_with_leader_with_mint_keypair(
         mint_lamports,
         validator_pubkey,
         validator_stake_lamports,
-        &FeatureSet::all_enabled(),
+        &all_enabled_test_feature_set(),
         Rent::free(),
     )
 }
@@ -414,6 +432,9 @@ pub fn activate_all_features_tower(genesis_config: &mut GenesisConfig) {
 fn do_activate_all_features<const IS_ALPENGLOW: bool>(genesis_config: &mut GenesisConfig) {
     // Activate all features at genesis in development mode
     for feature_id in FeatureSet::default().inactive() {
+        if FEATURES_INACTIVE_IN_TEST_GENESIS.contains(feature_id) {
+            continue;
+        }
         if IS_ALPENGLOW || *feature_id != agave_feature_set::alpenglow::id() {
             activate_feature(genesis_config, *feature_id);
         }

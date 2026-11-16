@@ -75,6 +75,8 @@ pub enum BlockComponentProcessorError {
     InvalidAlpentickPosition,
     #[error("Multiple block footers detected")]
     MultipleBlockFooters,
+    #[error("Block footer version {actual} is invalid, expected version {expected}")]
+    InvalidBlockFooterVersion { expected: u8, actual: u8 },
     #[error("Multiple block headers detected")]
     MultipleBlockHeaders,
     #[error(
@@ -118,6 +120,7 @@ impl BlockComponentProcessorError {
             | BlockComponentProcessorError::EntryBatchAfterBlockFooter
             | BlockComponentProcessorError::InvalidAlpentickPosition
             | BlockComponentProcessorError::MultipleBlockFooters
+            | BlockComponentProcessorError::InvalidBlockFooterVersion { .. }
             | BlockComponentProcessorError::MultipleBlockHeaders
             | BlockComponentProcessorError::HeaderParentSlotMismatch { .. }
             | BlockComponentProcessorError::NanosecondClockOutOfBounds
@@ -602,7 +605,21 @@ impl BlockComponentProcessor {
     ) -> Result<(), BlockComponentProcessorError> {
         self.stage.on_footer()?;
 
-        let VersionedBlockFooter::V1(footer) = footer;
+        // Block Commitment Root: once the feature is active the footer must
+        // be V2 (carrying `commitment_root`); before activation V2 is invalid,
+        // since it also changes how the block id is derived.
+        let expected_version = if bank.is_block_commitment_root_active() {
+            VersionedBlockFooter::V2_TAG
+        } else {
+            VersionedBlockFooter::V1_TAG
+        };
+        if footer.version() != expected_version {
+            return Err(BlockComponentProcessorError::InvalidBlockFooterVersion {
+                expected: expected_version,
+                actual: footer.version(),
+            });
+        }
+        let (footer, commitment_root) = footer.into_v1_and_commitment_root();
 
         Self::enforce_nanosecond_clock_bounds(bank, &parent_bank, &footer)?;
 
@@ -646,6 +663,11 @@ impl BlockComponentProcessor {
         if let Some((result, execute_time)) = bank.wait_for_completed_scheduler() {
             execute_timings.accumulate(&execute_time);
             result?;
+        }
+
+        if let Some(commitment_root) = commitment_root {
+            // Recorded like the bank hash and compared when the bank is frozen.
+            bank.set_expected_commitment_root(commitment_root);
         }
 
         let _ = Self::update_bank_with_footer_fields(
@@ -976,6 +998,92 @@ mod tests {
         assert!(migration_status.is_ready_to_enable());
         assert_eq!(bank.hashes_per_tick(), tower_hashes_per_tick);
         assert!(bank.get_alpenglow_genesis_certificate().is_some());
+    }
+
+    fn create_test_bank_with_block_commitment_root() -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
+        let mut genesis_config_info = create_genesis_config(10_000);
+        crate::genesis_utils::activate_feature(
+            &mut genesis_config_info.genesis_config,
+            agave_feature_set::block_commitment_root::id(),
+        );
+        Bank::new_with_bank_forks_for_tests(&genesis_config_info.genesis_config)
+    }
+
+    fn footer_v1_for(parent: &Bank) -> BlockFooterV1 {
+        let parent_time_nanos = parent.clock().unix_timestamp.saturating_mul(1_000_000_000);
+        BlockFooterV1 {
+            bank_hash: Hash::new_unique(),
+            block_producer_time_nanos: (parent_time_nanos + 200_000_000) as u64,
+            block_user_agent: vec![],
+            block_final_cert: None,
+            skip_reward_cert: None,
+            notar_reward_cert: None,
+        }
+    }
+
+    fn process_footer(
+        parent: Arc<Bank>,
+        bank: &Arc<Bank>,
+        footer: VersionedBlockFooter,
+    ) -> Result<(), BlockComponentProcessorError> {
+        let mut processor = processor_after_header();
+        processor.on_footer(
+            &Pubkey::new_unique(),
+            &BankWithScheduler::new_without_scheduler(bank.clone()),
+            parent,
+            0,
+            footer,
+            None,
+            &mut ExecuteTimings::default(),
+        )
+    }
+
+    #[test]
+    fn test_footer_version_gated_by_block_commitment_root() {
+        // Feature inactive: V1 accepted, V2 rejected.
+        let (parent, bank_forks) = create_test_bank();
+        assert!(!parent.is_block_commitment_root_active());
+        let bank = create_child_bank(&bank_forks, &parent, 1);
+        let v2 = VersionedBlockFooter::new_for_feature(footer_v1_for(&parent), true);
+        assert_matches!(
+            process_footer(parent.clone(), &bank, v2),
+            Err(BlockComponentProcessorError::InvalidBlockFooterVersion {
+                expected: 1,
+                actual: 2
+            })
+        );
+        let v1 = VersionedBlockFooter::new_for_feature(footer_v1_for(&parent), false);
+        process_footer(parent, &bank, v1).unwrap();
+        assert_eq!(bank.expected_commitment_root(), None);
+
+        // Feature active: V1 rejected, V2 accepted and its commitment root
+        // recorded for verification at freeze.
+        let (parent, bank_forks) = create_test_bank_with_block_commitment_root();
+        assert!(parent.is_block_commitment_root_active());
+        let bank = create_child_bank(&bank_forks, &parent, 1);
+        let v1 = VersionedBlockFooter::new_for_feature(footer_v1_for(&parent), false);
+        assert_matches!(
+            process_footer(parent.clone(), &bank, v1),
+            Err(BlockComponentProcessorError::InvalidBlockFooterVersion {
+                expected: 2,
+                actual: 1
+            })
+        );
+        let mut v2 = VersionedBlockFooter::new_for_feature(footer_v1_for(&parent), true);
+        let commitment_root = Hash::new_unique();
+        assert!(v2.set_commitment_root(commitment_root));
+        let bank_hash = v2.bank_hash();
+        process_footer(parent, &bank, v2).unwrap();
+        assert_eq!(bank.expected_commitment_root(), Some(commitment_root));
+        assert_eq!(bank.expected_bank_hash(), Some(bank_hash));
+
+        // The wrong value is detected when the bank is frozen.
+        bank.fill_bank_with_ticks_for_tests();
+        bank.freeze();
+        assert_eq!(
+            bank.verify_commitment_root(),
+            Err((commitment_root, bank.commitment_root().unwrap()))
+        );
     }
 
     #[test]
