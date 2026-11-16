@@ -3,4 +3,5 @@
 
 pub mod commitment_tree;
 pub mod merkle_tree;
+pub mod validator_set;
 pub use merkle_tree::MerkleTree;
