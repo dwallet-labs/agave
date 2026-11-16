@@ -3,6 +3,8 @@ use {
     agave_shred_wire_format::constants::{
         MERKLE_PROOF_ENTRIES, MerkleProofEntry, SIZE_OF_MERKLE_PROOF_ENTRY, SIZE_OF_MERKLE_ROOT,
     },
+    solana_clock::Slot,
+    solana_entry::block_component::FooterBinding,
     solana_hash::Hash,
     solana_sha256_hasher::hashv,
     static_assertions::const_assert_eq,
@@ -21,6 +23,44 @@ const_assert_eq!(PROOF_ENTRIES_FOR_32_32_BATCH, 6);
 // hash data when computing leaf and internal node hashes respectively.
 pub(crate) const MERKLE_HASH_PREFIX_LEAF: &[u8] = b"\x00SOLANA_MERKLE_SHREDS_LEAF";
 pub(crate) const MERKLE_HASH_PREFIX_NODE: &[u8] = b"\x01SOLANA_MERKLE_SHREDS_NODE";
+
+/// Final leaf of the double merkle tree whose root is the block id.
+///
+/// Without a footer binding this is
+/// `sha256(u64_le(parent_slot) || parent_block_id || u32_le(fec_set_count))`.
+/// A block whose footer is V2 (Block Commitment Root SIMD) also binds the
+/// footer's `bank_hash` and `commitment_root`:
+/// `sha256(u64_le(parent_slot) || parent_block_id || u32_le(fec_set_count)
+///         || bank_hash || commitment_root)`.
+///
+/// The `fec_set_count` is bound into this leaf so that an adversary cannot
+/// convince a verifier that the count is off-by-one when the number of FEC
+/// sets is even (which makes the total leaf count odd and causes the last
+/// leaf to be hashed with itself during tree construction).
+pub fn double_merkle_final_leaf(
+    parent_slot: Slot,
+    parent_block_id: &Hash,
+    fec_set_count: u32,
+    footer_binding: Option<&FooterBinding>,
+) -> Hash {
+    match footer_binding {
+        None => hashv(&[
+            &parent_slot.to_le_bytes(),
+            parent_block_id.as_ref(),
+            &fec_set_count.to_le_bytes(),
+        ]),
+        Some(FooterBinding {
+            bank_hash,
+            commitment_root,
+        }) => hashv(&[
+            &parent_slot.to_le_bytes(),
+            parent_block_id.as_ref(),
+            &fec_set_count.to_le_bytes(),
+            bank_hash.as_ref(),
+            commitment_root.as_ref(),
+        ]),
+    }
+}
 
 /// Borrows the prefix of a hash represented by a Merkle proof entry.
 #[inline]

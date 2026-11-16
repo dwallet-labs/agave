@@ -28,6 +28,7 @@ use {
         },
     },
     solana_clock::Slot,
+    solana_entry::block_component::FooterBinding,
     solana_gossip::{
         cluster_info::{ClusterInfo, ClusterInfoError},
         contact_info::{ContactInfo, Protocol},
@@ -50,7 +51,6 @@ use {
     solana_poh::poh_recorder::SharedLeaderState,
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_runtime::bank_forks::SharableBanks,
-    solana_sha256_hasher::hashv,
     solana_signature::{SIGNATURE_BYTES, Signature},
     solana_signer::Signer,
     solana_streamer::streamer::PacketBatchSender,
@@ -248,6 +248,55 @@ pub enum BlockIdRepairResponse {
     Ping {
         ping: Ping,
     },
+
+    /// `ParentFecSetCount` for a block whose final leaf also binds the
+    /// footer's `bank_hash` and `commitment_root` (Block Commitment Root
+    /// SIMD: the block's footer is V2). Added as a new variant so that the
+    /// encoding of the existing variants does not change.
+    ParentFecSetCountWithFooter {
+        fec_set_count: u32,
+        parent_info: (Slot, Hash),
+        /// `(bank_hash, commitment_root)` of the block footer.
+        footer_binding: (Hash, Hash),
+        parent_proof: Vec<u8>,
+    },
+}
+
+/// Verifies the final (parent info) leaf of the double merkle tree against
+/// `block_id`. Shared by both `ParentFecSetCount` response variants.
+fn verify_parent_fec_set_count(
+    block_id: &BlockId,
+    fec_set_count: u32,
+    (parent_slot, parent_block_id): (Slot, Hash),
+    footer_binding: Option<&FooterBinding>,
+    parent_proof: &[u8],
+) -> bool {
+    if fec_set_count == 0 || fec_set_count > MAX_FEC_SETS_PER_SLOT {
+        return false;
+    }
+
+    // + 1 here to account for the parent info which is the final leaf of the tree
+    let proof_size = merkle_tree::get_proof_size(fec_set_count as usize + 1);
+    if parent_proof.len() != proof_size as usize * SIZE_OF_MERKLE_PROOF_ENTRY {
+        return false;
+    }
+
+    // The verifier checks that the leaf index is `fec_set_count`, which is
+    // also bound inside the leaf, so an FEC set root cannot be presented as
+    // the final leaf.
+    let parent_info_leaf = merkle_tree::double_merkle_final_leaf(
+        parent_slot,
+        &parent_block_id,
+        fec_set_count,
+        footer_binding,
+    );
+    merkle_tree::verify_merkle_proof(
+        merkle_tree::hash_as_merkle_proof_entry(&parent_info_leaf),
+        fec_set_count as usize,
+        parent_proof,
+        block_id.to_hash(),
+    )
+    .is_ok()
 }
 
 impl RequestResponse for BlockIdRepairType {
@@ -270,33 +319,38 @@ impl RequestResponse for BlockIdRepairType {
                 },
                 Self::Response::ParentFecSetCount {
                     fec_set_count,
-                    parent_info: (parent_slot, parent_block_id),
+                    parent_info,
                     parent_proof,
                 },
-            ) => {
-                if *fec_set_count == 0 || *fec_set_count > MAX_FEC_SETS_PER_SLOT {
-                    return false;
-                }
+            ) => verify_parent_fec_set_count(
+                block_id,
+                *fec_set_count,
+                *parent_info,
+                None,
+                parent_proof,
+            ),
 
-                // + 1 here to account for the parent info which is the final leaf of the tree
-                let proof_size = merkle_tree::get_proof_size(*fec_set_count as usize + 1);
-                if parent_proof.len() != proof_size as usize * SIZE_OF_MERKLE_PROOF_ENTRY {
-                    return false;
-                }
-
-                let parent_info_leaf = hashv(&[
-                    &parent_slot.to_le_bytes(),
-                    parent_block_id.as_ref(),
-                    &fec_set_count.to_le_bytes(),
-                ]);
-                merkle_tree::verify_merkle_proof(
-                    merkle_tree::hash_as_merkle_proof_entry(&parent_info_leaf),
-                    *fec_set_count as usize,
+            (
+                Self::ParentAndFecSetCount {
+                    slot: _slot,
+                    block_id,
+                },
+                Self::Response::ParentFecSetCountWithFooter {
+                    fec_set_count,
+                    parent_info,
+                    footer_binding: (bank_hash, commitment_root),
                     parent_proof,
-                    block_id.to_hash(),
-                )
-                .is_ok()
-            }
+                },
+            ) => verify_parent_fec_set_count(
+                block_id,
+                *fec_set_count,
+                *parent_info,
+                Some(&FooterBinding {
+                    bank_hash: *bank_hash,
+                    commitment_root: *commitment_root,
+                }),
+                parent_proof,
+            ),
 
             (
                 Self::FecSetRoot {
@@ -1928,6 +1982,7 @@ mod tests {
             bank::Bank,
             genesis_utils::{ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts},
         },
+        solana_sha256_hasher::hashv,
         solana_time_utils::timestamp,
         std::{
             assert_matches,
@@ -3183,6 +3238,83 @@ mod tests {
                 parent_proof: real_parent_proof.clone(),
             })
         );
+    }
+
+    /// Block Commitment Root: a block whose final leaf binds the footer's
+    /// `bank_hash` and `commitment_root` is answered with
+    /// `ParentFecSetCountWithFooter`; the requester recomputes the extended
+    /// leaf, so both hashes are authenticated by the block id.
+    #[test]
+    fn test_verify_parent_fec_set_count_with_footer() {
+        let parent_slot = 99u64;
+        let parent_block_id = Hash::new_unique();
+        let binding = FooterBinding {
+            bank_hash: Hash::new_unique(),
+            commitment_root: Hash::new_unique(),
+        };
+        for fec_set_count in [1u32, 2, 3, 4, 7] {
+            let mut leaves: Vec<Hash> = (0..fec_set_count).map(|_| Hash::new_unique()).collect();
+            leaves.push(merkle_tree::double_merkle_final_leaf(
+                parent_slot,
+                &parent_block_id,
+                fec_set_count,
+                Some(&binding),
+            ));
+            let tree = merkle_tree::MerkleTree::try_new_with_len(
+                leaves.iter().copied().map(Ok),
+                leaves.len(),
+            )
+            .unwrap();
+            let block_id = BlockId::from(*tree.root());
+            let parent_proof: Vec<u8> = tree
+                .make_merkle_proof(fec_set_count as usize, leaves.len())
+                .flat_map(|entry| entry.unwrap().iter().copied())
+                .collect();
+            let request = BlockIdRepairType::ParentAndFecSetCount {
+                slot: 100,
+                block_id,
+            };
+            let response = |footer_binding: (Hash, Hash), fec_set_count: u32| {
+                BlockIdRepairResponse::ParentFecSetCountWithFooter {
+                    fec_set_count,
+                    parent_info: (parent_slot, parent_block_id),
+                    footer_binding,
+                    parent_proof: parent_proof.clone(),
+                }
+            };
+
+            assert!(request.verify_response(&response(
+                (binding.bank_hash, binding.commitment_root),
+                fec_set_count
+            )));
+            // Wrong commitment root or bank hash.
+            assert!(!request.verify_response(&response(
+                (binding.bank_hash, Hash::new_unique()),
+                fec_set_count
+            )));
+            assert!(!request.verify_response(&response(
+                (Hash::new_unique(), binding.commitment_root),
+                fec_set_count
+            )));
+            // Swapped fields.
+            assert!(!request.verify_response(&response(
+                (binding.commitment_root, binding.bank_hash),
+                fec_set_count
+            )));
+            // Wrong count.
+            assert!(!request.verify_response(&response(
+                (binding.bank_hash, binding.commitment_root),
+                fec_set_count + 1
+            )));
+            // The same proof does not verify without the footer binding.
+            assert!(
+                !request.verify_response(&BlockIdRepairResponse::ParentFecSetCount {
+                    fec_set_count,
+                    parent_info: (parent_slot, parent_block_id),
+                    parent_proof: parent_proof.clone(),
+                })
+            );
+        }
     }
 
     #[test]
