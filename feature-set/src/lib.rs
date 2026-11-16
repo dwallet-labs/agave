@@ -83,6 +83,7 @@ pub struct FeatureSnapshot {
     pub invoke_signed_v2: bool,
     pub loaderv3_programdata_size_floor: bool,
     pub block_commitment_root: bool,
+    pub transaction_receipt_tree: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -189,6 +190,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             invoke_signed_v2: is_active(&invoke_signed_v2::ID),
             loaderv3_programdata_size_floor: is_active(&loaderv3_programdata_size_floor::ID),
             block_commitment_root: is_active(&block_commitment_root::ID),
+            transaction_receipt_tree: is_active(&transaction_receipt_tree::ID),
         }
     }
 }
@@ -1693,6 +1695,17 @@ pub mod block_commitment_root {
     solana_pubkey::declare_id!("Hp4uawW6zBVP4aeue5A5tNFiPopvRMwCS8pp3E8BaszE");
 }
 
+/// Transaction Receipt Tree (draft SIMD, number not yet assigned).
+///
+/// Commits to one receipt per transaction of the block (status, fee,
+/// instruction trace root, events root) with `receipts_root`, slot 1 of the
+/// commitment vector of `block_commitment_root`. Has no effect unless
+/// `block_commitment_root` is also active. Placeholder key: replace with the
+/// real feature key once the SIMD is accepted.
+pub mod transaction_receipt_tree {
+    solana_pubkey::declare_id!("FQvAC6eff8n1CBAECBWqX6MAtwLTdgUzYbiHFkMo5TXr");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2842,6 +2855,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             block_commitment_root::id(),
             "SIMD-XXXX: Block commitment root",
+        ),
+        (
+            transaction_receipt_tree::id(),
+            "SIMD-XXXX: Transaction receipt tree",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
