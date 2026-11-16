@@ -312,10 +312,7 @@ impl AppendOnlyFrontier {
 
     /// Appends a leaf that is already hashed with [`hash_leaf`].
     pub fn append_leaf_hash(&mut self, leaf_hash: Hash) -> Result<(), FrontierError> {
-        let new_leaf_count = self
-            .leaf_count
-            .checked_add(1)
-            .ok_or(FrontierError::Full)?;
+        let new_leaf_count = self.leaf_count.checked_add(1).ok_or(FrontierError::Full)?;
         // Each trailing one bit of the old count is a complete subtree of the
         // same size as the node being carried; merge them, smallest first.
         let mut node = leaf_hash;
@@ -503,10 +500,7 @@ mod tests {
             Hash::new_from_array([0; 32])
         );
         let root = compute_root(TreeId::BLOCK_HISTORY, &leaves);
-        assert_eq!(
-            root,
-            hashv(&[&[0x80, 0x01], &0u64.to_le_bytes(), &[0; 32]])
-        );
+        assert_eq!(root, hashv(&[&[0x80, 0x01], &0u64.to_le_bytes(), &[0; 32]]));
         assert_ne!(root, Hash::default());
         // Empty trees with different tree ids have different roots.
         assert_ne!(root, compute_root(TreeId::COMMITMENT_VECTOR, &leaves));
@@ -623,11 +617,9 @@ mod tests {
     #[test]
     fn test_frontier_from_parts() {
         let leaves = test_leaves(13);
-        let frontier = AppendOnlyFrontier::from_leaf_hashes(&hash_leaves(
-            TreeId::BLOCK_HISTORY,
-            &leaves,
-        ))
-        .unwrap();
+        let frontier =
+            AppendOnlyFrontier::from_leaf_hashes(&hash_leaves(TreeId::BLOCK_HISTORY, &leaves))
+                .unwrap();
         let (leaf_count, roots) = frontier.clone().into_parts();
         assert_eq!(leaf_count, 13);
         assert_eq!(roots.len(), 3);

@@ -89,6 +89,24 @@
 /// └──────────────────────────────────────────────┘
 /// ```
 ///
+/// ### BlockFooterV2 Layout
+///
+/// Same as `BlockFooterV1` with `commitment_root` inserted directly after
+/// `bank_hash` (Block Commitment Root SIMD). Both hashes sit at fixed offsets
+/// from the start of the component, see [`FOOTER_BANK_HASH_OFFSET`] and
+/// [`FOOTER_COMMITMENT_ROOT_OFFSET`].
+/// ```text
+/// ┌──────────────────────────────────────────────┐
+/// │ Bank Hash                        (32 bytes)  │
+/// ├──────────────────────────────────────────────┤
+/// │ Commitment Root                  (32 bytes)  │
+/// ├──────────────────────────────────────────────┤
+/// │ Producer Time Nanos               (8 bytes)  │
+/// ├──────────────────────────────────────────────┤
+/// │ ... remaining fields as in BlockFooterV1     │
+/// └──────────────────────────────────────────────┘
+/// ```
+///
 /// ### BlockFinalizationCert Layout
 /// ```text
 /// ┌─────────────────────────────────────────┐
@@ -143,7 +161,7 @@ use {
         signature::AsSignatureAffine,
     },
     solana_clock::Slot,
-    solana_hash::Hash,
+    solana_hash::{HASH_BYTES, Hash},
     solana_perf::packet::packet_config,
     std::mem::MaybeUninit,
     wincode::{
@@ -246,6 +264,70 @@ pub struct BlockFooterV1 {
     pub block_final_cert: Option<BlockFinalizationCert>,
     pub skip_reward_cert: Option<SkipRewardCertificate>,
     pub notar_reward_cert: Option<NotarRewardCertificate>,
+}
+
+/// Block footer with `commitment_root` (Block Commitment Root SIMD).
+///
+/// Identical to [`BlockFooterV1`] except for `commitment_root`, which is
+/// placed directly after `bank_hash` so that both are at fixed offsets from
+/// the start of the footer component.
+#[derive(Clone, PartialEq, Eq, Debug, SchemaWrite, SchemaRead)]
+pub struct BlockFooterV2 {
+    pub bank_hash: Hash,
+    pub commitment_root: Hash,
+    pub block_producer_time_nanos: u64,
+    #[wincode(with = "WincodeVec<u8, FixIntLen<u8>>")]
+    pub block_user_agent: Vec<u8>,
+    pub block_final_cert: Option<BlockFinalizationCert>,
+    pub skip_reward_cert: Option<SkipRewardCertificate>,
+    pub notar_reward_cert: Option<NotarRewardCertificate>,
+}
+
+impl BlockFooterV2 {
+    /// Builds a V2 footer from the V1 fields and a commitment root.
+    pub fn from_v1(footer: BlockFooterV1, commitment_root: Hash) -> Self {
+        let BlockFooterV1 {
+            bank_hash,
+            block_producer_time_nanos,
+            block_user_agent,
+            block_final_cert,
+            skip_reward_cert,
+            notar_reward_cert,
+        } = footer;
+        Self {
+            bank_hash,
+            commitment_root,
+            block_producer_time_nanos,
+            block_user_agent,
+            block_final_cert,
+            skip_reward_cert,
+            notar_reward_cert,
+        }
+    }
+
+    /// Splits the footer into the fields shared with V1 and the commitment root.
+    pub fn into_v1_and_commitment_root(self) -> (BlockFooterV1, Hash) {
+        let Self {
+            bank_hash,
+            commitment_root,
+            block_producer_time_nanos,
+            block_user_agent,
+            block_final_cert,
+            skip_reward_cert,
+            notar_reward_cert,
+        } = self;
+        (
+            BlockFooterV1 {
+                bank_hash,
+                block_producer_time_nanos,
+                block_user_agent,
+                block_final_cert,
+                skip_reward_cert,
+                notar_reward_cert,
+            },
+            commitment_root,
+        )
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, SchemaWrite, SchemaRead)]
@@ -383,6 +465,169 @@ impl VotesAggregate {
 pub enum VersionedBlockFooter {
     #[wincode(tag = 1)]
     V1(BlockFooterV1),
+    /// Footer carrying `commitment_root` (Block Commitment Root SIMD). Valid
+    /// exactly when the `block_commitment_root` feature is active.
+    #[wincode(tag = 2)]
+    V2(BlockFooterV2),
+}
+
+impl VersionedBlockFooter {
+    /// Wire version tag of [`VersionedBlockFooter::V1`].
+    pub const V1_TAG: u8 = 1;
+    /// Wire version tag of [`VersionedBlockFooter::V2`].
+    pub const V2_TAG: u8 = 2;
+
+    /// Builds the footer version a leader must produce: V2 (with a zero
+    /// commitment root, filled in after freezing the bank) when the block
+    /// commitment root feature is active, V1 otherwise.
+    pub fn new_for_feature(footer: BlockFooterV1, block_commitment_root_active: bool) -> Self {
+        if block_commitment_root_active {
+            Self::V2(BlockFooterV2::from_v1(footer, Hash::default()))
+        } else {
+            Self::V1(footer)
+        }
+    }
+
+    /// Wire version tag of this footer.
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::V1(_) => Self::V1_TAG,
+            Self::V2(_) => Self::V2_TAG,
+        }
+    }
+
+    pub fn bank_hash(&self) -> Hash {
+        match self {
+            Self::V1(footer) => footer.bank_hash,
+            Self::V2(footer) => footer.bank_hash,
+        }
+    }
+
+    pub fn set_bank_hash(&mut self, bank_hash: Hash) {
+        match self {
+            Self::V1(footer) => footer.bank_hash = bank_hash,
+            Self::V2(footer) => footer.bank_hash = bank_hash,
+        }
+    }
+
+    /// The commitment root, present from V2 on.
+    pub fn commitment_root(&self) -> Option<Hash> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(footer) => Some(footer.commitment_root),
+        }
+    }
+
+    /// Sets the commitment root. Returns false, and leaves the footer
+    /// unchanged, if this footer version has no commitment root.
+    #[must_use]
+    pub fn set_commitment_root(&mut self, commitment_root: Hash) -> bool {
+        match self {
+            Self::V1(_) => false,
+            Self::V2(footer) => {
+                footer.commitment_root = commitment_root;
+                true
+            }
+        }
+    }
+
+    pub fn block_producer_time_nanos(&self) -> u64 {
+        match self {
+            Self::V1(footer) => footer.block_producer_time_nanos,
+            Self::V2(footer) => footer.block_producer_time_nanos,
+        }
+    }
+
+    pub fn block_final_cert(&self) -> Option<&BlockFinalizationCert> {
+        match self {
+            Self::V1(footer) => footer.block_final_cert.as_ref(),
+            Self::V2(footer) => footer.block_final_cert.as_ref(),
+        }
+    }
+
+    /// The values that the block id binds from this footer, if any.
+    pub fn block_id_binding(&self) -> Option<FooterBinding> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(footer) => Some(FooterBinding {
+                bank_hash: footer.bank_hash,
+                commitment_root: footer.commitment_root,
+            }),
+        }
+    }
+
+    /// Splits the footer into the fields shared by all versions and the
+    /// commitment root (`None` for V1).
+    pub fn into_v1_and_commitment_root(self) -> (BlockFooterV1, Option<Hash>) {
+        match self {
+            Self::V1(footer) => (footer, None),
+            Self::V2(footer) => {
+                let (footer, commitment_root) = footer.into_v1_and_commitment_root();
+                (footer, Some(commitment_root))
+            }
+        }
+    }
+}
+
+/// Footer values bound into the final leaf of the double merkle block id
+/// (Block Commitment Root SIMD, "Binding the Footer to the Block Id").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FooterBinding {
+    pub bank_hash: Hash,
+    pub commitment_root: Hash,
+}
+
+/// Size of the header that precedes a marker's payload in a block component:
+/// entry count = 0 (8 bytes), marker version (2 bytes), marker variant
+/// (1 byte), marker length prefix (2 bytes).
+const MARKER_PAYLOAD_OFFSET: usize = BlockComponent::ENTRY_COUNT_SIZE + 2 + 1 + 2;
+/// `BlockMarkerV1::BlockFooter` variant tag (first variant, u8 tag encoding).
+const BLOCK_FOOTER_MARKER_TAG: u8 = 0;
+/// Offset of the footer version tag from the start of a footer component.
+pub const FOOTER_VERSION_OFFSET: usize = MARKER_PAYLOAD_OFFSET;
+/// Offset of `bank_hash` from the start of a footer component.
+pub const FOOTER_BANK_HASH_OFFSET: usize = FOOTER_VERSION_OFFSET + 1;
+/// Offset of `commitment_root` from the start of a V2 footer component.
+pub const FOOTER_COMMITMENT_ROOT_OFFSET: usize = FOOTER_BANK_HASH_OFFSET + HASH_BYTES;
+
+/// Reads the [`FooterBinding`] from the first bytes of a block component.
+///
+/// `data` is the start of a serialized block component, for example the data
+/// of the first data shred of a component. Only the fixed-offset prefix is
+/// read, so the rest of the footer (which can span several shreds) is not
+/// needed. Returns `None` unless `data` starts with a V2 block footer marker.
+///
+/// This does not validate the footer: replay does. It only extracts the two
+/// hashes the block id binds, the same way for leader and receivers.
+pub fn footer_binding_from_component_prefix(data: &[u8]) -> Option<FooterBinding> {
+    let end = FOOTER_COMMITMENT_ROOT_OFFSET.checked_add(HASH_BYTES)?;
+    let prefix = data.get(..end)?;
+    if !BlockComponent::infer_is_block_marker(prefix)? {
+        return None;
+    }
+    let marker_version = u16::from_le_bytes(
+        prefix[BlockComponent::ENTRY_COUNT_SIZE..BlockComponent::ENTRY_COUNT_SIZE + 2]
+            .try_into()
+            .ok()?,
+    );
+    if marker_version != 1
+        || prefix[BlockComponent::ENTRY_COUNT_SIZE + 2] != BLOCK_FOOTER_MARKER_TAG
+    {
+        return None;
+    }
+    if prefix[FOOTER_VERSION_OFFSET] != VersionedBlockFooter::V2_TAG {
+        return None;
+    }
+    let bank_hash = <[u8; HASH_BYTES]>::try_from(
+        &prefix[FOOTER_BANK_HASH_OFFSET..FOOTER_COMMITMENT_ROOT_OFFSET],
+    )
+    .ok()?;
+    let commitment_root =
+        <[u8; HASH_BYTES]>::try_from(&prefix[FOOTER_COMMITMENT_ROOT_OFFSET..end]).ok()?;
+    Some(FooterBinding {
+        bank_hash: Hash::new_from_array(bank_hash),
+        commitment_root: Hash::new_from_array(commitment_root),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SchemaWrite, SchemaRead)]
@@ -469,7 +714,14 @@ impl VersionedBlockMarker {
     }
 
     pub fn from_block_footer(f: BlockFooterV1) -> Self {
-        let f = VersionedBlockFooter::V1(f);
+        Self::from_versioned_block_footer(VersionedBlockFooter::V1(f))
+    }
+
+    pub fn from_block_footer_v2(f: BlockFooterV2) -> Self {
+        Self::from_versioned_block_footer(VersionedBlockFooter::V2(f))
+    }
+
+    pub fn from_versioned_block_footer(f: VersionedBlockFooter) -> Self {
         let f = BlockMarkerV1::BlockFooter(LengthPrefixed::new(f));
         Self::new(f)
     }
@@ -911,6 +1163,155 @@ mod tests {
         let bytes = wincode::serialize(&comp).unwrap();
         let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
         assert_eq!(comp, deser);
+    }
+
+    fn sample_footer_v2() -> BlockFooterV2 {
+        BlockFooterV2::from_v1(sample_footer(), Hash::new_unique())
+    }
+
+    #[test]
+    fn footer_v2_round_trips() {
+        let footer = sample_footer_v2();
+        let bytes = wincode::serialize(&footer).unwrap();
+        assert_eq!(
+            footer,
+            wincode::deserialize::<BlockFooterV2>(&bytes).unwrap()
+        );
+
+        let versioned = VersionedBlockFooter::V2(footer.clone());
+        let bytes = wincode::serialize(&versioned).unwrap();
+        assert_eq!(bytes[0], VersionedBlockFooter::V2_TAG);
+        assert_eq!(
+            versioned,
+            wincode::deserialize::<VersionedBlockFooter>(&bytes).unwrap()
+        );
+
+        let comp =
+            BlockComponent::new_block_marker(VersionedBlockMarker::from_block_footer_v2(footer));
+        let bytes = wincode::serialize(&comp).unwrap();
+        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        assert_eq!(comp, deser);
+    }
+
+    #[test]
+    fn footer_v1_still_deserializes() {
+        // V1 encoding is unchanged by the introduction of V2.
+        let footer = sample_footer();
+        let v1_bytes = wincode::serialize(&VersionedBlockFooter::V1(footer.clone())).unwrap();
+        assert_eq!(v1_bytes[0], VersionedBlockFooter::V1_TAG);
+        assert_eq!(
+            &v1_bytes[1..],
+            wincode::serialize(&footer).unwrap().as_slice()
+        );
+        assert_eq!(
+            wincode::deserialize::<VersionedBlockFooter>(&v1_bytes).unwrap(),
+            VersionedBlockFooter::V1(footer)
+        );
+        // An unknown version is rejected.
+        let mut unknown = v1_bytes;
+        unknown[0] = 3;
+        assert!(wincode::deserialize::<VersionedBlockFooter>(&unknown).is_err());
+    }
+
+    #[test]
+    fn footer_v2_layout_inserts_commitment_root_after_bank_hash() {
+        let v2 = sample_footer_v2();
+        let (v1, commitment_root) = v2.clone().into_v1_and_commitment_root();
+        let v1_bytes = wincode::serialize(&v1).unwrap();
+        let v2_bytes = wincode::serialize(&v2).unwrap();
+        assert_eq!(v2_bytes.len(), v1_bytes.len() + HASH_BYTES);
+        assert_eq!(&v2_bytes[..HASH_BYTES], &v1_bytes[..HASH_BYTES]);
+        assert_eq!(
+            &v2_bytes[HASH_BYTES..2 * HASH_BYTES],
+            commitment_root.as_ref()
+        );
+        assert_eq!(&v2_bytes[2 * HASH_BYTES..], &v1_bytes[HASH_BYTES..]);
+        assert_eq!(BlockFooterV2::from_v1(v1, commitment_root), v2);
+    }
+
+    #[test]
+    fn footer_binding_at_fixed_offsets() {
+        let footer = sample_footer_v2();
+        let comp = BlockComponent::new_block_marker(VersionedBlockMarker::from_block_footer_v2(
+            footer.clone(),
+        ));
+        let bytes = wincode::serialize(&comp).unwrap();
+        assert_eq!(FOOTER_BANK_HASH_OFFSET, 14);
+        assert_eq!(FOOTER_COMMITMENT_ROOT_OFFSET, 46);
+        assert_eq!(
+            &bytes[FOOTER_BANK_HASH_OFFSET..FOOTER_BANK_HASH_OFFSET + HASH_BYTES],
+            footer.bank_hash.as_ref()
+        );
+        assert_eq!(
+            &bytes[FOOTER_COMMITMENT_ROOT_OFFSET..FOOTER_COMMITMENT_ROOT_OFFSET + HASH_BYTES],
+            footer.commitment_root.as_ref()
+        );
+        let expected = FooterBinding {
+            bank_hash: footer.bank_hash,
+            commitment_root: footer.commitment_root,
+        };
+        assert_eq!(footer_binding_from_component_prefix(&bytes), Some(expected));
+        // Only the fixed-size prefix is needed.
+        assert_eq!(
+            footer_binding_from_component_prefix(&bytes[..FOOTER_COMMITMENT_ROOT_OFFSET + 32]),
+            Some(expected)
+        );
+        assert_eq!(
+            footer_binding_from_component_prefix(&bytes[..FOOTER_COMMITMENT_ROOT_OFFSET + 31]),
+            None
+        );
+        assert_eq!(
+            VersionedBlockFooter::V2(footer).block_id_binding(),
+            Some(expected)
+        );
+
+        // A V1 footer binds nothing.
+        let v1 = BlockComponent::new_block_marker(VersionedBlockMarker::from_block_footer(
+            sample_footer(),
+        ));
+        let v1_bytes = wincode::serialize(&v1).unwrap();
+        assert_eq!(footer_binding_from_component_prefix(&v1_bytes), None);
+        assert_eq!(
+            VersionedBlockFooter::V1(sample_footer()).block_id_binding(),
+            None
+        );
+
+        // Other markers and entry batches bind nothing.
+        let header = BlockComponent::new_block_header(7, BlockId::new_unique());
+        let mut header_bytes = wincode::serialize(&header).unwrap();
+        header_bytes.resize(200, 0);
+        assert_eq!(footer_binding_from_component_prefix(&header_bytes), None);
+        let entries = BlockComponent::new_entry_batch(mock_entries(3)).unwrap();
+        let entry_bytes = wincode::serialize(&entries).unwrap();
+        assert_eq!(footer_binding_from_component_prefix(&entry_bytes), None);
+    }
+
+    #[test]
+    fn versioned_footer_accessors() {
+        let mut v1 = VersionedBlockFooter::new_for_feature(sample_footer(), false);
+        assert_eq!(v1.version(), 1);
+        assert_eq!(v1.commitment_root(), None);
+        assert!(!v1.set_commitment_root(Hash::new_unique()));
+        assert_eq!(v1.commitment_root(), None);
+        let bank_hash = Hash::new_unique();
+        v1.set_bank_hash(bank_hash);
+        assert_eq!(v1.bank_hash(), bank_hash);
+
+        let mut v2 = VersionedBlockFooter::new_for_feature(sample_footer(), true);
+        assert_eq!(v2.version(), 2);
+        assert_eq!(v2.commitment_root(), Some(Hash::default()));
+        let commitment_root = Hash::new_unique();
+        assert!(v2.set_commitment_root(commitment_root));
+        v2.set_bank_hash(bank_hash);
+        assert_eq!(v2.commitment_root(), Some(commitment_root));
+        assert_eq!(v2.bank_hash(), bank_hash);
+        assert_eq!(
+            v2.block_producer_time_nanos(),
+            sample_footer().block_producer_time_nanos
+        );
+        let (v1_fields, root) = v2.into_v1_and_commitment_root();
+        assert_eq!(root, Some(commitment_root));
+        assert_eq!(v1_fields.bank_hash, bank_hash);
     }
 
     #[test]
