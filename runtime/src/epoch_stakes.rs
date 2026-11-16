@@ -9,6 +9,7 @@ use {
         PopVerified, PubkeyAffine as BLSPubkeyAffine, PubkeyCompressed as BLSPubkeyCompressed,
     },
     solana_clock::Epoch,
+    solana_merkle_tree::validator_set::{Signer, SignerSetCommitment},
     solana_pubkey::Pubkey,
     solana_stake_interface::state::Stake as InterfaceStake,
     solana_vote::vote_account::{VoteAccounts, VoteAccountsHashMap},
@@ -68,7 +69,16 @@ pub(crate) fn bls_pubkey_compressed_bytes_to_bls_pubkey(
 }
 
 impl BLSPubkeyToRankMap {
+    /// Builds the rank map. Panics if no validator is eligible for a rank
+    /// (see [`Self::try_new`]).
     pub fn new(epoch_vote_accounts_hash_map: &VoteAccountsHashMap) -> Self {
+        Self::try_new(epoch_vote_accounts_hash_map).expect("total stakes should not be 0")
+    }
+
+    /// Builds the rank map, or returns `None` if no validator is eligible for
+    /// a rank (no vote account with stake, a valid BLS key and a unique BLS
+    /// key and identity), so that the total stake would be zero.
+    pub fn try_new(epoch_vote_accounts_hash_map: &VoteAccountsHashMap) -> Option<Self> {
         let mut candidates = Vec::with_capacity(epoch_vote_accounts_hash_map.len());
         let mut bls_pubkey_counts = HashMap::new();
         let mut node_pubkey_counts = HashMap::new();
@@ -108,7 +118,7 @@ impl BLSPubkeyToRankMap {
             .fold(StakeType(0), |stake, (entry, _)| {
                 stake.add(StakeType::from(entry.stake))
             });
-        let total_stake = NonZeroStake::new(total_stake.0).expect("total stakes should not be 0");
+        let total_stake = NonZeroStake::new(total_stake.0)?;
         keys_stake_entry_with_compressed.sort_by(
             |(a_entry, a_pubkey_compressed), (b_entry, b_pubkey_compressed)| {
                 b_entry
@@ -130,12 +140,12 @@ impl BLSPubkeyToRankMap {
             node_pubkey_to_rank.insert(entry.node_pubkey, rank);
             sorted_pubkeys.push(entry);
         }
-        Self {
+        Some(Self {
             vote_pubkey_to_rank: vote_pubkey_to_rank_map,
             sorted_pubkeys,
             total_stake,
             node_pubkey_to_rank,
-        }
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -162,6 +172,25 @@ impl BLSPubkeyToRankMap {
     pub fn iter(&self) -> impl Iterator<Item = (u16, &BLSPubkeyStakeEntry)> {
         // Construction checks that every rank fits in a u16.
         (0..=u16::MAX).zip(&self.sorted_pubkeys)
+    }
+
+    /// The signer set in rank order, as committed to by the Epoch Validator
+    /// Set Root SIMD: the leaf at position `i` is the validator with rank
+    /// `i`, which is the bit a certificate's signer bitmap uses for it.
+    ///
+    /// The BLS key is re-encoded from the decompressed key. Compressed
+    /// encoding is canonical (decompression rejects any other encoding of the
+    /// same point), so these are the bytes stored in the vote account, which
+    /// the rank order compares.
+    pub fn signers(&self) -> Vec<Signer> {
+        self.sorted_pubkeys
+            .iter()
+            .map(|entry| Signer {
+                bls_pubkey_compressed: entry.bls_pubkey.to_bytes_compressed(),
+                stake: entry.stake.get().get(),
+                vote_pubkey: entry.vote_account_pubkey.to_bytes(),
+            })
+            .collect()
     }
 
     /// Returns a node's rank and its canonical stake entry.
@@ -227,7 +256,6 @@ fn stable_abi_sample_deserializable_epoch_stakes(
 
 #[derive(Clone, Debug, SchemaWrite)]
 #[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
-#[cfg_attr(feature = "dev-context-only-utils", derive(PartialEq))]
 pub enum VersionedEpochStakes {
     Current {
         stakes: EpochStakes,
@@ -238,7 +266,43 @@ pub enum VersionedEpochStakes {
         #[cfg_attr(feature = "stable-abi", stable_abi_sample(with = "Default::default()"))]
         #[wincode(skip)]
         bls_pubkey_to_rank_map: OnceLock<Arc<BLSPubkeyToRankMap>>,
+        /// Commitment to the signer set (Epoch Validator Set Root SIMD),
+        /// computed at most once from the rank map. Not serialized: derived
+        /// from the vote accounts above, recomputed after a snapshot load.
+        #[cfg_attr(feature = "stable-abi", stable_abi_sample(with = "Default::default()"))]
+        #[wincode(skip)]
+        signer_set_commitment: OnceLock<SignerSetCommitment>,
     },
+}
+
+/// Compares the stakes only: the rank map and the signer set commitment are
+/// caches derived from them, filled on first use and not serialized, so a
+/// bank restored from a snapshot equals the original whether or not they were
+/// filled in either.
+#[cfg(feature = "dev-context-only-utils")]
+impl PartialEq for VersionedEpochStakes {
+    fn eq(&self, other: &Self) -> bool {
+        let Self::Current {
+            stakes,
+            total_stake,
+            node_id_to_vote_accounts,
+            epoch_authorized_voters,
+            bls_pubkey_to_rank_map: _,
+            signer_set_commitment: _,
+        } = self;
+        let Self::Current {
+            stakes: other_stakes,
+            total_stake: other_total_stake,
+            node_id_to_vote_accounts: other_node_id_to_vote_accounts,
+            epoch_authorized_voters: other_epoch_authorized_voters,
+            bls_pubkey_to_rank_map: _,
+            signer_set_commitment: _,
+        } = other;
+        stakes == other_stakes
+            && total_stake == other_total_stake
+            && node_id_to_vote_accounts == other_node_id_to_vote_accounts
+            && epoch_authorized_voters == other_epoch_authorized_voters
+    }
 }
 
 impl From<DeserializableVersionedEpochStakes> for VersionedEpochStakes {
@@ -255,6 +319,7 @@ impl From<DeserializableVersionedEpochStakes> for VersionedEpochStakes {
             node_id_to_vote_accounts: Arc::new(node_id_to_vote_accounts),
             epoch_authorized_voters: Arc::new(epoch_authorized_voters),
             bls_pubkey_to_rank_map: OnceLock::new(),
+            signer_set_commitment: OnceLock::new(),
         }
     }
 }
@@ -272,6 +337,7 @@ impl VersionedEpochStakes {
             node_id_to_vote_accounts: Arc::new(node_id_to_vote_accounts),
             epoch_authorized_voters: Arc::new(epoch_authorized_voters),
             bls_pubkey_to_rank_map: OnceLock::new(),
+            signer_set_commitment: OnceLock::new(),
         }
     }
 
@@ -349,6 +415,58 @@ impl VersionedEpochStakes {
                     self.stakes().vote_accounts().as_ref(),
                 ))
             }),
+        }
+    }
+
+    /// Like [`Self::bls_pubkey_to_rank_map`], but returns `None` instead of
+    /// panicking when no validator is eligible for a rank. Shares the cached
+    /// map with it.
+    pub fn try_bls_pubkey_to_rank_map(&self) -> Option<&Arc<BLSPubkeyToRankMap>> {
+        match self {
+            Self::Current {
+                bls_pubkey_to_rank_map,
+                ..
+            } => {
+                if let Some(rank_map) = bls_pubkey_to_rank_map.get() {
+                    return Some(rank_map);
+                }
+                let rank_map = BLSPubkeyToRankMap::try_new(self.stakes().vote_accounts().as_ref())?;
+                // A concurrent initialization computed the same map from the
+                // same vote accounts; either one is kept.
+                Some(bls_pubkey_to_rank_map.get_or_init(|| Arc::new(rank_map)))
+            }
+        }
+    }
+
+    /// Commitment to the signer set of these stakes, in rank order (Epoch
+    /// Validator Set Root SIMD). The set is the one [`Self::bls_pubkey_to_rank_map`]
+    /// ranks, which certificate verification uses; it is empty if no
+    /// validator has a rank. Computed once and cached.
+    pub fn signer_set_commitment(&self) -> &SignerSetCommitment {
+        match self {
+            Self::Current {
+                signer_set_commitment,
+                ..
+            } => signer_set_commitment.get_or_init(|| match self.try_bls_pubkey_to_rank_map() {
+                Some(rank_map) => {
+                    let commitment = SignerSetCommitment::new(&rank_map.signers())
+                        .expect("total stake is bounded by the lamport supply");
+                    debug_assert_eq!(commitment.total_stake, rank_map.total_stake().get().get());
+                    commitment
+                }
+                None => SignerSetCommitment::empty(),
+            }),
+        }
+    }
+
+    /// The cached signer set commitment, if it was computed.
+    #[cfg(test)]
+    pub(crate) fn cached_signer_set_commitment(&self) -> Option<&SignerSetCommitment> {
+        match self {
+            Self::Current {
+                signer_set_commitment,
+                ..
+            } => signer_set_commitment.get(),
         }
     }
 

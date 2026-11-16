@@ -985,6 +985,7 @@ mod serde_snapshot_tests {
                 node_id_to_vote_accounts: Arc::<NodeIdToVoteAccounts>::default(),
                 epoch_authorized_voters: Arc::<EpochAuthorizedVoters>::default(),
                 bls_pubkey_to_rank_map: OnceLock::new(),
+                signer_set_commitment: OnceLock::new(),
             },
         );
         assert_eq!(bank.epoch_stakes_map().len(), 3);
