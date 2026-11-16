@@ -8102,6 +8102,7 @@ dependencies = [
  "solana-leader-schedule",
  "solana-loader-v3-interface",
  "solana-measure",
+ "solana-merkle-tree",
  "solana-message",
  "solana-metrics",
  "solana-native-token",
