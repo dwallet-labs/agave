@@ -259,6 +259,7 @@ pub(crate) mod partitioned_epoch_rewards;
 mod recent_blockhashes_account;
 mod sysvar_cache;
 pub(crate) mod tests;
+mod validator_set_root;
 
 pub const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
 const INITIAL_RATE: u64 = 80_000_000_000_000;
@@ -2766,6 +2767,15 @@ impl Bank {
             );
 
             self.maybe_burn_vat_from_staked_accounts(&new_epoch_stakes);
+
+            // Epoch Validator Set Root: build the signer set commitment of the
+            // new entry here, at the boundary, rather than when the first
+            // block that commits to it is frozen. It is cached in the entry and
+            // inherited by descendants; the value does not depend on when it
+            // is computed.
+            if self.is_epoch_validator_set_root_active() {
+                new_epoch_stakes.signer_set_commitment();
+            }
 
             // It is expensive to log the details of epoch stakes. Only log them at "trace"
             // level for debugging purpose.

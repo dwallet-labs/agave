@@ -51,8 +51,11 @@ use {
 /// `block_commitment_root` changes the block footer version that replay
 /// accepts and the derivation of the block id, so it is activated explicitly
 /// by the tests that exercise it (see `activate_feature`).
-pub const FEATURES_INACTIVE_IN_TEST_GENESIS: &[Pubkey] =
-    &[agave_feature_set::block_commitment_root::ID];
+/// `epoch_validator_set_root` fills slot 3 of that commitment and follows it.
+pub const FEATURES_INACTIVE_IN_TEST_GENESIS: &[Pubkey] = &[
+    agave_feature_set::block_commitment_root::ID,
+    agave_feature_set::epoch_validator_set_root::ID,
+];
 
 /// `FeatureSet::all_enabled()` minus [`FEATURES_INACTIVE_IN_TEST_GENESIS`].
 pub fn all_enabled_test_feature_set() -> FeatureSet {
