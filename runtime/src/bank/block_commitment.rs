@@ -44,6 +44,7 @@ use {
     solana_merkle_tree::commitment_tree::{
         AppendOnlyFrontier, InclusionProof, TreeId, compute_root, make_inclusion_proof,
     },
+    solana_pubkey::Pubkey,
 };
 
 /// Number of slots in the commitment vector.
@@ -164,6 +165,21 @@ pub enum CommitmentFailure {
     /// its own, so `H(B)` is unknown.
     #[error("parent {parent_slot} has a commitment failure")]
     ParentCommitmentFailure { parent_slot: Slot },
+    /// Slot 2: the bank did not keep the account hashes from its first
+    /// account update, so its accounts delta cannot be computed.
+    #[error("accounts_delta_root is active but the account hashes were not collected")]
+    AccountsDeltaNotCollected,
+    /// Slot 2: the account versions recorded for `address` do not chain
+    /// from its state before the block to its state after it (an account
+    /// update was lost or duplicated).
+    #[error(
+        "account updates of {address} do not chain from the state before the block to the state \
+         after it ({num_prefixes} unmatched prefixes)"
+    )]
+    InconsistentAccountUpdates {
+        address: Pubkey,
+        num_prefixes: usize,
+    },
 }
 
 impl CommitmentFailure {
@@ -172,6 +188,8 @@ impl CommitmentFailure {
         match self {
             Self::MissingParentBlockId { .. } => "missing_parent_block_id",
             Self::ParentCommitmentFailure { .. } => "parent_commitment_failure",
+            Self::AccountsDeltaNotCollected => "accounts_delta_not_collected",
+            Self::InconsistentAccountUpdates { .. } => "inconsistent_account_updates",
         }
     }
 }
@@ -375,18 +393,14 @@ impl Bank {
     /// [`INACTIVE_COMMITMENT_SLOT`] unless the `accounts_delta_root` feature
     /// is active for this bank. The root is built in `freeze()` from the
     /// account hashes collected by the lattice hash, after the last account
-    /// update of the bank (see [`super::accounts_delta`]).
+    /// update of the bank (see [`super::accounts_delta`]); a commitment
+    /// failure if it could not be built.
     pub fn commitment_slot_accounts_delta_root(
         &self,
         _inputs: &CommitmentInputs,
     ) -> std::result::Result<Hash, CommitmentFailure> {
-        if !self.is_accounts_delta_root_active() {
-            return Ok(INACTIVE_COMMITMENT_SLOT);
-        }
-        // Unset only if the bank did not collect from its first account
-        // update, which `finish_accounts_delta()` reports.
         Ok(self
-            .accounts_delta_root()
+            .accounts_delta_root_for_commitment()?
             .unwrap_or(INACTIVE_COMMITMENT_SLOT))
     }
 

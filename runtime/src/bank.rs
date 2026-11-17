@@ -1033,10 +1033,11 @@ pub struct Bank {
     expected_commitment_root: RwLock<Option<Hash>>,
 
     /// Accounts Delta Root: the accounts changed in this bank, sorted, and
-    /// their root. Computed when the bank is frozen with the
-    /// `block_commitment_root` and `accounts_delta_root` features active.
-    /// None otherwise, and for banks loaded from a snapshot.
-    accounts_delta: RwLock<Option<Arc<solana_merkle_tree::accounts_delta::AccountsDelta>>>,
+    /// their root, or the commitment failure that prevents computing them.
+    /// Computed when the bank is frozen with the `block_commitment_root` and
+    /// `accounts_delta_root` features active. None otherwise, and for banks
+    /// loaded from a snapshot.
+    accounts_delta: RwLock<Option<accounts_delta::AccountsDeltaState>>,
     /// Why the bank has no commitment root although the `block_commitment_root`
     /// feature is active for it. Set when the bank is frozen, instead of
     /// `block_commitment`; see [`block_commitment::CommitmentFailure`].
