@@ -1496,7 +1496,10 @@ mod tests {
         agave_banking_stage_ingress_types::BankingPacketReceiver,
         agave_votor_messages::consensus_message::BlockId,
         crossbeam_channel::bounded,
-        solana_entry::{block_component::VersionedUpdateParent, recorder_message::RecorderMessage},
+        solana_entry::{
+            block_component::{BlockMarkerV1, VersionedUpdateParent},
+            recorder_message::RecorderMessage,
+        },
         solana_keypair::Keypair,
         solana_leader_schedule::{FixedSchedule, LeaderSchedule, SlotLeader},
         solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path_auto_delete},
@@ -1506,12 +1509,17 @@ mod tests {
         },
         solana_poh_config::PohConfig,
         solana_runtime::{
-            bank::Bank, bank_forks::BankForks, genesis_utils::create_genesis_config_with_leader,
+            bank::{
+                Bank,
+                block_commitment::{CommitmentFailure, CommitmentVerificationError},
+            },
+            bank_forks::BankForks,
+            genesis_utils::create_genesis_config_with_leader,
             installed_scheduler_pool::BankWithScheduler,
             transaction_execution::TransactionStatusMessage,
         },
         solana_system_transaction as system_transaction,
-        std::num::NonZeroUsize,
+        std::{assert_matches, num::NonZeroUsize},
     };
 
     fn versioned_transfer(lamports: u64) -> VersionedTransaction {
@@ -2003,6 +2011,156 @@ mod tests {
         abort_failed_working_bank(&mut ctx, 1).unwrap();
         assert!(!ctx.poh_recorder.read().unwrap().has_bank());
         assert!(ctx.bank_forks.read().unwrap().get(1).is_none());
+        assert!(ctx.record_receiver.is_shutdown());
+        assert!(ctx.record_receiver.is_safe_to_restart());
+    }
+
+    /// A leader bank that cannot compute its commitment root goes through
+    /// the real block completion path: PoH registers the final tick, the bank
+    /// is frozen (by "replay", emulated here by a thread that freezes it once
+    /// it is complete, as `ReplayStage::process_replay_results` does), PoH
+    /// refuses to publish the footer, and the slot is aborted: the bank is
+    /// removed from BankForks and PoH is reset to the parent. The replay side
+    /// (the slot is marked dead before the bank is cleared) is covered by
+    /// `test_leader_commitment_failure_marked_dead_then_cleared` in the
+    /// replay stage tests.
+    #[test]
+    fn test_leader_commitment_failure_aborts_slot() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let my_pubkey = Pubkey::new_unique();
+        let mut genesis = create_genesis_config_with_leader(10_000, &my_pubkey, 1_000);
+        solana_runtime::genesis_utils::activate_feature(
+            &mut genesis.genesis_config,
+            agave_feature_set::block_commitment_root::id(),
+        );
+        let root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        // The parent has a commitment root but no block id, so the leader
+        // bank cannot compute its block history.
+        root_bank.freeze();
+        assert!(root_bank.commitment_root().is_some());
+        assert_eq!(root_bank.block_id(), None);
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = fixed_leader_schedule(my_pubkey, &root_bank);
+
+        let exit = Arc::new(AtomicBool::new(false));
+        let poh_config = PohConfig::default();
+        let (mut poh_recorder, entry_receiver) = PohRecorder::new(
+            root_bank.tick_height(),
+            root_bank.last_blockhash(),
+            root_bank.clone(),
+            Some((1, 1)),
+            root_bank.ticks_per_slot(),
+            blockstore.clone(),
+            &leader_schedule_cache,
+            &poh_config,
+            exit.clone(),
+        );
+        poh_recorder.enable_alpenglow();
+        let poh_recorder = Arc::new(RwLock::new(poh_recorder));
+
+        let (_record_sender, record_receiver) = record_channels(false);
+        let (_leader_window_info_sender, leader_window_info_receiver) = bounded(1024);
+        let (banking_stage_sender, _banking_stage_receiver) = banking_channels::channel_for_test();
+        let bank_forks_controller = test_bank_forks_controller(bank_forks.clone());
+        let (reward_certs_requestor, _receiver) = CertsRequestor::new();
+
+        let mut ctx = LeaderContext {
+            exit,
+            my_pubkey,
+            leader_window_info_receiver,
+            pending_parent_ready: None,
+            highest_parent_ready: Arc::new(RwLock::new((0, Block::new_unique(0)))),
+            highest_finalized: Arc::new(RwLock::new(None)),
+            blockstore,
+            record_receiver,
+            poh_recorder,
+            leader_schedule_cache,
+            sharable_banks: bank_forks.read().unwrap().sharable_banks(),
+            alpenglow_slot_clock: SharedAlpenglowSlotClock::default(),
+            bank_forks: bank_forks.clone(),
+            bank_forks_controller,
+            rpc_subscriptions: None,
+            slot_status_notifier: None,
+            entry_notification_sender: None,
+            transaction_status_sender: None,
+            replay_highest_frozen: Arc::new(ReplayHighestFrozen::default()),
+            reward_certs_requestor,
+            banking_stage_sender,
+            metrics: LoopMetrics::default(),
+        };
+
+        create_and_insert_leader_bank(1, root_bank.clone(), 0, &mut ctx).unwrap();
+        let bank = ctx.poh_recorder.read().unwrap().bank().unwrap();
+        assert_eq!(bank.slot(), 1);
+        assert!(bank.is_block_commitment_root_active());
+        assert!(ctx.bank_forks.read().unwrap().get(1).is_some());
+
+        let expected_failure = CommitmentFailure::MissingParentBlockId { parent_slot: 0 };
+        let replay_bank = bank.clone();
+        let replay = std::thread::spawn(move || {
+            while !replay_bank.is_complete() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            replay_bank.freeze();
+            replay_bank.verify_commitment_root()
+        });
+
+        let mut slot_metrics = SlotMetrics::new(1, true);
+        // The block timer has expired, so the block is completed right away.
+        let mut block_timer = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let result = produce_slot(
+            &mut ctx,
+            &mut slot_metrics,
+            1,
+            None,
+            None,
+            &mut block_timer,
+            bank.clone(),
+        );
+        assert_eq!(
+            replay.join().unwrap(),
+            Err(CommitmentVerificationError::Failure(
+                expected_failure.clone()
+            ))
+        );
+        assert_matches!(
+            result,
+            Err(StartLeaderError::PohRecorder(PohRecorderError::CommitmentFailure(1, ref failure)))
+                if *failure == expected_failure
+        );
+        assert!(bank.is_frozen());
+        assert_eq!(bank.commitment_failure(), Some(expected_failure));
+
+        // Neither the footer nor the final tick was handed to broadcast, so
+        // the block never completes.
+        let max_tick_height = bank.max_tick_height();
+        for (_bank, (message, tick_height)) in entry_receiver.try_iter() {
+            assert!(
+                !matches!(
+                    message,
+                    RecorderMessage::Marker(VersionedBlockMarker::V1(BlockMarkerV1::BlockFooter(
+                        _
+                    )))
+                ),
+                "footer of a bank with a commitment failure was broadcast"
+            );
+            assert!(tick_height < max_tick_height, "final tick was broadcast");
+        }
+
+        // The slot is aborted: the bank is gone from BankForks and from PoH,
+        // and PoH is reset to the parent, ready for the next window.
+        assert!(ctx.bank_forks.read().unwrap().get(1).is_none());
+        let poh_recorder = ctx.poh_recorder.read().unwrap();
+        assert!(!poh_recorder.has_bank());
+        assert_eq!(poh_recorder.start_bank_id(), root_bank.bank_id());
+        assert_eq!(poh_recorder.start_slot(), 0);
+        assert_eq!(
+            poh_recorder.tick_height(),
+            (root_bank.slot() + 1) * root_bank.ticks_per_slot()
+        );
+        drop(poh_recorder);
         assert!(ctx.record_receiver.is_shutdown());
         assert!(ctx.record_receiver.is_safe_to_restart());
     }
