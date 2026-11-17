@@ -31,6 +31,16 @@ pub const JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE: i64 = -32019;
 pub const JSON_RPC_SERVER_ERROR_FILTER_TRANSACTION_NOT_FOUND: i64 = -32020;
 pub const JSON_RPC_SERVER_ERROR_NO_SLOT_HISTORY: i64 = -32021;
 pub const JSON_RPC_SERVER_ERROR_LEADER_SCHEDULE_IDENTITY_NOT_FOUND: i64 = -32022;
+// Light-client proofs (`getFinalityProof` and the other proof methods); see
+// [`LightClientProofError`].
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_PROOFS_DISABLED: i64 = -32030;
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_FEATURE_INACTIVE: i64 = -32031;
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL: i64 = -32032;
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED: i64 = -32033;
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_CERTIFICATES_NOT_AVAILABLE: i64 = -32034;
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE: i64 = -32035;
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BASE_TREE_NOT_READY: i64 = -32036;
+pub const JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_NOT_FOUND: i64 = -32037;
 
 #[derive(Error, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -89,6 +99,84 @@ pub enum RpcCustomError {
     NoSlotHistory,
     #[error("LeaderScheduleIdentityNotFound")]
     LeaderScheduleIdentityNotFound { identity: String },
+    #[error("LightClientProof")]
+    LightClientProof(LightClientProofError),
+}
+
+/// Why a light-client proof cannot be served. Each kind has its own error
+/// code; the error's `data` is this value as JSON (`{"kind": .., ..}`).
+#[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum LightClientProofError {
+    /// The node does not serve light-client proofs (it is started without
+    /// `--enable-light-client-proofs`).
+    #[error("light-client proofs are not enabled on this node")]
+    ProofsDisabled,
+    /// The feature that the proof needs is not active for the block.
+    #[error("{feature} is not active for slot {slot}")]
+    #[serde(rename_all = "camelCase")]
+    FeatureInactive { slot: Slot, feature: String },
+    /// The block is not finalized on this node yet, or is not on the
+    /// finalized chain.
+    #[error("block {slot} is not final on this node (latest finalized slot {finalized_slot})")]
+    #[serde(rename_all = "camelCase")]
+    BlockNotFinal { slot: Slot, finalized_slot: Slot },
+    /// The block is final but this node does not keep its proof data (it is
+    /// older than the retention window, or older than the node's start).
+    #[error(
+        "block {slot} is not retained by this node (retained: {first_retained:?} to \
+         {last_retained:?})"
+    )]
+    #[serde(rename_all = "camelCase")]
+    BlockNotRetained {
+        slot: Slot,
+        first_retained: Option<Slot>,
+        last_retained: Option<Slot>,
+    },
+    /// This node has no certificates for the block, nor for any later
+    /// finalized block it retains.
+    #[error("no certificates for block {slot} or for a later finalized block on this node")]
+    #[serde(rename_all = "camelCase")]
+    CertificatesNotAvailable { slot: Slot },
+    /// A part of the proof is missing on this node: a commitment failure, a
+    /// block id or footer that blockstore no longer has, receipts that were
+    /// not kept, a history leaf older than the retained history, ...
+    #[error("proof data for block {slot} is not available: {reason}")]
+    #[serde(rename_all = "camelCase")]
+    DataNotAvailable { slot: Slot, reason: String },
+    /// The base tree of the accounts state is still being computed; retry.
+    #[error("the accounts state base tree for block {slot} is still being computed")]
+    #[serde(rename_all = "camelCase")]
+    BaseTreeNotReady { slot: Slot },
+    /// The transaction, epoch or block asked for is not in what this node
+    /// retains.
+    #[error("{what} not found")]
+    #[serde(rename_all = "camelCase")]
+    NotFound { what: String },
+}
+
+impl LightClientProofError {
+    /// The JSON-RPC error code of this error.
+    pub fn code(&self) -> i64 {
+        match self {
+            Self::ProofsDisabled => JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_PROOFS_DISABLED,
+            Self::FeatureInactive { .. } => JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_FEATURE_INACTIVE,
+            Self::BlockNotFinal { .. } => JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL,
+            Self::BlockNotRetained { .. } => JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
+            Self::CertificatesNotAvailable { .. } => {
+                JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_CERTIFICATES_NOT_AVAILABLE
+            }
+            Self::DataNotAvailable { .. } => JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
+            Self::BaseTreeNotReady { .. } => JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BASE_TREE_NOT_READY,
+            Self::NotFound { .. } => JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_NOT_FOUND,
+        }
+    }
+}
+
+impl From<LightClientProofError> for RpcCustomError {
+    fn from(err: LightClientProofError) -> Self {
+        Self::LightClientProof(err)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -287,6 +375,11 @@ impl From<RpcCustomError> for Error {
                 ),
                 data: None,
             },
+            RpcCustomError::LightClientProof(err) => Self {
+                code: ErrorCode::ServerError(err.code()),
+                message: err.to_string(),
+                data: serde_json::to_value(&err).ok(),
+            },
         }
     }
 }
@@ -297,6 +390,41 @@ mod tests {
         crate::custom_error::EpochRewardsPeriodActiveErrorData, serde_json::Value,
         test_case::test_case,
     };
+
+    #[test]
+    fn test_light_client_proof_error_json() {
+        use {
+            super::{LightClientProofError, RpcCustomError},
+            jsonrpc_core::{Error, ErrorCode},
+        };
+        let err = LightClientProofError::BlockNotRetained {
+            slot: 5,
+            first_retained: Some(10),
+            last_retained: None,
+        };
+        let rpc_error = Error::from(RpcCustomError::from(err.clone()));
+        assert_eq!(rpc_error.code, ErrorCode::ServerError(-32033));
+        let data = rpc_error.data.unwrap();
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "kind": "blockNotRetained",
+                "slot": 5,
+                "firstRetained": 10,
+                "lastRetained": null,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<LightClientProofError>(data).unwrap(),
+            err
+        );
+        let rpc_error = Error::from(RpcCustomError::from(LightClientProofError::ProofsDisabled));
+        assert_eq!(rpc_error.code, ErrorCode::ServerError(-32030));
+        assert_eq!(
+            rpc_error.data.unwrap(),
+            serde_json::json!({"kind": "proofsDisabled"})
+        );
+    }
 
     #[test_case(serde_json::json!({
             "currentBlockHeight": 123,

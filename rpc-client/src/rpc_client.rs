@@ -35,6 +35,7 @@ use {
     solana_rpc_client_api::{
         client_error::{Error as ClientError, ErrorKind, Result as ClientResult},
         config::{RpcAccountInfoConfig, *},
+        light_client::*,
         request::{RpcRequest, TokenAccountsFilter},
         response::*,
     },
@@ -1936,6 +1937,65 @@ impl RpcClient {
         config: RpcVatActiveSetRankMapConfig,
     ) -> RpcResult<Option<RpcVatActiveSetRankMap>> {
         self.invoke((self.rpc_client.as_ref()).get_vat_active_set_rank_map(slot, config))
+    }
+
+    /// See `nonblocking::rpc_client::RpcClient::get_finality_proof`.
+    pub fn get_finality_proof(&self, slot: Slot) -> ClientResult<RpcFinalityProof> {
+        self.invoke((self.rpc_client.as_ref()).get_finality_proof(slot))
+    }
+
+    /// See `nonblocking::rpc_client::RpcClient::get_block_history_proof`.
+    pub fn get_block_history_proof(
+        &self,
+        slot: Slot,
+        at_slot: Slot,
+    ) -> ClientResult<RpcBlockHistoryProof> {
+        self.invoke((self.rpc_client.as_ref()).get_block_history_proof(slot, at_slot))
+    }
+
+    /// See `nonblocking::rpc_client::RpcClient::get_transaction_proof`.
+    pub fn get_transaction_proof(
+        &self,
+        signature: &Signature,
+        config: RpcTransactionProofConfig,
+    ) -> ClientResult<RpcTransactionProof> {
+        self.invoke((self.rpc_client.as_ref()).get_transaction_proof(signature, config))
+    }
+
+    /// See `nonblocking::rpc_client::RpcClient::get_account_delta_proof`.
+    pub fn get_account_delta_proof(
+        &self,
+        pubkey: &Pubkey,
+        slot: Slot,
+    ) -> ClientResult<RpcAccountDeltaProof> {
+        self.invoke((self.rpc_client.as_ref()).get_account_delta_proof(pubkey, slot))
+    }
+
+    /// See `nonblocking::rpc_client::RpcClient::get_account_state_proof`.
+    pub fn get_account_state_proof(
+        &self,
+        pubkey: &Pubkey,
+        config: RpcAccountStateProofConfig,
+    ) -> ClientResult<RpcAccountStateProof> {
+        self.invoke((self.rpc_client.as_ref()).get_account_state_proof(pubkey, config))
+    }
+
+    /// See `nonblocking::rpc_client::RpcClient::get_validator_set`.
+    pub fn get_validator_set(
+        &self,
+        epoch: Epoch,
+        config: RpcCommittingBlockConfig,
+    ) -> ClientResult<RpcValidatorSet> {
+        self.invoke((self.rpc_client.as_ref()).get_validator_set(epoch, config))
+    }
+
+    /// See `nonblocking::rpc_client::RpcClient::get_epoch_boundary`.
+    pub fn get_epoch_boundary(
+        &self,
+        epoch: Epoch,
+        config: RpcCommittingBlockConfig,
+    ) -> ClientResult<RpcEpochBoundary> {
+        self.invoke((self.rpc_client.as_ref()).get_epoch_boundary(epoch, config))
     }
 
     /// Get block production for the current epoch.

@@ -50,6 +50,8 @@ mod client;
 mod commitment;
 mod error;
 mod proofs;
+#[cfg(feature = "rpc")]
+pub mod rpc;
 mod signer_set;
 
 pub use {

@@ -21,14 +21,20 @@ name = "solana_light_client"
 
 [features]
 agave-unstable-api = []
+# Conversions to and from the JSON forms of the proofs served over RPC
+# (`solana-rpc-client-types::light_client`).
+rpc = ["dep:base64", "dep:bs58", "dep:solana-rpc-client-types"]
 
 [dependencies]
+base64 = { workspace = true, optional = true }
 blake3 = { workspace = true }
+bs58 = { workspace = true, optional = true, features = ["std"] }
 solana-bls-signatures = { workspace = true }
 solana-epoch-schedule = { workspace = true }
 solana-hash = { workspace = true, features = ["copy"] }
 solana-merkle-tree = { workspace = true }
 solana-pubkey = { workspace = true }
+solana-rpc-client-types = { workspace = true, optional = true }
 solana-sha256-hasher = { workspace = true, features = ["sha2"] }
 solana-signer-store = { workspace = true }
 thiserror = { workspace = true }
@@ -47,7 +53,7 @@ solana-genesis-config = { workspace = true }
 solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
 solana-ledger = { workspace = true }
-solana-light-client = { path = ".", features = ["agave-unstable-api"] }
+solana-light-client = { path = ".", features = ["agave-unstable-api", "rpc"] }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-runtime-transaction = { workspace = true, features = ["dev-context-only-utils"] }
 solana-sdk-ids = { workspace = true }
