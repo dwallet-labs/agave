@@ -476,10 +476,10 @@ impl Bank {
     /// feature is active for this bank. See `bank::transaction_receipts`.
     pub fn commitment_slot_receipts_root(
         &self,
-        inputs: &CommitmentInputs,
+        _inputs: &CommitmentInputs,
     ) -> std::result::Result<Hash, CommitmentFailure> {
         Ok(self
-            .receipts_root_for_commitment(inputs.parent)?
+            .receipts_root_for_commitment()?
             .unwrap_or(INACTIVE_COMMITMENT_SLOT))
     }
 
