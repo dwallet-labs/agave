@@ -1655,6 +1655,64 @@ mod serde_snapshot_tests {
         }
     }
 
+    /// All three fields on the wire, each present or absent: written up to
+    /// the last present one, each absent field before it as `None`, and read
+    /// back the same, also from a stream that ends after the last present
+    /// field.
+    #[test]
+    fn test_commitment_extra_fields_all_combinations() {
+        use crate::serde_snapshot::types::{SerdeAccountsState, SerdeAccountsStateGeneration};
+        let to_bytes = |fields: &CommitmentExtraFields| {
+            let mut buf = vec![];
+            serialize_into(&mut buf, fields).unwrap();
+            buf
+        };
+        let from_bytes = |bytes: &[u8]| -> CommitmentExtraFields {
+            deserialize_wincode_from(&mut BufReader::new(bytes)).unwrap()
+        };
+        let block_commitment = SerdeBlockCommitment {
+            history_leaf_count: 2,
+            history_subtree_roots: vec![Hash::new_unique()],
+            commitment_root: Hash::new_unique(),
+        };
+        let epoch_boundary = SerdeEpochBoundary {
+            epoch: 1,
+            first_slot: 33,
+            parent_slot: 30,
+            parent_block_id: Hash::new_unique(),
+            parent_commitment_root: Hash::default(),
+            history_len: 1,
+        };
+        let accounts_state = SerdeAccountsState {
+            generations: vec![SerdeAccountsStateGeneration {
+                epoch: 1,
+                base_parent: None,
+                base_root: None,
+                overlay: vec![],
+            }],
+        };
+        for mask in 0..8u8 {
+            let fields = CommitmentExtraFields {
+                block_commitment: (mask & 1 != 0).then(|| block_commitment.clone()),
+                epoch_boundary: (mask & 2 != 0).then_some(epoch_boundary),
+                accounts_state: (mask & 4 != 0).then(|| accounts_state.clone()),
+            };
+            let mut encoded = [vec![], vec![], vec![]];
+            serialize_into(&mut encoded[0], &fields.block_commitment).unwrap();
+            serialize_into(&mut encoded[1], &fields.epoch_boundary).unwrap();
+            serialize_into(&mut encoded[2], &fields.accounts_state).unwrap();
+            let num_written = (0..3)
+                .rev()
+                .find(|i| mask & (1 << i) != 0)
+                .map_or(0, |i| i + 1);
+            let expected = encoded[..num_written].concat();
+            assert_eq!(to_bytes(&fields), expected, "mask {mask}");
+            assert_eq!(from_bytes(&expected), fields, "mask {mask}");
+            // Writing every field, absent ones as `None`, reads the same.
+            assert_eq!(from_bytes(&encoded.concat()), fields, "mask {mask}");
+        }
+    }
+
     /// Round-trips the accounts state of a bank through a snapshot. A
     /// snapshot without the field, of a bank for which the feature is in
     /// effect, restores a bank whose child has a commitment failure, not an
