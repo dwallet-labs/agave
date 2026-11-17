@@ -2785,10 +2785,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             block_commitment_root::id(),
             "SIMD-XXXX: Block commitment root",
         ),
-        (
-            accounts_delta_root::id(),
-            "SIMD-XXXX: Accounts delta root",
-        ),
+        (accounts_delta_root::id(), "SIMD-XXXX: Accounts delta root"),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
     ]
