@@ -46,7 +46,10 @@ use {
         thread,
         time::Instant,
     },
-    types::{SerdeAccountsLtHash, SerdeBlockCommitment, UnusedRentCollector, UnusedStakes},
+    types::{
+        SerdeAccountsLtHash, SerdeBlockCommitment, SerdeEpochBoundary, UnusedRentCollector,
+        UnusedStakes,
+    },
     wincode::{
         ReadResult, SchemaRead, SchemaReadOwned, SchemaWrite, WriteResult,
         adapter::{DefaultOnEmptyRead, DiscardSeq},
@@ -254,6 +257,7 @@ impl From<DeserializableVersionedBank> for BankFieldsToDeserialize {
             bank_hash_stats: BankHashStats::default(),        // populated from AccountsDbFields
             block_id: None,         // populated from ExtraFieldsToDeserialize
             block_commitment: None, // populated from ExtraFieldsToDeserialize
+            epoch_boundary: None,   // populated from ExtraFieldsToDeserialize
         }
     }
 }
@@ -463,6 +467,9 @@ struct ExtraFieldsToDeserialize {
     /// frontier and commitment root).
     #[wincode(with = "DefaultOnEmptyRead<Option<SerdeBlockCommitment>>")]
     block_commitment: Option<SerdeBlockCommitment>,
+    /// Epoch Boundary Commitment state of the snapshot bank.
+    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeEpochBoundary>>")]
+    epoch_boundary: Option<SerdeEpochBoundary>,
 }
 
 /// Extra fields that are serialized at the end of snapshots.
@@ -477,7 +484,7 @@ struct ExtraFieldsToDeserialize {
     // Write-only type (its deserialize counterpart is `ExtraFieldsToDeserialize`), so the abi digest
     // only verifies the serialized wire format; there is no roundtrip.
     frozen_abi(
-        abi_digest = "HjTB3we1CQCwfFe9xp5CCwmLvkuWWX3PMm2gE2tYp1uf",
+        abi_digest = "GeDJNHpVkKdNqKXQb2mmdsEFB5jVDSHx9WydFWrTxETY",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )
@@ -494,6 +501,9 @@ pub struct ExtraFieldsToSerialize {
     /// None when the Block Commitment Root feature is not active for the
     /// snapshot bank.
     pub block_commitment: Option<SerdeBlockCommitment>,
+    /// None when the Epoch Boundary Commitment feature is not active for the
+    /// snapshot bank.
+    pub epoch_boundary: Option<SerdeEpochBoundary>,
 }
 
 /// Deserializable counterpart of [`SerializableBankSnapshot`], read as one struct (wincode reads
@@ -505,7 +515,7 @@ pub struct ExtraFieldsToSerialize {
     feature = "stable-abi",
     derive(SchemaWrite, StableAbi, StableAbiSample),
     frozen_abi(
-        abi_digest = "9pmfH28iWHWw5D6p4E28rc4dBBYvRMXGsLCHYATqhrTW",
+        abi_digest = "98fWY1Rm6EYZFqeoCxQ5WCxTycho3FmtoD3QRR2Xeean",
         abi_serializer = "wincode",
         test_roundtrip = "wire_only"
     )
@@ -539,6 +549,7 @@ impl DeserializableBankSnapshot {
             accounts_lt_hash,
             block_id,
             block_commitment,
+            epoch_boundary,
         } = extra_fields;
 
         bank_fields.fee_rate_governor = bank_fields
@@ -557,6 +568,7 @@ impl DeserializableBankSnapshot {
                     "block commitment history subtree roots do not match the leaf count",
                 )
             })?;
+        bank_fields.epoch_boundary = epoch_boundary.map(Into::into);
 
         Ok((bank_fields, accounts_db))
     }
@@ -652,6 +664,7 @@ where
     let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
     let block_id = Some(bank_fields.block_id);
     let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
+    let epoch_boundary = bank_fields.epoch_boundary.map(Into::into);
     serialize_bank_snapshot_into(
         stream,
         bank_fields,
@@ -664,6 +677,7 @@ where
             accounts_lt_hash,
             block_id,
             block_commitment,
+            epoch_boundary,
         },
     )
 }
@@ -676,7 +690,7 @@ where
     // Write-only type (its deserialize counterparts are `DeserializableVersionedBank`,
     // `AccountsDbFields` and `ExtraFieldsToDeserialize`), so there is no roundtrip.
     frozen_abi(
-        abi_digest = "9pmfH28iWHWw5D6p4E28rc4dBBYvRMXGsLCHYATqhrTW",
+        abi_digest = "98fWY1Rm6EYZFqeoCxQ5WCxTycho3FmtoD3QRR2Xeean",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )

@@ -146,6 +146,7 @@ use {
     solana_keypair::Keypair,
     solana_lattice_hash::lt_hash::LtHash,
     solana_measure::{measure::Measure, measure_time, measure_us},
+    solana_merkle_tree::epoch_boundary::EpochBoundary,
     solana_message::{
         AccountKeys, SanitizedMessage, inner_instruction::InnerInstructions, v0::LoadedAddresses,
     },
@@ -253,6 +254,7 @@ pub mod block_commitment;
 pub mod builtins;
 mod check_transactions;
 pub mod entry_bytes_budget;
+mod epoch_boundary;
 mod fee_distribution;
 mod metrics;
 pub(crate) mod partitioned_epoch_rewards;
@@ -534,6 +536,7 @@ pub enum VATHealthError {
         bank_hash_stats(pub),
         block_id(pub),
         block_commitment(pub),
+        epoch_boundary(pub),
     )
 )]
 pub struct BankFieldsToDeserialize {
@@ -569,6 +572,9 @@ pub struct BankFieldsToDeserialize {
     /// Block Commitment Root state of the snapshot bank, None if the feature
     /// was not active for it (or the snapshot predates the feature).
     pub(crate) block_commitment: Option<block_commitment::BlockCommitment>,
+    /// Epoch Boundary Commitment state of the snapshot bank, None if the
+    /// feature was not active for it (or the snapshot predates the feature).
+    pub(crate) epoch_boundary: Option<EpochBoundary>,
 }
 
 #[cfg(feature = "dev-context-only-utils")]
@@ -603,6 +609,7 @@ impl Default for BankFieldsToDeserialize {
             bank_hash_stats: BankHashStats::default(),
             block_id: Option::<BlockId>::default(),
             block_commitment: None,
+            epoch_boundary: None,
         }
     }
 }
@@ -644,6 +651,7 @@ pub struct BankFieldsToSerialize {
     pub accounts_lt_hash: AccountsLtHash,
     pub block_id: BlockId,
     pub block_commitment: Option<block_commitment::BlockCommitment>,
+    pub epoch_boundary: Option<EpochBoundary>,
 }
 
 // Can't derive PartialEq because RwLock doesn't implement PartialEq
@@ -726,6 +734,7 @@ impl PartialEq for Bank {
             transaction_receipts: _,
             // Derived from the account updates; `block_commitment` commits to it.
             accounts_delta: _,
+            epoch_boundary,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
             block_component_processor: _,
@@ -768,6 +777,7 @@ impl PartialEq for Bank {
             && *accounts_lt_hash.lock().unwrap() == *other.accounts_lt_hash.lock().unwrap()
             && *block_id.read().unwrap() == *other.block_id.read().unwrap()
             && *block_commitment.read().unwrap() == *other.block_commitment.read().unwrap()
+            && *epoch_boundary.read().unwrap() == *other.epoch_boundary.read().unwrap()
             && is_alpenglow.load(Relaxed) == other.is_alpenglow()
     }
 }
@@ -805,6 +815,7 @@ impl BankFieldsToSerialize {
             accounts_lt_hash: AccountsLtHash(LtHash([0x7E57; LtHash::NUM_ELEMENTS])),
             block_id: BlockId::default(),
             block_commitment: None,
+            epoch_boundary: None,
         }
     }
 }
@@ -1045,6 +1056,13 @@ pub struct Bank {
     /// `block_commitment_root` and `accounts_delta_root` features active.
     /// None otherwise, and for banks loaded from a snapshot.
     accounts_delta: RwLock<Option<Arc<solana_merkle_tree::accounts_delta::AccountsDelta>>>,
+
+    /// Epoch Boundary Commitment state: where the previous epoch ended on this
+    /// bank's chain. Set when the bank is frozen with the `block_commitment_root`
+    /// and `epoch_boundary_commitment` features active (computed by the first
+    /// bank of an epoch on its fork, copied from the parent otherwise), or
+    /// loaded from a snapshot. None otherwise.
+    epoch_boundary: RwLock<Option<EpochBoundary>>,
 
     /// Accounts stats for computing the bank hash
     bank_hash_stats: AtomicBankHashStats,
@@ -1328,6 +1346,7 @@ impl Bank {
             expected_commitment_root: RwLock::new(None),
             transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             accounts_delta: RwLock::new(None),
+            epoch_boundary: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -1585,6 +1604,7 @@ impl Bank {
             expected_commitment_root: RwLock::new(None),
             transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             accounts_delta: RwLock::new(None),
+            epoch_boundary: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -2349,6 +2369,7 @@ impl Bank {
             expected_commitment_root: RwLock::new(None),
             transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             accounts_delta: RwLock::new(None),
+            epoch_boundary: RwLock::new(fields.epoch_boundary),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
             is_alpenglow: AtomicBool::new(false),
             transaction_execution_gate: CachePadded::new(TransactionExecutionGate::default()),
@@ -2443,6 +2464,7 @@ impl Bank {
             accounts_lt_hash: self.accounts_lt_hash.lock().unwrap().clone(),
             block_id: self.block_id().expect("block id must be set"),
             block_commitment: self.block_commitment(),
+            epoch_boundary: self.epoch_boundary(),
         }
     }
 
@@ -3361,7 +3383,16 @@ impl Bank {
             // The commitment vector is computed at the same point as the bank
             // hash, after the lattice hash is finished, and while the hash
             // lock is held so that a frozen bank always has it.
-            *self.block_commitment.write().unwrap() = self.compute_block_commitment();
+            let block_commitment = self.compute_block_commitment();
+            // Same inputs as commitment slot 4 of that vector.
+            *self.epoch_boundary.write().unwrap() =
+                block_commitment.as_ref().and_then(|block_commitment| {
+                    self.compute_epoch_boundary(
+                        self.parent().as_deref(),
+                        block_commitment.block_history.leaf_count(),
+                    )
+                });
+            *self.block_commitment.write().unwrap() = block_commitment;
             self.rc
                 .accounts
                 .accounts_db
