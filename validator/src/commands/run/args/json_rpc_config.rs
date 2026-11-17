@@ -313,12 +313,38 @@ pub(super) mod tests {
                     light_client_proof_retained_blocks: retained_blocks,
                     ..default_run_args.json_rpc_config.clone()
                 },
+                // As set by `--full-rpc-api`.
+                pub_sub_config: PubSubConfig {
+                    notification_threads: Some(
+                        NonZeroUsize::new(
+                            DEFAULT_RPC_PUBSUB_NUM_NOTIFICATION_THREADS
+                                .parse::<usize>()
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    ..default_run_args.pub_sub_config.clone()
+                },
                 ..default_run_args.clone()
             };
             verify_args_struct_by_command_run_with_identity_setup(
                 default_run_args.clone(),
                 args,
                 expected_args,
+            );
+        }
+        // The proofs need the full API, and the bound needs the proofs.
+        for args in [
+            vec!["--enable-light-client-proofs"],
+            vec![
+                "--full-rpc-api",
+                "--light-client-proof-retained-blocks",
+                "77",
+            ],
+        ] {
+            crate::commands::run::args::tests::verify_args_struct_by_command_run_is_error_with_identity_setup(
+                default_run_args.clone(),
+                args,
             );
         }
     }
