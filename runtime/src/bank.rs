@@ -747,6 +747,7 @@ impl PartialEq for Bank {
             // Derived from the account updates; `block_commitment` commits to it.
             accounts_delta: _,
             epoch_boundary,
+            epoch_boundary_unknown,
             // Committed to by `block_commitment`; base cells are compared by
             // the accounts state tests.
             accounts_state: _,
@@ -796,6 +797,7 @@ impl PartialEq for Bank {
             && *block_id.read().unwrap() == *other.block_id.read().unwrap()
             && *block_commitment.read().unwrap() == *other.block_commitment.read().unwrap()
             && *epoch_boundary.read().unwrap() == *other.epoch_boundary.read().unwrap()
+            && *epoch_boundary_unknown == other.epoch_boundary_unknown
             && *commitment_failure.read().unwrap() == *other.commitment_failure.read().unwrap()
             && is_alpenglow.load(Relaxed) == other.is_alpenglow()
     }
@@ -1091,6 +1093,10 @@ pub struct Bank {
     /// bank of an epoch on its fork, copied from the parent otherwise), or
     /// loaded from a snapshot. None otherwise.
     epoch_boundary: RwLock<Option<EpochBoundary>>,
+    /// Whether this bank was restored from a snapshot without epoch boundary
+    /// state although it needs one, so its children in the same epoch cannot
+    /// copy it; see [`Bank::is_epoch_boundary_unknown`].
+    epoch_boundary_unknown: bool,
 
     /// Accounts State Root: the generations (overlays and bases) held by this
     /// bank, or the commitment failure that prevents computing them. Computed
@@ -1392,6 +1398,7 @@ impl Bank {
             transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             accounts_delta: RwLock::new(None),
             epoch_boundary: RwLock::new(None),
+            epoch_boundary_unknown: false,
             accounts_state: RwLock::new(None),
             accounts_state_bases: Arc::default(),
             commitment_vector: RwLock::new(None),
@@ -1659,6 +1666,7 @@ impl Bank {
             transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             accounts_delta: RwLock::new(None),
             epoch_boundary: RwLock::new(None),
+            epoch_boundary_unknown: false,
             accounts_state: RwLock::new(None),
             accounts_state_bases: parent.accounts_state_bases.clone(),
             commitment_vector: RwLock::new(None),
@@ -2430,6 +2438,7 @@ impl Bank {
             transaction_receipts: transaction_receipts::ReceiptAccumulator::default(),
             accounts_delta: RwLock::new(None),
             epoch_boundary: RwLock::new(fields.epoch_boundary),
+            epoch_boundary_unknown: false,
             accounts_state: RwLock::new(Self::accounts_state_from_snapshot(
                 fields.accounts_state,
                 &accounts_state_bases,
@@ -2461,6 +2470,7 @@ impl Bank {
 
         bank.refresh_slot_params_from_snapshot(genesis_config);
         bank.initialize_after_snapshot_restore(|| rewards_calculation_thread_pool);
+        bank.epoch_boundary_unknown = bank.is_epoch_boundary_unknown_after_snapshot_restore();
 
         datapoint_info!(
             "bank-new-from-fields",
