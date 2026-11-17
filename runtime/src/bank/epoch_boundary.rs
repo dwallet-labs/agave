@@ -36,15 +36,22 @@
 //!   epoch but has no state (activation in the middle of an epoch, which the
 //!   SIMD forbids and only tests can do) has none either.
 //! - `P` without a commitment root (`block_commitment_root` activated at the
-//!   same boundary): `P.commitment_root` is zero and `history_len(F)` is 0,
-//!   since the block history of `F` starts empty.
-//! - `P` without a block id: logged, and the zero block id is used, as in the
-//!   block history leaf; the resulting commitment root differs from the
-//!   cluster's, so the block is rejected instead of silently accepted.
+//!   same boundary): `P.commitment_root` is zero and `history_len(F)` is 1:
+//!   the block history of `F` is the anchor leaf of `P` alone, which is `P`'s
+//!   leaf (with a zero commitment root) at index 0, as in every other case.
+//! - `P` with `block_commitment_root` active but without a commitment root
+//!   (a commitment failure of its own, or no block commitment state at all,
+//!   as after loading a snapshot written before the field existed): a
+//!   commitment failure, never the zero commitment root, which stands only
+//!   for a `P` that predates the feature.
+//! - `P` without a block id: a commitment failure. The block history of `F`
+//!   (its last leaf, or its anchor leaf) needs the same block id and fails
+//!   first, with `MissingParentBlockId`.
 
 use {
     super::{Bank, block_commitment::CommitmentFailure},
     agave_feature_set as feature_set,
+    solana_hash::Hash,
     solana_merkle_tree::epoch_boundary::EpochBoundary,
 };
 
@@ -68,7 +75,8 @@ impl Bank {
     /// The epoch boundary of this bank, given its parent and the length of
     /// its block history `H(B)`. Used for commitment slot 4 and for the state
     /// stored at freeze, with the same inputs. Fails if this bank is the
-    /// first of its epoch and its parent has no block id.
+    /// first of its epoch and its parent has no block id, or has
+    /// `block_commitment_root` active but no commitment root.
     pub(super) fn compute_epoch_boundary(
         &self,
         parent: Option<&Bank>,
@@ -86,18 +94,34 @@ impl Bank {
             // has a block id in a running validator (see
             // `block_history_for_commitment`); without it the boundary, and
             // so this bank's commitment root, cannot be computed.
-            let parent_block_id =
-                parent
-                    .block_id()
-                    .ok_or(CommitmentFailure::EpochBoundaryMissingParentBlockId {
-                        parent_slot: parent.slot(),
-                    })?;
+            let parent_slot = parent.slot();
+            let parent_block_id = parent
+                .block_id()
+                .ok_or(CommitmentFailure::EpochBoundaryMissingParentBlockId { parent_slot })?;
+            // `P.commitment_root` is 32 zero bytes only for a `P` that
+            // predates Block Commitment Root. A `P` with the feature active
+            // has one, or a commitment failure; one with neither (no block
+            // commitment state, e.g. loaded from an old snapshot) is a
+            // failure as well, not a zero commitment root.
+            let parent_commitment_root = if parent.is_block_commitment_root_active() {
+                match parent.commitment_root() {
+                    Some(commitment_root) => commitment_root,
+                    None if parent.commitment_failure().is_some() => {
+                        return Err(CommitmentFailure::ParentCommitmentFailure { parent_slot });
+                    }
+                    None => {
+                        return Err(CommitmentFailure::MissingParentCommitment { parent_slot });
+                    }
+                }
+            } else {
+                Hash::default()
+            };
             Ok(Some(EpochBoundary {
                 epoch: self.epoch(),
                 first_slot: self.slot(),
-                parent_slot: parent.slot(),
+                parent_slot,
                 parent_block_id: parent_block_id.to_hash(),
-                parent_commitment_root: parent.commitment_root().unwrap_or_default(),
+                parent_commitment_root,
                 history_len,
             }))
         } else {
@@ -129,7 +153,6 @@ mod tests {
         solana_clock::Slot,
         solana_epoch_schedule::EpochSchedule,
         solana_genesis_config::GenesisConfig,
-        solana_hash::Hash,
         solana_merkle_tree::commitment_tree::{TreeId, compute_root, make_inclusion_proof},
         solana_pubkey::Pubkey,
         solana_sha256_hasher::hashv,
@@ -460,7 +483,8 @@ mod tests {
     #[test]
     fn test_parent_without_commitment_root() {
         // Both features activate in the first block of epoch 1: `P` has no
-        // commitment root and the history of `F` is empty.
+        // commitment root, and the history of `F` is the anchor leaf of `P`
+        // alone, at index 0.
         let bank0 = Arc::new(Bank::new_for_tests(&genesis(&[])));
         freeze_with_block_id(&bank0);
         let bank5 = child(&bank0, 5);
@@ -480,16 +504,43 @@ mod tests {
                 parent_slot: 5,
                 parent_block_id: bank5.block_id().unwrap().to_hash(),
                 parent_commitment_root: Hash::default(),
-                history_len: 0,
+                history_len: 1,
             }
         );
-        assert_eq!(boundary.parent_history_index(), None);
-        assert_eq!(slot4(&bank32), expected_hash(1, 32, &bank5, 0));
+        assert_eq!(slot4(&bank32), expected_hash(1, 32, &bank5, 1));
+
+        // `P`'s leaf, rebuilt from the boundary, is the anchor leaf at index
+        // 0 of the history of `F`.
+        assert_eq!(boundary.parent_history_index(), Some(0));
+        let anchor = history_leaf(5, &bank5.block_id().unwrap().to_hash(), &Hash::default());
+        let history_root = bank32.block_commitment().unwrap().block_history_root();
+        assert_eq!(compute_root(TreeId::BLOCK_HISTORY, &[anchor]), history_root);
+        let proof = make_inclusion_proof(TreeId::BLOCK_HISTORY, &[anchor], 0).unwrap();
+        assert!(proof.verify(
+            TreeId::BLOCK_HISTORY,
+            &history_leaf(
+                boundary.parent_slot,
+                &boundary.parent_block_id,
+                &boundary.parent_commitment_root
+            ),
+            &history_root
+        ));
+
+        // The count of blocks of epoch 1 includes `F`, from the anchor leaf on.
+        let mut bank = bank32;
+        for slot in [40, 50, 63] {
+            bank = child(&bank, slot);
+        }
+        let bank64 = child(&bank, 64);
+        assert_eq!(
+            boundary.blocks_until(&bank64.epoch_boundary().unwrap()),
+            Some(4)
+        );
     }
 
-    /// `F` whose parent `P` has no block id (and no commitment root, so the
-    /// block history does not need it) cannot compute its epoch boundary:
-    /// a commitment failure instead of the zero block id.
+    /// `F` whose parent `P` has no block id cannot compute its block history
+    /// (the anchor leaf of `P`) or its epoch boundary: a commitment failure
+    /// instead of the zero block id. The history fails first.
     #[test]
     fn test_parent_without_block_id_is_commitment_failure() {
         let bank0 = Arc::new(Bank::new_for_tests(&genesis(&[])));
@@ -507,7 +558,12 @@ mod tests {
         assert_eq!(bank32.epoch_boundary(), None);
         assert_commitment_failure(
             &bank32,
-            CommitmentFailure::EpochBoundaryMissingParentBlockId { parent_slot: 5 },
+            CommitmentFailure::MissingParentBlockId { parent_slot: 5 },
+        );
+        // The epoch boundary on its own fails as well.
+        assert_eq!(
+            bank32.compute_epoch_boundary(Some(&bank5), 1),
+            Err(CommitmentFailure::EpochBoundaryMissingParentBlockId { parent_slot: 5 })
         );
 
         // Within the epoch, the boundary is copied from the parent, whose
@@ -517,6 +573,48 @@ mod tests {
         assert_commitment_failure(
             &bank33,
             CommitmentFailure::ParentCommitmentFailure { parent_slot: 32 },
+        );
+    }
+
+    /// `P` with Block Commitment Root active but no commitment root does not
+    /// stand for a zero commitment root: the epoch boundary of `F` is a
+    /// commitment failure, as its block history is.
+    #[test]
+    fn test_active_parent_without_commitment_root_is_commitment_failure() {
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis(&both_features())));
+        freeze_with_block_id(&bank0);
+        let bank5 = child(&bank0, 5);
+
+        // No block commitment state and no failure, as for a bank loaded
+        // from a snapshot written before the field existed.
+        *bank5.block_commitment.write().unwrap() = None;
+        assert!(bank5.is_block_commitment_root_active());
+        assert_eq!(bank5.commitment_failure(), None);
+        let bank32 = child(&bank5, 32);
+        assert_eq!(bank32.epoch_boundary(), None);
+        assert_commitment_failure(
+            &bank32,
+            CommitmentFailure::MissingParentCommitment { parent_slot: 5 },
+        );
+        assert_eq!(
+            bank32.compute_epoch_boundary(Some(&bank5), 2),
+            Err(CommitmentFailure::MissingParentCommitment { parent_slot: 5 })
+        );
+
+        // `P` with a commitment failure of its own.
+        let bank31 = child(&bank5, 31);
+        assert_eq!(
+            bank31.commitment_failure(),
+            Some(CommitmentFailure::MissingParentCommitment { parent_slot: 5 })
+        );
+        let bank33 = child(&bank31, 33);
+        assert_commitment_failure(
+            &bank33,
+            CommitmentFailure::ParentCommitmentFailure { parent_slot: 31 },
+        );
+        assert_eq!(
+            bank33.compute_epoch_boundary(Some(&bank31), 3),
+            Err(CommitmentFailure::ParentCommitmentFailure { parent_slot: 31 })
         );
     }
 
