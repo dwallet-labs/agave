@@ -70,6 +70,7 @@ solana-hash = { workspace = true }
 solana-keypair = { workspace = true }
 solana-leader-schedule = { workspace = true }
 solana-ledger = { workspace = true }
+solana-light-client = { workspace = true, features = ["agave-unstable-api", "rpc"] }
 solana-measure = { workspace = true }
 solana-message = { workspace = true }
 solana-metrics = { workspace = true }
@@ -111,6 +112,7 @@ tokio-util = { workspace = true, features = ["codec", "compat", "rt"] }
 wincode = { workspace = true }
 
 [dev-dependencies]
+agave-bls-cert-verify = { workspace = true, features = ["dev-context-only-utils"] }
 agave-fs = { path = "../fs" }
 agave-reserved-account-keys = { path = "../reserved-account-keys", features = ["agave-unstable-api"] }
 serial_test = { workspace = true }

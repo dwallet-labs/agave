@@ -5,6 +5,7 @@ use solana_runtime::installed_scheduler_pool::{
 };
 use {
     crate::{
+        light_client_proofs::{DEFAULT_RETAINED_BLOCKS, LightClientProofStore},
         max_slots::MaxSlots, optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::*, rpc_cache::RankMapCache, rpc_health::*,
     },
@@ -125,6 +126,7 @@ mod transaction {
 }
 
 pub mod account_resolver;
+pub mod rpc_light_client;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
@@ -196,6 +198,12 @@ pub struct JsonRpcConfig {
     pub scan_results_limit_bytes: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
+    /// Serve light-client proofs (`getFinalityProof` and the other proof
+    /// methods), keeping what they need in memory; see
+    /// [`crate::light_client_proofs`]. Off by default.
+    pub enable_light_client_proofs: bool,
+    /// Number of finalized blocks whose light-client proof data is kept.
+    pub light_client_proof_retained_blocks: usize,
 }
 
 impl Default for JsonRpcConfig {
@@ -217,6 +225,8 @@ impl Default for JsonRpcConfig {
             max_request_body_size: Option::default(),
             scan_results_limit_bytes: Option::default(),
             disable_health_check: Default::default(),
+            enable_light_client_proofs: false,
+            light_client_proof_retained_blocks: DEFAULT_RETAINED_BLOCKS,
         }
     }
 }
@@ -276,6 +286,7 @@ pub struct JsonRpcRequestProcessor {
     max_complete_and_rooted_transaction_status_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     runtime: Arc<Runtime>,
+    light_client_proofs: Option<Arc<LightClientProofStore>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -413,9 +424,20 @@ impl JsonRpcRequestProcessor {
                 max_complete_and_rooted_transaction_status_slot,
                 prioritization_fee_cache,
                 runtime,
+                light_client_proofs: None,
             },
             transaction_receiver,
         )
+    }
+
+    /// Serves light-client proofs from `light_client_proofs` (if the
+    /// configuration enables them).
+    pub fn with_light_client_proofs(
+        mut self,
+        light_client_proofs: Option<Arc<LightClientProofStore>>,
+    ) -> Self {
+        self.light_client_proofs = light_client_proofs;
+        self
     }
 
     #[cfg(test)]
@@ -498,6 +520,7 @@ impl JsonRpcRequestProcessor {
             max_complete_and_rooted_transaction_status_slot: Arc::new(AtomicU64::default()),
             prioritization_fee_cache: Some(Arc::new(PrioritizationFeeCache::default())),
             runtime,
+            light_client_proofs: None,
         }
     }
 

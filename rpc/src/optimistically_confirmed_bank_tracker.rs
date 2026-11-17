@@ -9,7 +9,7 @@
 //! BankNotification::NewRootedChain --> SlotNotification::Root for the roots in the chain.
 
 use {
-    crate::rpc_subscriptions::RpcSubscriptions,
+    crate::{light_client_proofs::LightClientProofStore, rpc_subscriptions::RpcSubscriptions},
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
     solana_clock::Slot,
     solana_hash::Hash,
@@ -90,6 +90,9 @@ pub struct BankNotificationSenderConfig {
     pub sender: BankNotificationSender,
     pub should_send_parents: bool,
     pub dependency_tracker: Option<Arc<DependencyTracker>>,
+    /// Light-client proof store to feed with rooted banks and completed
+    /// certificates, if the node serves light-client proofs.
+    pub light_client_proofs: Option<Arc<LightClientProofStore>>,
 }
 
 pub type SlotNotificationReceiver = Receiver<SlotNotification>;

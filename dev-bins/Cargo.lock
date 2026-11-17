@@ -7261,6 +7261,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-light-client"
+version = "5.0.0-alpha.0"
+dependencies = [
+ "base64 0.23.1",
+ "blake3",
+ "bs58",
+ "solana-bls-signatures",
+ "solana-epoch-schedule",
+ "solana-hash",
+ "solana-merkle-tree",
+ "solana-pubkey 4.4.0",
+ "solana-rpc-client-types",
+ "solana-sha256-hasher",
+ "solana-signer-store",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solana-loader-v2-interface"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7773,6 +7791,7 @@ dependencies = [
  "solana-keypair",
  "solana-leader-schedule",
  "solana-ledger",
+ "solana-light-client",
  "solana-measure",
  "solana-message",
  "solana-metrics",

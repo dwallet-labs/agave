@@ -2,6 +2,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 mod cluster_tpu_info;
 pub mod filter;
+pub mod light_client_proofs;
 pub mod max_slots;
 pub mod optimistically_confirmed_bank_tracker;
 pub mod parsed_token_accounts;

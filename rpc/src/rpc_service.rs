@@ -3,9 +3,17 @@
 use {
     crate::{
         cluster_tpu_info::ClusterTpuInfo,
+        light_client_proofs::LightClientProofStore,
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
-        rpc::{rpc_accounts::*, rpc_bank::*, rpc_full::*, rpc_minimal::*, *},
+        rpc::{
+            rpc_accounts::*,
+            rpc_bank::*,
+            rpc_full::*,
+            rpc_light_client::{self, LightClient as _},
+            rpc_minimal::*,
+            *,
+        },
         rpc_cache::RankMapCache,
         rpc_health::*,
     },
@@ -485,6 +493,9 @@ pub struct JsonRpcServiceConfig<'a> {
     pub max_complete_and_rooted_transaction_status_slot: Arc<AtomicU64>,
     pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     pub rpc_tpu_client_args: RpcTpuClientArgs<'a>,
+    /// Store of the light-client proof methods, when
+    /// `JsonRpcConfig::enable_light_client_proofs` is set.
+    pub light_client_proofs: Option<Arc<LightClientProofStore>>,
 }
 
 /// Arguments required to create a TPU client for the RPC service.
@@ -556,6 +567,7 @@ impl JsonRpcService {
             config.max_complete_and_rooted_transaction_status_slot,
             config.prioritization_fee_cache,
             runtime,
+            config.light_client_proofs,
         )?;
         Ok(json_rpc_service)
     }
@@ -585,6 +597,7 @@ impl JsonRpcService {
         max_complete_and_rooted_transaction_status_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         runtime: Arc<TokioRuntime>,
+        light_client_proofs: Option<Arc<LightClientProofStore>>,
     ) -> Result<Self, String> {
         info!("rpc bound to {rpc_addr:?}");
         info!("rpc configuration: {config:?}");
@@ -672,6 +685,7 @@ impl JsonRpcService {
             prioritization_fee_cache,
             Arc::clone(&runtime),
         );
+        let request_processor = request_processor.with_light_client_proofs(light_client_proofs);
 
         let _send_transaction_service = Arc::new(SendTransactionService::new(
             bank_forks.clone(),
@@ -699,6 +713,7 @@ impl JsonRpcService {
                     io.extend_with(rpc_bank::BankDataImpl.to_delegate());
                     io.extend_with(rpc_accounts::AccountsDataImpl.to_delegate());
                     io.extend_with(rpc_full::FullImpl.to_delegate());
+                    io.extend_with(rpc_light_client::LightClientImpl.to_delegate());
                 }
 
                 let request_middleware = RpcRequestMiddleware::new(
@@ -1190,6 +1205,7 @@ mod tests {
             Arc::new(AtomicU64::default()),
             Some(Arc::new(PrioritizationFeeCache::default())),
             runtime,
+            None,
         )
         .expect("assume successful JsonRpcService start");
         let thread = rpc_service.thread_hdl.thread();
