@@ -11,7 +11,7 @@ use {
     crate::{
         bank::{
             Bank, BankFieldsToDeserialize, BankFieldsToSerialize, BankHashStats, BankRc,
-            block_commitment::BlockCommitment,
+            accounts_state::SnapshotAccountsState, block_commitment::BlockCommitment,
         },
         epoch_stakes::{DeserializableVersionedEpochStakes, VersionedEpochStakes},
         runtime_config::RuntimeConfig,
@@ -55,8 +55,8 @@ use {
         time::Instant,
     },
     types::{
-        SerdeAccountsLtHash, SerdeBlockCommitment, SerdeEpochBoundary, UnusedRentCollector,
-        UnusedStakes,
+        SerdeAccountsLtHash, SerdeAccountsState, SerdeBlockCommitment, SerdeEpochBoundary,
+        UnusedRentCollector, UnusedStakes,
     },
     wincode::{
         ReadResult, SchemaRead, SchemaReadOwned, SchemaWrite, WriteResult,
@@ -247,6 +247,7 @@ impl From<DeserializableVersionedBank> for BankFieldsToDeserialize {
             block_id: None,         // populated from ExtraFieldsToDeserialize
             block_commitment: None, // populated from ExtraFieldsToDeserialize
             epoch_boundary: None,   // populated from ExtraFieldsToDeserialize
+            accounts_state: None,   // populated from ExtraFieldsToDeserialize
         }
     }
 }
@@ -459,6 +460,10 @@ struct ExtraFieldsToDeserialize {
     /// Epoch Boundary Commitment state of the snapshot bank.
     #[wincode(with = "DefaultOnEmptyRead<Option<SerdeEpochBoundary>>")]
     epoch_boundary: Option<SerdeEpochBoundary>,
+    /// Accounts State Root state of the snapshot bank (overlays and known
+    /// base roots).
+    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeAccountsState>>")]
+    accounts_state: Option<SerdeAccountsState>,
 }
 
 /// Extra fields that are serialized at the end of snapshots.
@@ -473,7 +478,7 @@ struct ExtraFieldsToDeserialize {
     // Write-only type (its deserialize counterpart is `ExtraFieldsToDeserialize`), so the abi digest
     // only verifies the serialized wire format; there is no roundtrip.
     frozen_abi(
-        abi_digest = "GeDJNHpVkKdNqKXQb2mmdsEFB5jVDSHx9WydFWrTxETY",
+        abi_digest = "CxsqSdHnZ5AuFVG54mhYcSALum7iefVtjT55GUMQMBQr",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )
@@ -493,6 +498,9 @@ pub struct ExtraFieldsToSerialize {
     /// None when the Epoch Boundary Commitment feature is not active for the
     /// snapshot bank.
     pub epoch_boundary: Option<SerdeEpochBoundary>,
+    /// None when the Accounts State Root feature is not active for the
+    /// snapshot bank.
+    pub accounts_state: Option<SerdeAccountsState>,
 }
 
 /// Deserializable counterpart of [`SerializableBankSnapshot`], read as one struct (wincode reads
@@ -504,7 +512,7 @@ pub struct ExtraFieldsToSerialize {
     feature = "stable-abi",
     derive(SchemaWrite, StableAbi, StableAbiSample),
     frozen_abi(
-        abi_digest = "98fWY1Rm6EYZFqeoCxQ5WCxTycho3FmtoD3QRR2Xeean",
+        abi_digest = "3psM4ktwFwZrbYZTEt3fFVRirt5UbE2tqEXtT15xByjj",
         abi_serializer = "wincode",
         test_roundtrip = "wire_only"
     )
@@ -539,6 +547,7 @@ impl DeserializableBankSnapshot {
             block_id,
             block_commitment,
             epoch_boundary,
+            accounts_state,
         } = extra_fields;
 
         bank_fields.fee_rate_governor = bank_fields
@@ -558,6 +567,10 @@ impl DeserializableBankSnapshot {
                 )
             })?;
         bank_fields.epoch_boundary = epoch_boundary.map(Into::into);
+        bank_fields.accounts_state = accounts_state
+            .map(SnapshotAccountsState::try_from)
+            .transpose()
+            .map_err(wincode::ReadError::InvalidValue)?;
 
         Ok((bank_fields, accounts_db))
     }
@@ -660,6 +673,7 @@ where
     let block_id = Some(bank_fields.block_id);
     let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
     let epoch_boundary = bank_fields.epoch_boundary.map(Into::into);
+    let accounts_state = bank_fields.accounts_state.clone().map(Into::into);
     serialize_bank_snapshot_into(
         stream,
         bank_fields,
@@ -673,6 +687,7 @@ where
             block_id,
             block_commitment,
             epoch_boundary,
+            accounts_state,
         },
     )
 }
@@ -685,7 +700,7 @@ where
     // Write-only type (its deserialize counterparts are `DeserializableVersionedBank`,
     // `AccountsDbFields` and `ExtraFieldsToDeserialize`), so there is no roundtrip.
     frozen_abi(
-        abi_digest = "98fWY1Rm6EYZFqeoCxQ5WCxTycho3FmtoD3QRR2Xeean",
+        abi_digest = "3psM4ktwFwZrbYZTEt3fFVRirt5UbE2tqEXtT15xByjj",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )

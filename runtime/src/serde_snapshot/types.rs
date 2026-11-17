@@ -1,5 +1,8 @@
 use {
-    crate::bank::block_commitment::BlockCommitment,
+    crate::bank::{
+        accounts_state::{SnapshotAccountsState, SnapshotGeneration},
+        block_commitment::BlockCommitment,
+    },
     solana_account::AccountSharedData,
     solana_accounts_db::accounts_hash::AccountsLtHash,
     solana_clock::Epoch,
@@ -7,8 +10,10 @@ use {
     solana_hash::Hash,
     solana_lattice_hash::lt_hash::LtHash,
     solana_merkle_tree::{
-        commitment_tree::{AppendOnlyFrontier, FrontierError},
+        accounts_state::{OverlayEntry, overlay_value},
+        commitment_tree::{AppendOnlyFrontier, FrontierError, TreeId},
         epoch_boundary::EpochBoundary,
+        keyed_tree::KeyedTree,
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
@@ -153,6 +158,125 @@ impl From<SerdeEpochBoundary> for EpochBoundary {
             parent_commitment_root,
             history_len,
         }
+    }
+}
+
+/// Snapshot serde-safe accounts state (Accounts State Root SIMD): the
+/// generations held by the snapshot bank.
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Debug, Clone, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct SerdeAccountsState {
+    /// In ascending epoch order, at most two.
+    pub generations: Vec<SerdeAccountsStateGeneration>,
+}
+
+/// One generation of [`SerdeAccountsState`].
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Debug, Clone, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct SerdeAccountsStateGeneration {
+    pub epoch: Epoch,
+    /// The block whose state is the base state of the generation (`P`), None
+    /// for a chain that starts without a parent (empty base state).
+    pub base_parent: Option<SerdeBaseParent>,
+    /// `base_root`, if it was known when the snapshot was taken.
+    pub base_root: Option<Hash>,
+    /// The overlay entries, sorted by address (96 bytes per entry).
+    pub overlay: Vec<SerdeOverlayEntry>,
+}
+
+/// `(slot, bank_hash)` of the block whose state is a base state.
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct SerdeBaseParent {
+    pub slot: u64,
+    pub bank_hash: Hash,
+}
+
+/// One overlay entry: address, `account_hash` now and in the base state.
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct SerdeOverlayEntry {
+    pub address: Pubkey,
+    pub now: Hash,
+    pub base: Hash,
+}
+
+impl From<SnapshotAccountsState> for SerdeAccountsState {
+    fn from(state: SnapshotAccountsState) -> Self {
+        Self {
+            generations: state
+                .generations
+                .into_iter()
+                .map(|generation| SerdeAccountsStateGeneration {
+                    epoch: generation.epoch,
+                    base_parent: generation
+                        .base_parent
+                        .map(|(slot, bank_hash)| SerdeBaseParent { slot, bank_hash }),
+                    base_root: generation.base_root,
+                    overlay: generation
+                        .overlay
+                        .iter()
+                        .map(|(address, value)| {
+                            let entry = OverlayEntry::from_value(*address, value);
+                            SerdeOverlayEntry {
+                                address: Pubkey::new_from_array(entry.address),
+                                now: entry.now,
+                                base: entry.base,
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<SerdeAccountsState> for SnapshotAccountsState {
+    type Error = &'static str;
+
+    /// Checks that generations are in strictly ascending epoch order, at most
+    /// two, and that overlay addresses are strictly ascending.
+    fn try_from(serde: SerdeAccountsState) -> Result<Self, Self::Error> {
+        if serde.generations.len() > 2
+            || serde
+                .generations
+                .windows(2)
+                .any(|pair| pair[0].epoch >= pair[1].epoch)
+        {
+            return Err("accounts state generations are not two ascending epochs");
+        }
+        let generations = serde
+            .generations
+            .into_iter()
+            .map(|generation| {
+                if generation
+                    .overlay
+                    .windows(2)
+                    .any(|pair| pair[0].address >= pair[1].address)
+                {
+                    return Err("accounts state overlay entries are not sorted and unique");
+                }
+                let overlay = KeyedTree::from_entries(
+                    TreeId::STATE_OVERLAY,
+                    generation.overlay.iter().map(|entry| {
+                        (
+                            entry.address.to_bytes(),
+                            overlay_value(&entry.now, &entry.base),
+                        )
+                    }),
+                )
+                .map_err(|_| "accounts state overlay entries are not unique")?;
+                Ok(SnapshotGeneration {
+                    epoch: generation.epoch,
+                    base_parent: generation
+                        .base_parent
+                        .map(|parent| (parent.slot, parent.bank_hash)),
+                    base_root: generation.base_root,
+                    overlay,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { generations })
     }
 }
 

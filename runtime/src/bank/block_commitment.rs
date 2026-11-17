@@ -8,7 +8,7 @@
 //!
 //! # Extension points for the companion proposals
 //!
-//! Each of the commitment slots 1 to 4 is produced by exactly one method on
+//! Each of the commitment slots 1 to 5 is produced by exactly one method on
 //! [`Bank`], listed below. A slot method returns [`INACTIVE_COMMITMENT_SLOT`]
 //! (32 zero bytes, which the SIMD defines as the value of a slot whose
 //! defining feature is not active) unless its proposal is implemented and its
@@ -21,8 +21,9 @@
 //! | 2    | [`Bank::commitment_slot_accounts_delta_root`]  | Accounts Delta Root       |
 //! | 3    | [`Bank::commitment_slot_validator_set_root`]   | Epoch Validator Set Root  |
 //! | 4    | [`Bank::commitment_slot_epoch_boundary`]       | Epoch Boundary Commitment |
+//! | 5    | [`Bank::commitment_slot_accounts_state_root`]  | Accounts State Root       |
 //!
-//! Slots 5 to 7 are reserved and always zero. Every slot method receives the
+//! Slots 6 and 7 are reserved and always zero. Every slot method receives the
 //! same [`CommitmentInputs`], which carries this block's history state and
 //! parent (the epoch boundary commitment needs both).
 //!
@@ -72,6 +73,8 @@ pub enum CommitmentSlot {
     ValidatorSetRoot = 3,
     /// `epoch_boundary` (Epoch Boundary Commitment).
     EpochBoundary = 4,
+    /// `accounts_state_root` (Accounts State Root).
+    AccountsStateRoot = 5,
 }
 
 impl CommitmentSlot {
@@ -235,6 +238,16 @@ pub enum CommitmentFailure {
     /// block id, so the epoch boundary cannot be computed.
     #[error("parent {parent_slot} has no block id for the epoch boundary")]
     EpochBoundaryMissingParentBlockId { parent_slot: Slot },
+    /// Slot 5: the accounts state of the bank at `slot` is not known
+    /// although the features are active for it: a parent loaded from a
+    /// snapshot without it, or a generation that was not tracked from the
+    /// first block of its epoch.
+    #[error("accounts_state_root is active but the accounts state of bank {slot} is not tracked")]
+    AccountsStateNotTracked { slot: Slot },
+    /// Slot 5: `base_root` of the generation in use could not be obtained
+    /// (the background job and the synchronous rebuild both failed).
+    #[error("the base tree of generation {generation} is unavailable: {reason}")]
+    AccountsStateBaseUnavailable { generation: u64, reason: String },
 }
 
 impl CommitmentFailure {
@@ -255,6 +268,8 @@ impl CommitmentFailure {
             Self::EpochBoundaryMissingParentBlockId { .. } => {
                 "epoch_boundary_missing_parent_block_id"
             }
+            Self::AccountsStateNotTracked { .. } => "accounts_state_not_tracked",
+            Self::AccountsStateBaseUnavailable { .. } => "accounts_state_base_unavailable",
         }
     }
 }
@@ -349,18 +364,21 @@ impl Bank {
         if !self.is_block_commitment_root_active() {
             return;
         }
-        let result = self.compute_block_commitment().and_then(|commitment| {
-            // Same inputs as commitment slot 4 of that vector, so this cannot
-            // fail once the vector was computed.
-            let epoch_boundary = self.compute_epoch_boundary(
-                self.parent().as_deref(),
-                commitment.block_history.leaf_count(),
-            )?;
-            Ok((commitment, epoch_boundary))
-        });
+        let result = self
+            .compute_block_commitment()
+            .and_then(|(commitment, vector)| {
+                // Same inputs as commitment slot 4 of that vector, so this
+                // cannot fail once the vector was computed.
+                let epoch_boundary = self.compute_epoch_boundary(
+                    self.parent().as_deref(),
+                    commitment.block_history.leaf_count(),
+                )?;
+                Ok((commitment, vector, epoch_boundary))
+            });
         match result {
-            Ok((commitment, epoch_boundary)) => {
+            Ok((commitment, vector, epoch_boundary)) => {
                 *self.epoch_boundary.write().unwrap() = epoch_boundary;
+                *self.commitment_vector.write().unwrap() = Some(vector);
                 *self.block_commitment.write().unwrap() = Some(commitment);
             }
             Err(failure) => {
@@ -381,9 +399,11 @@ impl Bank {
         }
     }
 
-    /// Computes the block commitment state of this bank (the feature must be
-    /// active).
-    fn compute_block_commitment(&self) -> std::result::Result<BlockCommitment, CommitmentFailure> {
+    /// Computes the block commitment state of this bank and its commitment
+    /// vector (the feature must be active).
+    fn compute_block_commitment(
+        &self,
+    ) -> std::result::Result<(BlockCommitment, CommitmentVector), CommitmentFailure> {
         let parent = self.parent();
         let block_history = self.block_history_for_commitment(parent.as_deref())?;
         let vector = self.compute_commitment_vector(&CommitmentInputs {
@@ -396,10 +416,13 @@ impl Bank {
             self.slot(),
             block_history.leaf_count(),
         );
-        Ok(BlockCommitment {
-            block_history,
-            commitment_root,
-        })
+        Ok((
+            BlockCommitment {
+                block_history,
+                commitment_root,
+            },
+            vector,
+        ))
     }
 
     /// `H(B)` for this bank `B`:
@@ -467,7 +490,9 @@ impl Bank {
             self.commitment_slot_validator_set_root(inputs)?;
         vector[CommitmentSlot::EpochBoundary.index()] =
             self.commitment_slot_epoch_boundary(inputs)?;
-        // Slots 5..8 are reserved and stay zero.
+        vector[CommitmentSlot::AccountsStateRoot.index()] =
+            self.commitment_slot_accounts_state_root(inputs)?;
+        // Slots 6 and 7 are reserved and stay zero.
         Ok(CommitmentVector(vector))
     }
 
@@ -534,6 +559,30 @@ impl Bank {
             .compute_epoch_boundary(inputs.parent, inputs.block_history.leaf_count())?
             .map(|epoch_boundary| epoch_boundary.hash())
             .unwrap_or(INACTIVE_COMMITMENT_SLOT))
+    }
+
+    /// Commitment slot 5: `accounts_state_root` (Accounts State Root SIMD).
+    ///
+    /// [`INACTIVE_COMMITMENT_SLOT`] unless the `accounts_state_root` feature
+    /// and both features it depends on are active for this bank, and zero
+    /// while the generation in use does not exist. Otherwise
+    /// `sha256(0x84 || u64_le(G) || base_root(G) || overlay_root(G, B))`; the
+    /// overlay is updated in `freeze()` (see [`super::accounts_state`]), and
+    /// this method waits for `base_root(G)` if it is still being computed.
+    /// A commitment failure if the accounts state or the base root cannot be
+    /// obtained.
+    pub fn commitment_slot_accounts_state_root(
+        &self,
+        _inputs: &CommitmentInputs,
+    ) -> std::result::Result<Hash, CommitmentFailure> {
+        self.accounts_state_root_for_commitment()
+    }
+
+    /// The commitment vector of this bank, set when it is frozen with a
+    /// commitment root. `None` otherwise, including for a bank loaded from a
+    /// snapshot. Used to open a slot against `commitment_root`.
+    pub fn commitment_vector(&self) -> Option<CommitmentVector> {
+        *self.commitment_vector.read().unwrap()
     }
 }
 

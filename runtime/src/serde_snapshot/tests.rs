@@ -911,6 +911,7 @@ mod serde_snapshot_tests {
             let block_id = Some(bank_fields.block_id);
             let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
             let epoch_boundary = bank_fields.epoch_boundary.map(Into::into);
+            let accounts_state = bank_fields.accounts_state.clone().map(Into::into);
             serde_snapshot::serialize_bank_snapshot_into(
                 &mut writer,
                 bank_fields,
@@ -924,6 +925,7 @@ mod serde_snapshot_tests {
                     block_id,
                     block_commitment,
                     epoch_boundary,
+                    accounts_state,
                 },
             )
             .unwrap();
@@ -1116,6 +1118,47 @@ mod serde_snapshot_tests {
             commitment1.child_block_history(1, &block_id1.to_hash())
         );
 
+        // A snapshot written before the accounts state field existed (it ends
+        // right after `epoch_boundary`, the field before it) restores the
+        // block commitment state without accounts state; one written before
+        // the epoch boundary field as well (it ends right after
+        // `block_commitment`) restores the same.
+        for num_dropped_fields in [1, 2] {
+            let mut bank_fields = bank1.get_fields_to_serialize();
+            let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
+            let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
+            let block_id = Some(bank_fields.block_id);
+            let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
+            // The epoch boundary feature is not active for bank1.
+            assert_eq!(bank_fields.epoch_boundary, None);
+            let mut old_buf = vec![];
+            serde_snapshot::serialize_bank_snapshot_into(
+                &mut old_buf,
+                bank_fields,
+                bank1.get_bank_hash_stats(),
+                ExtraFieldsToSerialize {
+                    lamports_per_signature: bank1.fee_rate_governor.lamports_per_signature,
+                    unused_incremental_snapshot_persistence: None,
+                    unused_epoch_accounts_hash: None,
+                    versioned_epoch_stakes,
+                    accounts_lt_hash,
+                    block_id,
+                    block_commitment,
+                    epoch_boundary: None,
+                    accounts_state: None,
+                },
+            )
+            .unwrap();
+            // Drop the `None` tags of `accounts_state` (and `epoch_boundary`).
+            for _ in 0..num_dropped_fields {
+                assert_eq!(old_buf.pop(), Some(0));
+            }
+            let dbank = deserialize(&old_buf);
+            assert_eq!(dbank.block_commitment(), Some(commitment1.clone()));
+            assert_eq!(dbank.epoch_boundary(), None);
+            assert!(dbank.accounts_state().is_none());
+        }
+
         // A snapshot written before the field existed (it ends right after
         // `block_id`) restores without block commitment state.
         let mut bank_fields = bank1.get_fields_to_serialize();
@@ -1136,10 +1179,13 @@ mod serde_snapshot_tests {
                 block_id,
                 block_commitment: None,
                 epoch_boundary: None,
+                accounts_state: None,
             },
         )
         .unwrap();
-        // Drop the `None` tags of `epoch_boundary` and `block_commitment`.
+        // Drop the `None` tags of `accounts_state`, `epoch_boundary` and
+        // `block_commitment`.
+        assert_eq!(old_buf.pop(), Some(0));
         assert_eq!(old_buf.pop(), Some(0));
         assert_eq!(old_buf.pop(), Some(0));
         let dbank = Arc::new(deserialize(&old_buf));
@@ -1268,7 +1314,8 @@ mod serde_snapshot_tests {
         assert_eq!(next.commitment_root(), expected_next.commitment_root());
 
         // A snapshot written before the field existed (it ends right after
-        // `block_commitment`) restores without epoch boundary state.
+        // `block_commitment`, without the fields after it) restores without
+        // epoch boundary state.
         let mut bank_fields = bank40.get_fields_to_serialize();
         let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
         let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
@@ -1288,10 +1335,12 @@ mod serde_snapshot_tests {
                 block_id,
                 block_commitment,
                 epoch_boundary: None,
+                accounts_state: None,
             },
         )
         .unwrap();
-        // Drop the `None` tag of `epoch_boundary`.
+        // Drop the `None` tags of `accounts_state` and `epoch_boundary`.
+        assert_eq!(old_buf.pop(), Some(0));
         assert_eq!(old_buf.pop(), Some(0));
         let dbank = deserialize(&old_buf);
         assert_eq!(dbank.epoch_boundary(), None);
@@ -1359,5 +1408,69 @@ mod serde_snapshot_tests {
             bank.fee_rate_governor.lamports_per_signature,
             dbank.fee_rate_governor.lamports_per_signature
         );
+    }
+
+    /// The accounts state read from a snapshot is validated: at most two
+    /// generations in ascending epoch order, overlay entries sorted and
+    /// unique; a valid one converts back to the same entries.
+    #[test]
+    fn test_serde_accounts_state_validation() {
+        use {
+            crate::{
+                bank::accounts_state::SnapshotAccountsState,
+                serde_snapshot::types::{
+                    SerdeAccountsState, SerdeAccountsStateGeneration, SerdeBaseParent,
+                    SerdeOverlayEntry,
+                },
+            },
+            solana_hash::Hash,
+        };
+        let entry = |byte: u8| SerdeOverlayEntry {
+            address: Pubkey::new_from_array([byte; 32]),
+            now: Hash::new_from_array([byte; 32]),
+            base: Hash::default(),
+        };
+        let generation = |epoch, overlay| SerdeAccountsStateGeneration {
+            epoch,
+            base_parent: Some(SerdeBaseParent {
+                slot: 7,
+                bank_hash: Hash::new_from_array([7; 32]),
+            }),
+            base_root: None,
+            overlay,
+        };
+        let valid = SerdeAccountsState {
+            generations: vec![
+                generation(3, vec![entry(1), entry(2)]),
+                generation(4, vec![entry(2)]),
+            ],
+        };
+        let state = SnapshotAccountsState::try_from(valid.clone()).unwrap();
+        assert_eq!(state.generations[0].overlay.len(), 2);
+        assert_eq!(SerdeAccountsState::from(state), valid);
+
+        for invalid in [
+            SerdeAccountsState {
+                generations: vec![generation(4, vec![]), generation(3, vec![])],
+            },
+            SerdeAccountsState {
+                generations: vec![generation(3, vec![]), generation(3, vec![])],
+            },
+            SerdeAccountsState {
+                generations: vec![
+                    generation(1, vec![]),
+                    generation(2, vec![]),
+                    generation(3, vec![]),
+                ],
+            },
+            SerdeAccountsState {
+                generations: vec![generation(3, vec![entry(2), entry(1)])],
+            },
+            SerdeAccountsState {
+                generations: vec![generation(3, vec![entry(1), entry(1)])],
+            },
+        ] {
+            assert!(SnapshotAccountsState::try_from(invalid).is_err());
+        }
     }
 }

@@ -55,12 +55,15 @@ use {
 /// `accounts_delta_root` fills slot 2 of that commitment and follows it.
 /// `epoch_validator_set_root` fills slot 3 of that commitment and follows it.
 /// `epoch_boundary_commitment` fills slot 4 of that commitment and follows it.
+/// `accounts_state_root` fills slot 5 of that commitment and follows it and
+/// `accounts_delta_root`.
 pub const FEATURES_INACTIVE_IN_TEST_GENESIS: &[Pubkey] = &[
     agave_feature_set::block_commitment_root::ID,
     agave_feature_set::transaction_receipt_tree::ID,
     agave_feature_set::accounts_delta_root::ID,
     agave_feature_set::epoch_validator_set_root::ID,
     agave_feature_set::epoch_boundary_commitment::ID,
+    agave_feature_set::accounts_state_root::ID,
 ];
 
 /// `FeatureSet::all_enabled()` minus [`FEATURES_INACTIVE_IN_TEST_GENESIS`].
