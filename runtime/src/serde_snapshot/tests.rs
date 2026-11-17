@@ -16,7 +16,7 @@ mod serde_snapshot_tests {
                 SnapshotAccountsDbFields, SnapshotStreams, UnusedIncrementalSnapshotPersistence,
                 deserialize_from, reconstruct_accountsdb_from_fields, remap_append_vec_file,
                 serialize_into,
-                types::{SerdeAccountsLtHash, SerdeBlockCommitment},
+                types::{SerdeAccountsLtHash, SerdeBlockCommitment, SerdeEpochBoundary},
             },
             snapshot_bank_utils,
             snapshot_utils::create_tmp_accounts_dir_for_tests,
@@ -1423,6 +1423,52 @@ mod serde_snapshot_tests {
         serialize_into(&mut value, &block_commitment).unwrap();
         assert_eq!(bytes, [&[1][..], &value].concat());
         assert_eq!(from_bytes(&bytes), present);
+    }
+
+    /// The epoch boundary field on the wire, with and without the block
+    /// commitment before it: written only up to the last present field, an
+    /// absent block commitment before a present epoch boundary as `None`.
+    #[test]
+    fn test_commitment_extra_fields_epoch_boundary_wire_format() {
+        let to_bytes = |fields: &CommitmentExtraFields| {
+            let mut buf = vec![];
+            serialize_into(&mut buf, fields).unwrap();
+            buf
+        };
+        let from_bytes = |bytes: &[u8]| -> CommitmentExtraFields {
+            deserialize_wincode_from(&mut BufReader::new(bytes)).unwrap()
+        };
+        let block_commitment = SerdeBlockCommitment {
+            history_leaf_count: 1,
+            history_subtree_roots: vec![Hash::new_unique()],
+            commitment_root: Hash::new_unique(),
+        };
+        let epoch_boundary = SerdeEpochBoundary {
+            epoch: 3,
+            first_slot: 97,
+            parent_slot: 95,
+            parent_block_id: Hash::new_unique(),
+            parent_commitment_root: Hash::new_unique(),
+            history_len: 12,
+        };
+        for block_commitment in [None, Some(block_commitment)] {
+            for epoch_boundary in [None, Some(epoch_boundary)] {
+                let fields = CommitmentExtraFields {
+                    block_commitment: block_commitment.clone(),
+                    epoch_boundary,
+                    ..CommitmentExtraFields::default()
+                };
+                let mut expected = vec![];
+                if block_commitment.is_some() || epoch_boundary.is_some() {
+                    serialize_into(&mut expected, &block_commitment).unwrap();
+                }
+                if epoch_boundary.is_some() {
+                    serialize_into(&mut expected, &epoch_boundary).unwrap();
+                }
+                assert_eq!(to_bytes(&fields), expected);
+                assert_eq!(from_bytes(&expected), fields);
+            }
+        }
     }
 
     #[test]
