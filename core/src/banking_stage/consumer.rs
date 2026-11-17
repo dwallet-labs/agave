@@ -601,6 +601,7 @@ mod tests {
         solana_poh::record_channels::{RecordReceiver, record_channels},
         solana_pubkey::Pubkey,
         solana_runtime::{
+            bank::block_commitment::{CommitmentFailure, CommitmentVerificationError},
             bank_forks::BankForks,
             transaction_execution::{TransactionStatusMessage, TransactionStatusSender},
         },
@@ -843,15 +844,80 @@ mod tests {
             .collect();
         assert_eq!(recorded.len(), num_txs);
 
-        let receipts = bank.transaction_receipt_leaf_hashes();
+        let receipts = bank.transaction_receipt_leaf_hashes().unwrap();
         assert_eq!(receipts.len(), num_txs);
 
         let reference = Bank::new_for_tests(&genesis_config);
         for tx in recorded {
             let _ = reference.process_entry_transactions(vec![tx]);
         }
-        assert_eq!(receipts, reference.transaction_receipt_leaf_hashes());
+        assert_eq!(
+            receipts,
+            reference.transaction_receipt_leaf_hashes().unwrap()
+        );
+        assert!(bank.receipts_root().is_some());
         assert_eq!(bank.receipts_root(), reference.receipts_root());
+    }
+
+    /// Transaction Receipt Tree: if the record channel gives no transaction
+    /// index, the leader cannot place its receipts in the block. With the
+    /// feature active that is a commitment failure of the bank, rather than
+    /// receipts in commit order and a `receipts_root` the cluster does not
+    /// compute.
+    #[test]
+    fn test_leader_receipts_without_transaction_indexes_fail_commitment() {
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        for feature_id in [
+            agave_feature_set::block_commitment_root::id(),
+            agave_feature_set::transaction_receipt_tree::id(),
+        ] {
+            solana_runtime::genesis_utils::activate_feature(&mut genesis_config, feature_id);
+        }
+        let (bank, _bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        assert!(bank.is_transaction_receipt_tree_active());
+        let blockhash = bank.last_blockhash();
+        let txs: Vec<_> = (0..2)
+            .map(|_| {
+                system_transaction::transfer(&mint_keypair, &Pubkey::new_unique(), 1, blockhash)
+            })
+            .collect();
+
+        let (record_sender, mut record_receiver) = record_channels(false);
+        record_receiver.restart(bank.bank_id());
+        let recorder = TransactionRecorder::new(record_sender);
+        let consumer = Consumer::new(Committer::new(None, None), recorder, None);
+        let output = consumer.process_and_record_transactions(&bank, &sanitize_transactions(txs));
+        assert!(
+            output
+                .execute_and_commit_transactions_output
+                .commit_transactions_result
+                .is_ok()
+        );
+        record_receiver.shutdown();
+        assert_eq!(record_receiver.drain().count(), 1);
+
+        let expected_failure = CommitmentFailure::UnknownReceiptOrder { num_receipts: 2 };
+        assert_eq!(
+            bank.transaction_receipt_leaf_hashes(),
+            Err(expected_failure.clone())
+        );
+        assert_eq!(bank.receipts_root(), None);
+        bank.freeze();
+        assert_eq!(bank.commitment_failure(), Some(expected_failure.clone()));
+        assert_eq!(bank.commitment_root(), None);
+        assert_eq!(
+            bank.verify_commitment_root(),
+            Err(CommitmentVerificationError::Failure(expected_failure))
+        );
     }
 
     #[test]
