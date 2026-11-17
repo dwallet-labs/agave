@@ -42,6 +42,7 @@ use {
             Error as ClientError, ErrorKind as ClientErrorKind, Result as ClientResult,
         },
         config::{RpcAccountInfoConfig, *},
+        light_client::*,
         request::{RpcError, RpcRequest, RpcResponseErrorData, TokenAccountsFilter},
         response::*,
     },
@@ -2207,6 +2208,88 @@ impl RpcClient {
         config: RpcVatActiveSetRankMapConfig,
     ) -> RpcResult<Option<RpcVatActiveSetRankMap>> {
         self.send(RpcRequest::GetVatActiveSetRankMap, json!([slot, config]))
+            .await
+    }
+
+    /// Light-client proof that the block at `slot` is final, with its
+    /// footer proof (`getFinalityProof`). Verify with
+    /// `solana_light_client::rpc::FinalityResponse`.
+    pub async fn get_finality_proof(&self, slot: Slot) -> ClientResult<RpcFinalityProof> {
+        self.send(RpcRequest::GetFinalityProof, json!([slot])).await
+    }
+
+    /// Light-client proof that the block at `slot` is an ancestor of the
+    /// final block at `at_slot` (`getBlockHistoryProof`).
+    pub async fn get_block_history_proof(
+        &self,
+        slot: Slot,
+        at_slot: Slot,
+    ) -> ClientResult<RpcBlockHistoryProof> {
+        self.send(RpcRequest::GetBlockHistoryProof, json!([slot, at_slot]))
+            .await
+    }
+
+    /// Light-client proof of a transaction's receipt, and optionally of its
+    /// instructions and events (`getTransactionProof`).
+    pub async fn get_transaction_proof(
+        &self,
+        signature: &Signature,
+        config: RpcTransactionProofConfig,
+    ) -> ClientResult<RpcTransactionProof> {
+        self.send(
+            RpcRequest::GetTransactionProof,
+            json!([signature.to_string(), config]),
+        )
+        .await
+    }
+
+    /// Light-client proof that the block at `slot` changed `pubkey` (and
+    /// to what), or did not (`getAccountDeltaProof`).
+    pub async fn get_account_delta_proof(
+        &self,
+        pubkey: &Pubkey,
+        slot: Slot,
+    ) -> ClientResult<RpcAccountDeltaProof> {
+        self.send(
+            RpcRequest::GetAccountDeltaProof,
+            json!([pubkey.to_string(), slot]),
+        )
+        .await
+    }
+
+    /// Light-client proof of the state of `pubkey`, or of its absence, at
+    /// the end of a finalized block (`getAccountStateProof`).
+    pub async fn get_account_state_proof(
+        &self,
+        pubkey: &Pubkey,
+        config: RpcAccountStateProofConfig,
+    ) -> ClientResult<RpcAccountStateProof> {
+        self.send(
+            RpcRequest::GetAccountStateProof,
+            json!([pubkey.to_string(), config]),
+        )
+        .await
+    }
+
+    /// The signer set of `epoch`, with the opening of commitment slot 3 of a
+    /// finalized block of the previous epoch (`getValidatorSet`).
+    pub async fn get_validator_set(
+        &self,
+        epoch: Epoch,
+        config: RpcCommittingBlockConfig,
+    ) -> ClientResult<RpcValidatorSet> {
+        self.send(RpcRequest::GetValidatorSet, json!([epoch, config]))
+            .await
+    }
+
+    /// The epoch boundary of `epoch`, with the opening of commitment slot 4
+    /// of a finalized block of that epoch (`getEpochBoundary`).
+    pub async fn get_epoch_boundary(
+        &self,
+        epoch: Epoch,
+        config: RpcCommittingBlockConfig,
+    ) -> ClientResult<RpcEpochBoundary> {
+        self.send(RpcRequest::GetEpochBoundary, json!([epoch, config]))
             .await
     }
 

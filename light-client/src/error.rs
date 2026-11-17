@@ -71,6 +71,10 @@ pub enum Error {
         threshold_percent: u64,
     },
 
+    /// A proof names another block than the one asked for or verified.
+    #[error("the proof is for another block")]
+    WrongBlock,
+
     // Footer proof.
     /// `fec_set_count` must be between 1 and `MAX_FEC_SETS_PER_SLOT`.
     #[error("invalid FEC set count {0}")]

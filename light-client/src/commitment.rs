@@ -109,6 +109,8 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::VerifiedBlock {}
     impl Sealed for super::VerifiedAncestor {}
+    #[cfg(feature = "rpc")]
+    impl Sealed for crate::rpc::VerifiedFinal {}
 }
 
 /// A block named by slot and block id.
