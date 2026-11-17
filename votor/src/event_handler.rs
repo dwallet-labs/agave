@@ -1122,7 +1122,7 @@ mod tests {
         },
         solana_net_utils::SocketAddrSpace,
         solana_runtime::{
-            bank::{Bank, BankTestConfig, SlotLeader},
+            bank::{Bank, BankTestConfig, SlotLeader, block_commitment::CommitmentFailure},
             bank_forks::BankForks,
             bank_forks_controller::{BankForksController, BankForksControllerError},
             genesis_utils::{ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts},
@@ -2231,6 +2231,84 @@ mod tests {
             Block {
                 slot: 1,
                 block_id: finalized_block_id,
+            },
+            FinalizationType::Fast,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "we have a commitment root mismatch")]
+    fn test_finalized_block_with_commitment_root_mismatch_panics() {
+        let mut test_context = setup();
+        let root_bank = test_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .sharable_banks()
+            .root();
+        let bank = test_context.create_block_only(1, root_bank);
+        let block_id = bank.block_id().unwrap();
+        // The bank hash matches; only the footer's commitment root differs.
+        bank.set_expected_bank_hash(bank.hash());
+        bank.set_expected_commitment_root(Hash::new_unique());
+
+        test_context.send_finalized_event(Block { slot: 1, block_id }, FinalizationType::Fast);
+    }
+
+    /// Bank 1 of the test context with `block_commitment_root` activated on
+    /// top of the root bank, which predates it and has no block id: bank 1
+    /// cannot compute the anchor leaf of its block history and is frozen with
+    /// a commitment failure.
+    fn create_block_with_commitment_failure(
+        test_context: &mut EventHandlerTestContext,
+    ) -> Arc<Bank> {
+        let root_bank = test_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .sharable_banks()
+            .root();
+        assert!(!root_bank.is_block_commitment_root_active());
+        assert_eq!(root_bank.block_id(), None);
+        let mut bank = Bank::new_from_parent(root_bank, SlotLeader::new_unique(), 1);
+        bank.activate_feature(&agave_feature_set::block_commitment_root::id());
+        bank.set_block_id(Some(BlockId::new_unique()));
+        bank.freeze();
+        assert_eq!(
+            bank.commitment_failure(),
+            Some(CommitmentFailure::MissingParentBlockId { parent_slot: 0 })
+        );
+        let mut bank_forks_w = test_context.bank_forks.write().unwrap();
+        bank_forks_w.insert(bank);
+        bank_forks_w.get(1).unwrap()
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "we have no commitment root: we could not compute it (commitment failure \
+                    missing_parent_block_id: parent 0 has no block id for its block history leaf)"
+    )]
+    fn test_finalized_block_with_commitment_failure_panics() {
+        let mut test_context = setup();
+        let bank = create_block_with_commitment_failure(&mut test_context);
+        let block_id = bank.block_id().unwrap();
+        // Neither the bank hash nor the footer's commitment root, which may
+        // even be absent, makes the block acceptable.
+        bank.set_expected_bank_hash(bank.hash());
+
+        test_context.send_finalized_event(Block { slot: 1, block_id }, FinalizationType::Fast);
+    }
+
+    #[test]
+    fn test_finalized_different_block_id_with_commitment_failure_does_not_panic() {
+        let mut test_context = setup();
+        let bank = create_block_with_commitment_failure(&mut test_context);
+        assert!(bank.verify_commitment_root().is_err());
+
+        test_context.send_finalized_event(
+            Block {
+                slot: 1,
+                block_id: BlockId::new_unique(),
             },
             FinalizationType::Fast,
         );
