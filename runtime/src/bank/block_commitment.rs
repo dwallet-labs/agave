@@ -9,11 +9,11 @@
 //! # Extension points for the companion proposals
 //!
 //! Each of the commitment slots 1 to 4 is produced by exactly one method on
-//! [`Bank`], listed below. Today each returns 32 zero bytes, which the SIMD
-//! defines as the value of a slot whose defining feature is not active. A
-//! follow-up implements its slot by filling in its method (gated by its own
-//! feature, returning [`INACTIVE_COMMITMENT_SLOT`] while that feature is
-//! inactive) and nothing else in the vector changes:
+//! [`Bank`], listed below. A slot method returns [`INACTIVE_COMMITMENT_SLOT`]
+//! (32 zero bytes, which the SIMD defines as the value of a slot whose
+//! defining feature is not active) unless its proposal is implemented and its
+//! own feature is active for the bank; nothing else in the vector depends on
+//! which slots are implemented:
 //!
 //! | Slot | Method                                         | Proposal                  |
 //! |------|------------------------------------------------|---------------------------|
@@ -25,11 +25,19 @@
 //! Slots 5 to 7 are reserved and always zero. Every slot method receives the
 //! same [`CommitmentInputs`], which carries this block's history state and
 //! parent (the epoch boundary commitment needs both).
+//!
+//! # Commitment failures
+//!
+//! A slot method that cannot compute its value from the bank's own state
+//! returns a [`CommitmentFailure`] instead of a substitute value. The bank then
+//! has no commitment root: the failure is recorded on the bank when it is
+//! frozen ([`Bank::commitment_failure`]), [`Bank::verify_commitment_root`]
+//! fails with it, replay marks the block dead as for a commitment root
+//! mismatch, and a leader does not publish the block's footer.
 
 use {
     super::Bank,
     agave_feature_set as feature_set,
-    agave_votor_messages::consensus_message::BlockId,
     log::*,
     solana_clock::Slot,
     solana_hash::{HASH_BYTES, Hash},
@@ -137,6 +145,49 @@ pub struct CommitmentInputs<'a> {
     pub parent: Option<&'a Bank>,
 }
 
+/// Why a bank with the `block_commitment_root` feature active has no
+/// commitment root.
+///
+/// Each variant is a condition under which a value of the commitment vector
+/// cannot be computed from the bank's state. None of them happens in a
+/// correctly running validator; each would otherwise have to be replaced by a
+/// substitute value, giving a commitment root that the cluster does not
+/// compute. The failure is recorded on the bank when it is frozen, and the
+/// block is rejected instead (see [`Bank::verify_commitment_root`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CommitmentFailure {
+    /// Slot 0: the parent has a commitment root but no block id, so its
+    /// history leaf cannot be computed.
+    #[error("parent {parent_slot} has no block id for its block history leaf")]
+    MissingParentBlockId { parent_slot: Slot },
+    /// Slot 0: the parent has the feature active but a commitment failure of
+    /// its own, so `H(B)` is unknown.
+    #[error("parent {parent_slot} has a commitment failure")]
+    ParentCommitmentFailure { parent_slot: Slot },
+}
+
+impl CommitmentFailure {
+    /// Name of the condition, for datapoints.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::MissingParentBlockId { .. } => "missing_parent_block_id",
+            Self::ParentCommitmentFailure { .. } => "parent_commitment_failure",
+        }
+    }
+}
+
+/// Why [`Bank::verify_commitment_root`] rejects a frozen bank.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CommitmentVerificationError {
+    /// The footer's commitment root differs from the computed one (the zero
+    /// hash if the bank has none).
+    #[error("expected commitment root {expected}, computed {computed}")]
+    Mismatch { expected: Hash, computed: Hash },
+    /// The bank could not compute its commitment root.
+    #[error("{0}")]
+    Failure(CommitmentFailure),
+}
+
 impl Bank {
     /// Whether the Block Commitment Root feature is active for this bank.
     pub fn is_block_commitment_root_active(&self) -> bool {
@@ -145,19 +196,28 @@ impl Bank {
     }
 
     /// Block commitment state, set when the bank is frozen with the feature
-    /// active, or loaded from a snapshot.
+    /// active, or loaded from a snapshot. `None` for a bank with a
+    /// [`Self::commitment_failure`].
     pub fn block_commitment(&self) -> Option<BlockCommitment> {
         self.block_commitment.read().unwrap().clone()
     }
 
     /// `commitment_root` of this bank, set when the bank is frozen with the
-    /// feature active, or loaded from a snapshot.
+    /// feature active, or loaded from a snapshot. `None` for a bank with a
+    /// [`Self::commitment_failure`].
     pub fn commitment_root(&self) -> Option<Hash> {
         self.block_commitment
             .read()
             .unwrap()
             .as_ref()
             .map(|commitment| commitment.commitment_root)
+    }
+
+    /// Why this bank, frozen with the feature active, has no commitment root.
+    /// Set when the bank is frozen; `None` for every bank that has one, and
+    /// for every bank with the feature inactive.
+    pub fn commitment_failure(&self) -> Option<CommitmentFailure> {
+        self.commitment_failure.read().unwrap().clone()
     }
 
     /// Records the commitment root found in this block's footer. It is
@@ -171,14 +231,21 @@ impl Bank {
         *self.expected_commitment_root.read().unwrap()
     }
 
-    /// Compares the commitment root from the footer, if any, with the one
-    /// computed when the bank was frozen. Must be called on a frozen bank.
+    /// Verifies the commitment state of a frozen bank. Must be called on a
+    /// frozen bank.
     ///
-    /// Returns `Err((expected, computed))` on mismatch; `computed` is the
-    /// zero hash if the bank has no commitment root. Replay marks the block
+    /// Fails with [`CommitmentVerificationError::Failure`] if the bank has a
+    /// [`Self::commitment_failure`], whether or not the footer carries a
+    /// commitment root, and otherwise with
+    /// [`CommitmentVerificationError::Mismatch`] if the commitment root from
+    /// the footer, if any, differs from the computed one (`computed` is the
+    /// zero hash if the bank has no commitment root). Replay marks the block
     /// dead on error, as for a bank hash mismatch.
-    pub fn verify_commitment_root(&self) -> std::result::Result<(), (Hash, Hash)> {
+    pub fn verify_commitment_root(&self) -> std::result::Result<(), CommitmentVerificationError> {
         debug_assert!(self.is_frozen());
+        if let Some(failure) = self.commitment_failure() {
+            return Err(CommitmentVerificationError::Failure(failure));
+        }
         let Some(expected) = self.expected_commitment_root() else {
             return Ok(());
         };
@@ -186,29 +253,55 @@ impl Bank {
         if expected == computed {
             Ok(())
         } else {
-            Err((expected, computed))
+            Err(CommitmentVerificationError::Mismatch { expected, computed })
         }
     }
 
-    /// Computes the block commitment state of this bank. Called once, from
-    /// `freeze()`, after the accounts lattice hash is finished.
-    pub(super) fn compute_block_commitment(&self) -> Option<BlockCommitment> {
+    /// Computes the block commitment state of this bank and stores it, or the
+    /// [`CommitmentFailure`] that prevents it. Called once, from `freeze()`,
+    /// after the accounts lattice hash is finished, while the hash lock is
+    /// held, so that a frozen bank has one or the other. Does nothing if the
+    /// feature is inactive.
+    pub(super) fn freeze_block_commitment(&self) {
         if !self.is_block_commitment_root_active() {
-            return None;
+            return;
         }
+        match self.compute_block_commitment() {
+            Ok(commitment) => *self.block_commitment.write().unwrap() = Some(commitment),
+            Err(failure) => {
+                error!(
+                    "bank {} has no commitment root: commitment failure {}: {failure}",
+                    self.slot(),
+                    failure.name(),
+                );
+                datapoint_error!(
+                    "bank-commitment_failure",
+                    ("slot", self.slot(), i64),
+                    ("failure", failure.name(), String),
+                    ("error", failure.to_string(), String),
+                );
+                *self.block_commitment.write().unwrap() = None;
+                *self.commitment_failure.write().unwrap() = Some(failure);
+            }
+        }
+    }
+
+    /// Computes the block commitment state of this bank (the feature must be
+    /// active).
+    fn compute_block_commitment(&self) -> std::result::Result<BlockCommitment, CommitmentFailure> {
         let parent = self.parent();
-        let block_history = self.block_history_for_commitment(parent.as_deref());
+        let block_history = self.block_history_for_commitment(parent.as_deref())?;
         let vector = self.compute_commitment_vector(&CommitmentInputs {
             block_history: &block_history,
             parent: parent.as_deref(),
-        });
+        })?;
         let commitment_root = vector.root();
         info!(
             "bank {} commitment_root: {commitment_root} block_history_len: {}",
             self.slot(),
             block_history.leaf_count(),
         );
-        Some(BlockCommitment {
+        Ok(BlockCommitment {
             block_history,
             commitment_root,
         })
@@ -217,50 +310,52 @@ impl Bank {
     /// `H(B)` for this bank `B`: `H(parent)` with `history_leaf(parent)`
     /// appended if the feature was active for the parent, empty otherwise
     /// (first block with the feature active, or no parent).
-    fn block_history_for_commitment(&self, parent: Option<&Bank>) -> AppendOnlyFrontier {
+    fn block_history_for_commitment(
+        &self,
+        parent: Option<&Bank>,
+    ) -> std::result::Result<AppendOnlyFrontier, CommitmentFailure> {
         let Some(parent) = parent else {
-            return AppendOnlyFrontier::new();
+            return Ok(AppendOnlyFrontier::new());
         };
         let Some(parent_commitment) = parent.block_commitment() else {
-            return AppendOnlyFrontier::new();
+            if parent.commitment_failure().is_some() {
+                return Err(CommitmentFailure::ParentCommitmentFailure {
+                    parent_slot: parent.slot(),
+                });
+            }
+            return Ok(AppendOnlyFrontier::new());
         };
-        let parent_block_id = parent.block_id().unwrap_or_else(|| {
-            // Every frozen bank that a child is built on has a block id in a
-            // running validator: replayed banks get it from the blockstore
-            // before freezing, leader banks from broadcast once the last
-            // shred is made, snapshot banks from the snapshot. Without it the
-            // history leaf cannot be computed; a zero block id makes this
-            // bank's commitment root differ from the cluster's, so its own
-            // block is rejected by replay instead of being silently accepted.
-            error!(
-                "bank {} parent {} has no block id; using the zero block id in the block \
-                 history leaf",
-                self.slot(),
-                parent.slot()
-            );
-            datapoint_error!(
-                "bank-block_commitment_missing_parent_block_id",
-                ("slot", self.slot(), i64),
-                ("parent_slot", parent.slot(), i64),
-            );
-            BlockId::default()
-        });
-        parent_commitment.child_block_history(parent.slot(), &parent_block_id.to_hash())
+        // Every frozen bank that a child is built on has a block id in a
+        // running validator: replayed banks get it from the blockstore before
+        // freezing, leader banks from broadcast once the last shred is made,
+        // snapshot banks from the snapshot. Without it the history leaf, and
+        // so this bank's commitment root, cannot be computed.
+        let parent_block_id = parent
+            .block_id()
+            .ok_or(CommitmentFailure::MissingParentBlockId {
+                parent_slot: parent.slot(),
+            })?;
+        Ok(parent_commitment.child_block_history(parent.slot(), &parent_block_id.to_hash()))
     }
 
     /// Computes the commitment vector of this bank from its inputs.
-    pub fn compute_commitment_vector(&self, inputs: &CommitmentInputs) -> CommitmentVector {
+    pub fn compute_commitment_vector(
+        &self,
+        inputs: &CommitmentInputs,
+    ) -> std::result::Result<CommitmentVector, CommitmentFailure> {
         let mut vector = [INACTIVE_COMMITMENT_SLOT; COMMITMENT_VECTOR_LEN];
         vector[CommitmentSlot::BlockHistoryRoot.index()] =
             inputs.block_history.root(TreeId::BLOCK_HISTORY);
-        vector[CommitmentSlot::ReceiptsRoot.index()] = self.commitment_slot_receipts_root(inputs);
+        vector[CommitmentSlot::ReceiptsRoot.index()] =
+            self.commitment_slot_receipts_root(inputs)?;
         vector[CommitmentSlot::AccountsDeltaRoot.index()] =
-            self.commitment_slot_accounts_delta_root(inputs);
+            self.commitment_slot_accounts_delta_root(inputs)?;
         vector[CommitmentSlot::ValidatorSetRoot.index()] =
-            self.commitment_slot_validator_set_root(inputs);
-        vector[CommitmentSlot::EpochBoundary.index()] = self.commitment_slot_epoch_boundary(inputs);
+            self.commitment_slot_validator_set_root(inputs)?;
+        vector[CommitmentSlot::EpochBoundary.index()] =
+            self.commitment_slot_epoch_boundary(inputs)?;
         // Slots 5..8 are reserved and stay zero.
-        CommitmentVector(vector)
+        Ok(CommitmentVector(vector))
     }
 
     /// Commitment slot 1: `receipts_root` (Transaction Receipt Tree SIMD).
@@ -268,8 +363,11 @@ impl Bank {
     /// Extension point: not implemented yet, so the slot is inactive and
     /// zero. The implementation must return [`INACTIVE_COMMITMENT_SLOT`]
     /// unless its own feature is active for this bank.
-    pub fn commitment_slot_receipts_root(&self, _inputs: &CommitmentInputs) -> Hash {
-        INACTIVE_COMMITMENT_SLOT
+    pub fn commitment_slot_receipts_root(
+        &self,
+        _inputs: &CommitmentInputs,
+    ) -> std::result::Result<Hash, CommitmentFailure> {
+        Ok(INACTIVE_COMMITMENT_SLOT)
     }
 
     /// Commitment slot 2: `accounts_delta_root` (Accounts Delta Root SIMD).
@@ -278,14 +376,18 @@ impl Bank {
     /// is active for this bank. The root is built in `freeze()` from the
     /// account hashes collected by the lattice hash, after the last account
     /// update of the bank (see [`super::accounts_delta`]).
-    pub fn commitment_slot_accounts_delta_root(&self, _inputs: &CommitmentInputs) -> Hash {
+    pub fn commitment_slot_accounts_delta_root(
+        &self,
+        _inputs: &CommitmentInputs,
+    ) -> std::result::Result<Hash, CommitmentFailure> {
         if !self.is_accounts_delta_root_active() {
-            return INACTIVE_COMMITMENT_SLOT;
+            return Ok(INACTIVE_COMMITMENT_SLOT);
         }
         // Unset only if the bank did not collect from its first account
         // update, which `finish_accounts_delta()` reports.
-        self.accounts_delta_root()
-            .unwrap_or(INACTIVE_COMMITMENT_SLOT)
+        Ok(self
+            .accounts_delta_root()
+            .unwrap_or(INACTIVE_COMMITMENT_SLOT))
     }
 
     /// Commitment slot 3: `validator_set_root` (Epoch Validator Set Root SIMD).
@@ -293,8 +395,11 @@ impl Bank {
     /// Extension point: not implemented yet, so the slot is inactive and
     /// zero. The implementation must return [`INACTIVE_COMMITMENT_SLOT`]
     /// unless its own feature is active for this bank.
-    pub fn commitment_slot_validator_set_root(&self, _inputs: &CommitmentInputs) -> Hash {
-        INACTIVE_COMMITMENT_SLOT
+    pub fn commitment_slot_validator_set_root(
+        &self,
+        _inputs: &CommitmentInputs,
+    ) -> std::result::Result<Hash, CommitmentFailure> {
+        Ok(INACTIVE_COMMITMENT_SLOT)
     }
 
     /// Commitment slot 4: `epoch_boundary` (Epoch Boundary Commitment SIMD).
@@ -304,19 +409,23 @@ impl Bank {
     /// unless its own feature is active for this bank. `inputs` carries the
     /// parent bank (`P` when this bank is the first of its epoch) and
     /// `H(B)`, whose leaf count is `history_len`.
-    pub fn commitment_slot_epoch_boundary(&self, _inputs: &CommitmentInputs) -> Hash {
-        INACTIVE_COMMITMENT_SLOT
+    pub fn commitment_slot_epoch_boundary(
+        &self,
+        _inputs: &CommitmentInputs,
+    ) -> std::result::Result<Hash, CommitmentFailure> {
+        Ok(INACTIVE_COMMITMENT_SLOT)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use {
         super::*,
         crate::{
             bank::{SlotLeader, test_utils::goto_end_of_slot},
             genesis_utils::{activate_feature, create_genesis_config},
         },
+        agave_votor_messages::consensus_message::BlockId,
         solana_merkle_tree::commitment_tree::{hash_leaf, hash_node, hash_root},
         std::sync::Arc,
     };
@@ -401,6 +510,7 @@ mod tests {
         bank0.freeze();
         assert_eq!(bank0.block_commitment(), None);
         assert_eq!(bank0.commitment_root(), None);
+        assert_eq!(bank0.commitment_failure(), None);
         // Without a footer value there is nothing to verify.
         assert_eq!(bank0.verify_commitment_root(), Ok(()));
     }
@@ -489,7 +599,13 @@ mod tests {
         bank1.set_expected_commitment_root(wrong);
         freeze_with_block_id(&bank1);
         let computed = bank1.commitment_root().unwrap();
-        assert_eq!(bank1.verify_commitment_root(), Err((wrong, computed)));
+        assert_eq!(
+            bank1.verify_commitment_root(),
+            Err(CommitmentVerificationError::Mismatch {
+                expected: wrong,
+                computed
+            })
+        );
 
         let bank2 = new_child(&bank1, 2);
         freeze_with_block_id(&bank2);
@@ -504,6 +620,56 @@ mod tests {
         assert_eq!(bank2.commitment_root(), Some(expected));
         bank2.set_expected_commitment_root(expected);
         assert_eq!(bank2.verify_commitment_root(), Ok(()));
+    }
+
+    /// Asserts that `bank` is frozen with `failure` recorded, exposes no
+    /// commitment root, and fails verification with that reason whether or
+    /// not its footer carried a commitment root.
+    pub(crate) fn assert_commitment_failure(bank: &Bank, failure: CommitmentFailure) {
+        assert!(bank.is_frozen());
+        assert_eq!(bank.commitment_failure(), Some(failure.clone()));
+        assert_eq!(bank.block_commitment(), None);
+        assert_eq!(bank.commitment_root(), None);
+        let expected_err = Err(CommitmentVerificationError::Failure(failure));
+        assert_eq!(bank.verify_commitment_root(), expected_err);
+        // The footer's value, whatever it is, does not make it pass.
+        bank.set_expected_commitment_root(Hash::default());
+        assert_eq!(bank.verify_commitment_root(), expected_err);
+        bank.set_expected_commitment_root(Hash::new_unique());
+        assert_eq!(bank.verify_commitment_root(), expected_err);
+    }
+
+    #[test]
+    fn test_missing_parent_block_id_is_commitment_failure() {
+        let bank0 = new_bank(true);
+        goto_end_of_slot(bank0.clone());
+        bank0.freeze();
+        // The parent has a commitment root but no block id.
+        assert!(bank0.commitment_root().is_some());
+        assert_eq!(bank0.block_id(), None);
+        let bank1 = new_child(&bank0, 1);
+        freeze_with_block_id(&bank1);
+        assert_commitment_failure(
+            &bank1,
+            CommitmentFailure::MissingParentBlockId { parent_slot: 0 },
+        );
+
+        // A child of a bank with a commitment failure cannot compute its
+        // block history either.
+        let bank2 = new_child(&bank1, 2);
+        freeze_with_block_id(&bank2);
+        assert_commitment_failure(
+            &bank2,
+            CommitmentFailure::ParentCommitmentFailure { parent_slot: 1 },
+        );
+
+        // A sibling built on a parent with a block id is unaffected.
+        bank0.set_block_id(Some(BlockId::from(Hash::new_unique())));
+        let bank3 = new_child(&bank0, 3);
+        freeze_with_block_id(&bank3);
+        assert_eq!(bank3.commitment_failure(), None);
+        assert!(bank3.commitment_root().is_some());
+        assert_eq!(bank3.verify_commitment_root(), Ok(()));
     }
 
     #[test]
