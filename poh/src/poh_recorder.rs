@@ -31,7 +31,7 @@ use {
     solana_poh_config::PohConfig,
     solana_pubkey::Pubkey,
     solana_runtime::{
-        bank::{Bank, BankId},
+        bank::{Bank, BankId, block_commitment::CommitmentFailure},
         block_component_processor::BankFooterError,
         installed_scheduler_pool::BankWithScheduler,
         transaction_execution::TransactionStatusSenderError,
@@ -109,6 +109,9 @@ pub enum PohRecorderError {
 
     #[error("bank {0} block footer version does not match its block commitment root state")]
     FooterCommitmentRootMismatch(Slot),
+
+    #[error("bank {0} has no commitment root to put in its block footer: {1}")]
+    CommitmentFailure(Slot, CommitmentFailure),
 
     #[error("couldn't reset bank during fast leader handover slot {0} -> slot {1}")]
     ResetBankError(Slot, Slot),
@@ -671,6 +674,23 @@ impl PohRecorder {
             );
             return Err(PohRecorderError::BankFreezeTimeout(
                 working_bank.bank.slot(),
+            ));
+        }
+
+        // A bank that could not compute its commitment root has a commitment
+        // failure instead. Do not publish a footer with a made-up commitment
+        // root: every other validator would reject the block, and replay
+        // marks it dead here too.
+        if let Some(failure) = working_bank.bank.commitment_failure() {
+            error!(
+                "slot = {} block production failure. the bank has no commitment root, \
+                 commitment failure {}: {failure}; not publishing the block footer",
+                working_bank.bank.slot(),
+                failure.name(),
+            );
+            return Err(PohRecorderError::CommitmentFailure(
+                working_bank.bank.slot(),
+                failure,
             ));
         }
 
@@ -1560,6 +1580,67 @@ mod tests {
             ),
             Err(PohRecorderError::FooterCommitmentRootMismatch(slot)) if slot == bank.slot()
         );
+    }
+
+    /// A leader bank that could not compute its commitment root (a recorded
+    /// commitment failure) does not publish a footer: the footer would carry
+    /// a made-up commitment root. The working bank is left attached, for
+    /// `BlockCreationLoop` to abort the slot.
+    #[test]
+    fn test_alpenglow_footer_not_published_on_commitment_failure() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(
+            Blockstore::open(ledger_path.path()).expect("Expected to be able to open ledger"),
+        );
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(2);
+        solana_runtime::genesis_utils::activate_feature(
+            &mut genesis_config,
+            agave_feature_set::block_commitment_root::id(),
+        );
+        // The parent is frozen without a block id, so the child cannot
+        // compute its block history.
+        let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+        parent.freeze();
+        assert!(parent.commitment_root().is_some());
+        assert_eq!(parent.block_id(), None);
+        let bank = Arc::new(Bank::new_from_parent(parent, SlotLeader::default(), 1));
+        let (mut poh_recorder, entry_receiver) =
+            new_alpenglow_recorder_for_bank(bank.clone(), blockstore);
+        let bank_to_freeze = bank.clone();
+        let freezer = std::thread::spawn(move || {
+            while bank_to_freeze.tick_height() < bank_to_freeze.max_tick_height() {
+                std::hint::spin_loop();
+            }
+            bank_to_freeze.freeze();
+        });
+        let result = poh_recorder.tick_alpenglow(
+            bank.max_tick_height(),
+            VersionedBlockFooter::new_for_feature(test_footer_v1(), true),
+        );
+        freezer.join().unwrap();
+
+        let expected_failure = CommitmentFailure::MissingParentBlockId { parent_slot: 0 };
+        assert_eq!(bank.commitment_failure(), Some(expected_failure.clone()));
+        assert_eq!(bank.commitment_root(), None);
+        assert_matches!(
+            result,
+            Err(PohRecorderError::CommitmentFailure(slot, failure))
+                if slot == bank.slot() && failure == expected_failure
+        );
+        // No footer was sent to broadcast.
+        assert!(
+            !entry_receiver
+                .try_iter()
+                .any(|(_bank, (message, _))| matches!(
+                    message,
+                    RecorderMessage::Marker(VersionedBlockMarker::V1(BlockMarkerV1::BlockFooter(
+                        _
+                    )))
+                ))
+        );
+        assert!(poh_recorder.has_bank());
     }
 
     #[test]
