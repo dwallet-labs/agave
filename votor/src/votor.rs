@@ -212,6 +212,9 @@ impl Votor {
             own_votes_receiver,
             footer_certs_receiver,
         } = config;
+        let light_client_proofs = bank_notification_sender
+            .as_ref()
+            .and_then(|config| config.light_client_proofs.clone());
 
         let migration_status = bank_forks.read().unwrap().migration_status();
         let identity_keypair = cluster_info.keypair();
@@ -294,6 +297,7 @@ impl Votor {
             repair_event_sender,
             highest_finalized,
             staked_status: StakedStatus::new(&root_bank, &cluster_info),
+            light_client_proofs,
         };
 
         let metrics = ConsensusMetrics::start_metrics_loop(

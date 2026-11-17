@@ -36,6 +36,7 @@ use {
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache},
     solana_pubkey::Pubkey,
+    solana_rpc::light_client_proofs::LightClientProofStore,
     solana_runtime::{
         bank::Bank, bank_forks::SharableBanks,
         leader_schedule_utils::last_of_consecutive_leader_slots,
@@ -106,6 +107,9 @@ pub(crate) struct ConsensusPoolContext {
 
     /// Used to communicate the highest finalization cert the pool has observed to the block creation loop.
     pub(crate) highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
+
+    /// Light-client proof store, on nodes that serve light-client proofs.
+    pub(crate) light_client_proofs: Option<Arc<LightClientProofStore>>,
 }
 
 impl ConsensusPoolContext {
@@ -119,6 +123,7 @@ impl ConsensusPoolContext {
             self.migration_status.clone(),
             initial_parent_ready,
         )
+        .with_light_client_proofs(self.light_client_proofs.clone())
     }
 
     /// Finds the initial parent ready that we should use for instantiating the ConsensusPool or kicking off votor
@@ -820,6 +825,7 @@ mod tests {
                 repair_event_sender,
                 highest_finalized: Arc::new(RwLock::new(None)),
                 staked_status: StakedStatus::new(&root_bank, &cluster_info),
+                light_client_proofs: None,
             };
             let consensus_pool = ctx.new_consensus_pool();
 
