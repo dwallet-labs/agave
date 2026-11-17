@@ -188,7 +188,7 @@ fn check_commitment(bank: &Bank, transactions: Option<&BlockTransactions>) -> Co
     // Slot 1: receipts root, one receipt per committed transaction, in block
     // order, equal to the root of the independently encoded receipts.
     let slot1 = bank.receipts_root().unwrap();
-    let leaf_hashes = bank.transaction_receipt_leaf_hashes();
+    let leaf_hashes = bank.transaction_receipt_leaf_hashes().unwrap();
     assert_eq!(bank.executed_transaction_count(), leaf_hashes.len() as u64);
     match transactions {
         Some(transactions) => {
@@ -427,7 +427,7 @@ fn test_all_light_client_commitments_inactive() {
         assert_eq!(bank.block_commitment(), None);
         assert_eq!(bank.commitment_root(), None);
         assert_eq!(bank.receipts_root(), None);
-        assert!(bank.transaction_receipt_leaf_hashes().is_empty());
+        assert!(bank.transaction_receipt_leaf_hashes().unwrap().is_empty());
         assert_eq!(bank.accounts_delta(), None);
         assert_eq!(bank.accounts_delta_root(), None);
         assert_eq!(bank.epoch_boundary(), None);
