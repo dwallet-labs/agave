@@ -32,14 +32,22 @@ use {solana_hash::Hash, solana_sha256_hasher::hashv};
 pub const LEAF_PREFIX: u8 = 0x00;
 /// First byte of the hash input of a commitment tree inner node.
 pub const NODE_PREFIX: u8 = 0x01;
+/// First byte of the hash input of a keyed tree leaf (Accounts State Root SIMD).
+pub const KEYED_LEAF_PREFIX: u8 = 0x02;
+/// First byte of the hash input of a keyed tree branch (Accounts State Root SIMD).
+pub const KEYED_BRANCH_PREFIX: u8 = 0x03;
 /// First byte of the hash input of a commitment tree root.
 pub const ROOT_PREFIX: u8 = 0x80;
+/// First byte of the hash input of a keyed tree root (Accounts State Root SIMD).
+pub const KEYED_ROOT_PREFIX: u8 = 0x81;
 /// First byte of the `validator_set_root` hash (Epoch Validator Set Root SIMD).
 /// Reserved here so that all prefixes are defined in one place.
 pub const VALIDATOR_SET_ROOT_PREFIX: u8 = 0x82;
 /// First byte of the `epoch_boundary` hash (Epoch Boundary Commitment SIMD).
 /// Reserved here so that all prefixes are defined in one place.
 pub const EPOCH_BOUNDARY_PREFIX: u8 = 0x83;
+/// First byte of the `accounts_state_root` hash (Accounts State Root SIMD).
+pub const ACCOUNTS_STATE_ROOT_PREFIX: u8 = 0x84;
 
 /// `MTH` of a tree with no leaves: 32 zero bytes.
 pub const EMPTY_TREE_HASH: Hash = Hash::new_from_array([0; 32]);
@@ -67,6 +75,10 @@ impl TreeId {
     pub const ACCOUNTS_DELTA: Self = Self(0x05);
     /// Validator set (Epoch Validator Set Root).
     pub const VALIDATOR_SET: Self = Self(0x06);
+    /// Base state (Accounts State Root).
+    pub const BASE_STATE: Self = Self(0x07);
+    /// State overlay, a keyed tree (Accounts State Root).
+    pub const STATE_OVERLAY: Self = Self(0x08);
 }
 
 /// `leaf(tree_id, data) = sha256(0x00 || tree_id || data)`
@@ -666,9 +678,13 @@ mod tests {
         let prefixes = [
             LEAF_PREFIX,
             NODE_PREFIX,
+            KEYED_LEAF_PREFIX,
+            KEYED_BRANCH_PREFIX,
             ROOT_PREFIX,
+            KEYED_ROOT_PREFIX,
             VALIDATOR_SET_ROOT_PREFIX,
             EPOCH_BOUNDARY_PREFIX,
+            ACCOUNTS_STATE_ROOT_PREFIX,
         ];
         for (i, a) in prefixes.iter().enumerate() {
             for b in &prefixes[i + 1..] {
