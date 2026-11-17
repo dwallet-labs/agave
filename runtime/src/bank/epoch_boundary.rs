@@ -43,8 +43,8 @@
 //!   cluster's, so the block is rejected instead of silently accepted.
 
 use {
-    super::Bank, agave_feature_set as feature_set,
-    agave_votor_messages::consensus_message::BlockId, log::*,
+    super::{Bank, block_commitment::CommitmentFailure},
+    agave_feature_set as feature_set,
     solana_merkle_tree::epoch_boundary::EpochBoundary,
 };
 
@@ -67,47 +67,45 @@ impl Bank {
 
     /// The epoch boundary of this bank, given its parent and the length of
     /// its block history `H(B)`. Used for commitment slot 4 and for the state
-    /// stored at freeze, with the same inputs.
+    /// stored at freeze, with the same inputs. Fails if this bank is the
+    /// first of its epoch and its parent has no block id.
     pub(super) fn compute_epoch_boundary(
         &self,
         parent: Option<&Bank>,
         history_len: u64,
-    ) -> Option<EpochBoundary> {
+    ) -> Result<Option<EpochBoundary>, CommitmentFailure> {
         if !self.is_epoch_boundary_commitment_active() {
-            return None;
+            return Ok(None);
         }
-        let parent = parent?;
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
         if parent.epoch() < self.epoch() {
             // This bank is `F`, the first block of its epoch on this fork, and
-            // its parent is `P`.
-            let parent_block_id = parent.block_id().unwrap_or_else(|| {
-                error!(
-                    "bank {} parent {} has no block id; using the zero block id in the epoch \
-                     boundary",
-                    self.slot(),
-                    parent.slot()
-                );
-                datapoint_error!(
-                    "bank-epoch_boundary_missing_parent_block_id",
-                    ("slot", self.slot(), i64),
-                    ("parent_slot", parent.slot(), i64),
-                );
-                BlockId::default()
-            });
-            Some(EpochBoundary {
+            // its parent is `P`. Every frozen bank that a child is built on
+            // has a block id in a running validator (see
+            // `block_history_for_commitment`); without it the boundary, and
+            // so this bank's commitment root, cannot be computed.
+            let parent_block_id =
+                parent
+                    .block_id()
+                    .ok_or(CommitmentFailure::EpochBoundaryMissingParentBlockId {
+                        parent_slot: parent.slot(),
+                    })?;
+            Ok(Some(EpochBoundary {
                 epoch: self.epoch(),
                 first_slot: self.slot(),
                 parent_slot: parent.slot(),
                 parent_block_id: parent_block_id.to_hash(),
                 parent_commitment_root: parent.commitment_root().unwrap_or_default(),
                 history_len,
-            })
+            }))
         } else {
             let epoch_boundary = parent.epoch_boundary();
             debug_assert!(
                 epoch_boundary.is_none_or(|epoch_boundary| epoch_boundary.epoch == self.epoch())
             );
-            epoch_boundary
+            Ok(epoch_boundary)
         }
     }
 }
@@ -121,12 +119,13 @@ mod tests {
                 SlotLeader,
                 block_commitment::{
                     COMMITMENT_VECTOR_LEN, CommitmentSlot, CommitmentVector,
-                    INACTIVE_COMMITMENT_SLOT, history_leaf,
+                    INACTIVE_COMMITMENT_SLOT, history_leaf, tests::assert_commitment_failure,
                 },
                 test_utils::goto_end_of_slot,
             },
             genesis_utils::{activate_feature, create_genesis_config},
         },
+        agave_votor_messages::consensus_message::BlockId,
         solana_clock::Slot,
         solana_epoch_schedule::EpochSchedule,
         solana_genesis_config::GenesisConfig,
@@ -486,6 +485,39 @@ mod tests {
         );
         assert_eq!(boundary.parent_history_index(), None);
         assert_eq!(slot4(&bank32), expected_hash(1, 32, &bank5, 0));
+    }
+
+    /// `F` whose parent `P` has no block id (and no commitment root, so the
+    /// block history does not need it) cannot compute its epoch boundary:
+    /// a commitment failure instead of the zero block id.
+    #[test]
+    fn test_parent_without_block_id_is_commitment_failure() {
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis(&[])));
+        freeze_with_block_id(&bank0);
+        let bank5 = new_child(&bank0, 5);
+        goto_end_of_slot(bank5.clone());
+        bank5.freeze();
+        assert_eq!(bank5.block_id(), None);
+        let mut bank32 = Bank::new_from_parent(bank5.clone(), SlotLeader::default(), 32);
+        for feature_id in both_features() {
+            bank32.activate_feature(&feature_id);
+        }
+        let bank32 = Arc::new(bank32);
+        freeze_with_block_id(&bank32);
+        assert_eq!(bank32.epoch_boundary(), None);
+        assert_commitment_failure(
+            &bank32,
+            CommitmentFailure::EpochBoundaryMissingParentBlockId { parent_slot: 5 },
+        );
+
+        // Within the epoch, the boundary is copied from the parent, whose
+        // block id is not needed; but the parent itself has no commitment.
+        let bank33 = new_child(&bank32, 33);
+        freeze_with_block_id(&bank33);
+        assert_commitment_failure(
+            &bank33,
+            CommitmentFailure::ParentCommitmentFailure { parent_slot: 32 },
+        );
     }
 
     #[test]
