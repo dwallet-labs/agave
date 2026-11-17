@@ -273,10 +273,18 @@ impl Bank {
 
     /// Builds the accounts delta from the collected prefixes, or records why
     /// it cannot be built (a commitment failure, reported by `freeze()`).
-    /// Called once, from `freeze()`, after the last account update of the bank
-    /// has been hashed. Returns the number of addresses updated in the bank
-    /// (0 if this bank does not collect).
+    /// Called once, from `freeze()` (through
+    /// `finish_accounts_lt_hash_updates`), after the last account update of
+    /// the bank has been hashed. Returns the number of addresses
+    /// updated in the bank (0 if this bank does not collect).
+    ///
+    /// Idempotent: once the delta (or its failure) is recorded, a later call
+    /// changes nothing. Taking the prefixes again would otherwise find them
+    /// empty and replace the delta with an empty one.
     pub(super) fn finish_accounts_delta(&self) -> usize {
+        if self.accounts_delta.read().unwrap().is_some() {
+            return 0;
+        }
         let prefixes = self
             .accounts_lt_hash_async_progress
             .take_accounts_delta_prefixes();
@@ -867,6 +875,51 @@ mod bank_tests {
         }
         // An account that was not touched is not a leaf.
         assert!(entry_of(&delta, &sysvar::rent::id()).is_none());
+    }
+
+    /// The accounts delta is built once, when the bank is frozen. Building
+    /// it again (a second `finish_accounts_delta`, which a second
+    /// `finish_accounts_lt_hash_updates` would do), freezing again or
+    /// rehashing changes neither the delta nor the commitment root; without
+    /// the guard a second build would take the already taken prefixes and
+    /// replace the delta with an empty one.
+    #[test]
+    fn test_accounts_delta_is_built_once() {
+        let Setup {
+            genesis_config,
+            mint_keypair,
+        } = setup_active();
+        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        freeze_and_check(None, &bank0);
+        let bank1 = new_child(&bank_forks, &bank0, 1);
+        let alice = Pubkey::new_unique();
+        bank1.register_unique_recent_blockhash_for_test();
+        bank1
+            .transfer(LAMPORTS_PER_SOL, &mint_keypair, &alice)
+            .unwrap();
+        let delta = freeze_and_check(Some(&bank0), &bank1);
+        assert!(entry_of(&delta, &alice).is_some());
+        let lt_hash = bank1.accounts_lt_hash.lock().unwrap().clone();
+        let hash = bank1.hash();
+        let commitment_root = bank1.commitment_root();
+
+        // The prefixes were taken at freeze: what is left is empty.
+        assert_eq!(
+            bank1
+                .accounts_lt_hash_async_progress
+                .take_accounts_delta_prefixes()
+                .map(|prefixes| prefixes.num_addresses()),
+            Some(0)
+        );
+        assert_eq!(bank1.finish_accounts_delta(), 0);
+        bank1.freeze();
+        bank1.rehash();
+        assert!(Arc::ptr_eq(&bank1.accounts_delta().unwrap(), &delta));
+        assert_eq!(bank1.accounts_delta_root(), Some(delta.root()));
+        assert_eq!(*bank1.accounts_lt_hash.lock().unwrap(), lt_hash);
+        assert_eq!(bank1.hash(), hash);
+        assert_eq!(bank1.commitment_root(), commitment_root);
+        assert_eq!(bank1.verify_commitment_root(), Ok(()));
     }
 
     #[test]
