@@ -72,6 +72,14 @@ impl Bank {
         *self.epoch_boundary.read().unwrap()
     }
 
+    /// Epoch boundary state written to a snapshot of this bank: `None` unless
+    /// the feature is in effect for the bank, so that a snapshot taken before
+    /// that has the format it had before the field existed.
+    pub(crate) fn epoch_boundary_for_snapshot(&self) -> Option<EpochBoundary> {
+        self.epoch_boundary()
+            .filter(|_| self.is_epoch_boundary_commitment_active())
+    }
+
     /// The epoch boundary of this bank, given its parent and the length of
     /// its block history `H(B)`. Used for commitment slot 4 and for the state
     /// stored at freeze, with the same inputs. Fails if this bank is the
@@ -240,6 +248,36 @@ mod tests {
             } else {
                 assert_eq!(bank32.block_commitment(), None);
             }
+        }
+    }
+
+    #[test]
+    fn test_epoch_boundary_for_snapshot() {
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis(&both_features())));
+        freeze_with_block_id(&bank0);
+        // The genesis epoch has no boundary, so nothing to write.
+        assert_eq!(bank0.epoch_boundary_for_snapshot(), None);
+        let bank32 = Bank::new_from_parent(bank0.clone(), SlotLeader::default(), 32);
+        bank32.freeze();
+        bank32.set_block_id(Some(BlockId::from(Hash::new_unique())));
+        let boundary = bank32.epoch_boundary().unwrap();
+        assert_eq!(bank32.epoch_boundary_for_snapshot(), Some(boundary));
+        assert_eq!(
+            bank32.get_fields_to_serialize().epoch_boundary,
+            Some(boundary)
+        );
+        // State held while the feature is not in effect (which only a test
+        // can produce) is not written to a snapshot, whichever feature is
+        // missing.
+        for feature_id in both_features() {
+            let mut bank = Bank::new_from_parent(bank0.clone(), SlotLeader::default(), 32);
+            bank.freeze();
+            bank.set_block_id(Some(BlockId::from(Hash::new_unique())));
+            assert_eq!(bank.epoch_boundary(), Some(boundary));
+            bank.deactivate_feature(&feature_id);
+            assert_eq!(bank.epoch_boundary(), Some(boundary));
+            assert_eq!(bank.epoch_boundary_for_snapshot(), None);
+            assert_eq!(bank.get_fields_to_serialize().epoch_boundary, None);
         }
     }
 
