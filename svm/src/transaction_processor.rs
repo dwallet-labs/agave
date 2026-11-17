@@ -19,7 +19,7 @@ use {
             AccountsDeltas, ExecutedTransaction, TransactionExecutionDetails,
         },
         transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
-        transaction_receipt::compute_receipt_roots,
+        transaction_receipt::{ReceiptLeaves, compute_receipt_leaves},
     },
     log::{debug, error},
     solana_account::{AccountSharedData, ReadableAccount, state_traits::StateMutWincode as _},
@@ -179,6 +179,12 @@ pub struct TransactionProcessingConfig<'a> {
     /// This is consensus-relevant: the bank sets it from its feature set, and
     /// it must be the same for block production and replay.
     pub compute_receipt_roots: bool,
+    /// With `compute_receipt_roots`, also return the instruction trace
+    /// records and events under the roots, in
+    /// [`TransactionExecutionDetails::receipt_leaves`], for nodes that serve
+    /// receipt proofs. Not consensus-relevant: the roots are the same either
+    /// way.
+    pub retain_receipt_leaves: bool,
 }
 
 /// Runtime environment for transaction batch processing.
@@ -1242,10 +1248,10 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         // The trace is consumed below, so the receipt roots are computed now
         // and kept only if the transaction still succeeds after the final
         // balance check.
-        let receipt_roots = recorded_events
+        let receipt_leaves = recorded_events
             .filter(|_| post_account_state_info_result.is_ok())
             .and_then(|recorded_events| {
-                compute_receipt_roots(&transaction_context, recorded_events)
+                compute_receipt_leaves(&transaction_context, recorded_events)
                     .inspect_err(|err| {
                         // Unreachable: the trace of a successful transaction is
                         // always consistent. The bank reports a missing root.
@@ -1253,6 +1259,10 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     })
                     .ok()
             });
+        let receipt_roots = receipt_leaves.as_ref().map(ReceiptLeaves::roots);
+        let receipt_leaves = receipt_leaves
+            .filter(|_| config.retain_receipt_leaves)
+            .map(Box::new);
 
         let (execution_record, inner_instructions) = Self::deconstruct_transaction(
             transaction_context,
@@ -1314,6 +1324,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         };
 
         let receipt_roots = receipt_roots.filter(|_| status.is_ok());
+        let receipt_leaves = receipt_leaves.filter(|_| receipt_roots.is_some());
 
         ExecutedTransaction {
             execution_details: TransactionExecutionDetails {
@@ -1324,6 +1335,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 executed_units,
                 accounts_deltas,
                 receipt_roots,
+                receipt_leaves,
             },
             loaded_transaction,
             programs_modified_by_tx: program_cache_for_tx_batch.drain_modified_entries(),

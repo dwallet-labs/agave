@@ -278,6 +278,7 @@ fn new_executed_processing_result(
                 executed_units: 0,
                 accounts_deltas,
                 receipt_roots: None,
+                receipt_leaves: None,
             },
             programs_modified_by_tx: HashMap::new(),
         },
@@ -8916,6 +8917,7 @@ fn test_collect_transaction_logs_ignores_vote_classification() {
             accounts_uninitialized_size: 0,
         }),
         receipt_roots: None,
+        receipt_leaves: None,
     };
 
     for is_simple_vote in [false, true] {

@@ -377,6 +377,7 @@ impl Consumer {
                     drop_bail_out_transactions: true,
                     // Set by the bank from its feature set.
                     compute_receipt_roots: false,
+                    retain_receipt_leaves: false,
                 }
             ));
         execute_and_commit_timings.load_execute_us = load_execute_us;

@@ -47,11 +47,23 @@ use {
     },
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_svm::{
-        transaction_execution_result::ReceiptRoots,
+        transaction_execution_result::{ReceiptLeaves, ReceiptRoots},
         transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     },
-    std::sync::Mutex,
+    std::sync::{Arc, Mutex},
 };
+
+/// A transaction receipt kept for light-client provers
+/// (`RuntimeConfig::retain_light_client_proof_data`), with the leaves of its
+/// instruction trace and events trees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedReceipt {
+    pub receipt: TransactionReceipt,
+    /// The records and events under the receipt's roots: empty for a failed
+    /// receipt. `None` only if the SVM did not return them for a successful
+    /// transaction (it always does when they are requested).
+    pub leaves: Option<Arc<ReceiptLeaves>>,
+}
 
 /// How the transactions of a committed batch are placed in the block, for
 /// the order of their receipts.
@@ -85,6 +97,9 @@ pub(crate) struct ReceiptAccumulator {
 struct ReceiptAccumulatorState {
     /// `(position, leaf hash)` of every receipt.
     entries: Vec<(u64, Hash)>,
+    /// `(position, receipt)` of every receipt, if the bank keeps them for
+    /// light-client provers. Same positions as `entries`.
+    retained: Vec<(u64, RetainedReceipt)>,
     /// Whether a batch was committed with [`ReceiptOrder::BlockPositions`].
     uses_block_positions: bool,
     /// Whether a batch was committed with [`ReceiptOrder::CommitOrder`].
@@ -100,18 +115,20 @@ impl ReceiptAccumulatorState {
 }
 
 impl ReceiptAccumulator {
-    /// Adds the receipts of a batch, `(index in the batch, leaf hash)`, or
-    /// the failure to compute one of them.
+    /// Adds the receipts of a batch, `(index in the batch, leaf hash,
+    /// receipt to keep)`, or the failure to compute one of them.
     fn push(
         &self,
         order: ReceiptOrder,
-        receipts: impl Iterator<Item = Result<(usize, Hash), CommitmentFailure>>,
+        receipts: impl Iterator<
+            Item = Result<(usize, Hash, Option<RetainedReceipt>), CommitmentFailure>,
+        >,
     ) {
         let mut state = self.state.lock().unwrap();
         let state = &mut *state;
         let mut num_receipts = 0usize;
         for receipt in receipts {
-            let (index_in_batch, leaf_hash) = match receipt {
+            let (index_in_batch, leaf_hash, retained) = match receipt {
                 Ok(receipt) => receipt,
                 Err(failure) => {
                     state.fail(failure);
@@ -131,6 +148,9 @@ impl ReceiptAccumulator {
                 ReceiptOrder::Unknown => continue,
             };
             state.entries.push((position, leaf_hash));
+            if let Some(retained) = retained {
+                state.retained.push((position, retained));
+            }
         }
         if num_receipts == 0 {
             return;
@@ -166,6 +186,31 @@ impl ReceiptAccumulator {
             .into_iter()
             .map(|(_, leaf_hash)| leaf_hash)
             .collect())
+    }
+
+    /// Kept receipts in block order, or why the receipts cannot be put in
+    /// block order. Fails as well if not every receipt was kept.
+    fn retained_in_block_order(&self) -> Result<Vec<RetainedReceipt>, CommitmentFailure> {
+        let (mut retained, num_entries) = {
+            let state = self.state.lock().unwrap();
+            if let Some(failure) = &state.failure {
+                return Err(failure.clone());
+            }
+            (state.retained.clone(), state.entries.len())
+        };
+        if retained.len() != num_entries {
+            return Err(CommitmentFailure::ReceiptCountMismatch {
+                committed: num_entries as u64,
+                receipts: retained.len() as u64,
+            });
+        }
+        retained.sort_unstable_by_key(|(position, _)| *position);
+        if let Some(pair) = retained.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(CommitmentFailure::DuplicateBlockPosition {
+                position: pair[0].0,
+            });
+        }
+        Ok(retained.into_iter().map(|(_, receipt)| receipt).collect())
     }
 }
 
@@ -215,6 +260,27 @@ pub fn transaction_receipt(
     })
 }
 
+/// The leaves under the receipt of a processed transaction, as kept for
+/// light-client provers.
+fn retained_receipt_leaves(
+    processed_transaction: &ProcessedTransaction,
+) -> Option<Arc<ReceiptLeaves>> {
+    match processed_transaction {
+        ProcessedTransaction::Executed(executed_tx)
+            if executed_tx.execution_details.status.is_ok() =>
+        {
+            executed_tx
+                .execution_details
+                .receipt_leaves
+                .as_deref()
+                .cloned()
+                .map(Arc::new)
+        }
+        // A failed receipt commits to empty trees.
+        _ => Some(Arc::default()),
+    }
+}
+
 impl Bank {
     /// Whether this bank computes `receipts_root`: both the Transaction
     /// Receipt Tree feature and the Block Commitment Root feature, which
@@ -238,6 +304,7 @@ impl Bank {
         if !self.is_transaction_receipt_tree_active() {
             return;
         }
+        let retain = self.retain_light_client_proof_data;
         let receipts = transactions
             .iter()
             .zip(processing_results)
@@ -245,11 +312,28 @@ impl Bank {
             .filter_map(|(index_in_batch, (transaction, processing_result))| {
                 let processed_transaction = processing_result.as_ref().ok()?;
                 Some(
-                    transaction_receipt(transaction, processed_transaction)
-                        .map(|receipt| (index_in_batch, receipt.leaf_hash())),
+                    transaction_receipt(transaction, processed_transaction).map(|receipt| {
+                        let retained = retain.then(|| RetainedReceipt {
+                            receipt,
+                            leaves: retained_receipt_leaves(processed_transaction),
+                        });
+                        (index_in_batch, receipt.leaf_hash(), retained)
+                    }),
                 )
             });
         self.transaction_receipts.push(order, receipts);
+    }
+
+    /// The receipts committed so far with the leaves of their trees, in
+    /// block order, if this bank keeps them for light-client provers
+    /// (`RuntimeConfig::retain_light_client_proof_data`); `None` otherwise
+    /// and while the feature is inactive. Its leaf hashes are
+    /// [`Self::transaction_receipt_leaf_hashes`].
+    pub fn retained_transaction_receipts(
+        &self,
+    ) -> Option<Result<Vec<RetainedReceipt>, CommitmentFailure>> {
+        (self.retain_light_client_proof_data && self.is_transaction_receipt_tree_active())
+            .then(|| self.transaction_receipts.retained_in_block_order())
     }
 
     /// Leaf hashes of the receipts committed so far, in block order, or the
@@ -328,7 +412,7 @@ mod tests {
         solana_merkle_tree::{
             commitment_tree::TreeId,
             receipt_tree::{
-                EventKind, EventRecord, InstructionAccountMeta, InstructionRecord,
+                EventKind, EventRecord, InstructionAccountMeta, InstructionRecord, ReceiptStatus,
                 empty_events_root, event_inclusion_proof, events_root,
                 instruction_record_inclusion_proof, instruction_trace_root, log_data_payload,
                 receipts_root, verify_event, verify_instruction_record, verify_receipt,
@@ -611,6 +695,126 @@ mod tests {
             records[events[1].instruction_index as usize].stack_height,
             2
         );
+    }
+
+    /// With `retain_light_client_proof_data`, the bank keeps every receipt
+    /// with the records and events under its roots, in block order, and
+    /// computes the same receipts as a bank that does not keep them.
+    #[test]
+    fn test_retained_receipts() {
+        let setup = setup(true, true);
+        let new_bank = |slot, retain| {
+            let mut bank = Bank::new_from_parent(setup.bank0.clone(), *setup.bank0.leader(), slot);
+            bank.set_retain_light_client_proof_data_for_tests(retain);
+            Arc::new(bank)
+        };
+        let recipient = Pubkey::new_unique();
+        let extra = [0xaa, 0xbb];
+        let run = |bank: &Bank| {
+            bank.transfer(1_000_000_000, &setup.mint_keypair, &recipient)
+                .unwrap();
+            let ok_tx = program_transaction(&setup, bank, &recipient, &[0, 0xaa, 0xbb]);
+            bank.process_transaction(&ok_tx).unwrap();
+            let fail_tx = program_transaction(&setup, bank, &recipient, &[2]);
+            assert!(bank.process_transaction(&fail_tx).is_err());
+            (ok_tx, fail_tx)
+        };
+        let kept = new_bank(1, true);
+        let (ok_tx, fail_tx) = run(&kept);
+        let not_kept = new_bank(2, false);
+        run(&not_kept);
+        assert_eq!(not_kept.retained_transaction_receipts(), None);
+        // Keeping the receipts does not change them.
+        assert_eq!(
+            kept.transaction_receipt_leaf_hashes().unwrap(),
+            not_kept.transaction_receipt_leaf_hashes().unwrap()
+        );
+
+        let retained = kept.retained_transaction_receipts().unwrap().unwrap();
+        assert_eq!(retained.len(), 3);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|retained| retained.receipt.leaf_hash())
+                .collect::<Vec<_>>(),
+            kept.transaction_receipt_leaf_hashes().unwrap()
+        );
+        let payer = setup.mint_keypair.pubkey();
+        let transfer_records = vec![InstructionRecord::new(
+            1,
+            system_program::id().to_bytes(),
+            [meta(&payer, true, true), meta(&recipient, false, true)],
+            &system_transaction::transfer(
+                &setup.mint_keypair,
+                &recipient,
+                1_000_000_000,
+                kept.last_blockhash(),
+            )
+            .message
+            .instructions[0]
+                .data,
+        )];
+        let (records, events) = expected_trace_and_events(&setup, &recipient, &extra);
+        let expected_leaves = [
+            ReceiptLeaves {
+                records: transfer_records,
+                events: vec![],
+            },
+            ReceiptLeaves { records, events },
+            ReceiptLeaves::default(),
+        ];
+        for (retained, expected) in retained.iter().zip(&expected_leaves) {
+            let leaves = retained.leaves.as_deref().unwrap();
+            assert_eq!(leaves, expected);
+            let roots = leaves.roots();
+            if retained.receipt.status == ReceiptStatus::Success {
+                assert_eq!(
+                    roots.instruction_trace_root,
+                    retained.receipt.instruction_trace_root
+                );
+                assert_eq!(roots.events_root, retained.receipt.events_root);
+            }
+        }
+        assert_eq!(retained[1].receipt.signature, signature_bytes(&ok_tx));
+        assert_eq!(retained[2].receipt.signature, signature_bytes(&fail_tx));
+        assert_eq!(retained[2].receipt.status, ReceiptStatus::Failed);
+
+        // The kept receipts follow the block positions, not commit order.
+        let bank = new_bank(3, true);
+        let tx_a = system_transaction::transfer(
+            &setup.mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            bank.last_blockhash(),
+        );
+        let tx_b = system_transaction::transfer(
+            &setup.mint_keypair,
+            &Pubkey::new_unique(),
+            2,
+            bank.last_blockhash(),
+        );
+        for (tx, position) in [(&tx_a, 7), (&tx_b, 3)] {
+            let batch = bank.prepare_batch_for_tests(vec![tx.clone()]);
+            let (results, _) = bank
+                .load_execute_and_commit_transactions_with_pre_commit_callback(
+                    &batch,
+                    ExecutionRecordingConfig::new_single_setting(false),
+                    &mut ExecuteTimings::default(),
+                    None,
+                    ReceiptOrder::BlockPositions(&[position]),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(results[0].is_ok());
+        }
+        let signatures: Vec<_> = bank
+            .retained_transaction_receipts()
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|retained| retained.receipt.signature)
+            .collect();
+        assert_eq!(signatures, [signature_bytes(&tx_b), signature_bytes(&tx_a)]);
     }
 
     #[test]
@@ -916,7 +1120,7 @@ mod tests {
         // A receipt for a transaction that was not committed.
         bank.transaction_receipts.push(
             ReceiptOrder::BlockPositions(&[1]),
-            std::iter::once(Ok((0, Hash::new_unique()))),
+            std::iter::once(Ok((0, Hash::new_unique(), None))),
         );
         assert_eq!(bank.transaction_receipt_leaf_hashes().unwrap().len(), 2);
         freeze_with_block_id(&bank);
@@ -995,7 +1199,7 @@ mod tests {
         );
         bank.transaction_receipts.push(
             ReceiptOrder::BlockPositions(&[1]),
-            std::iter::once(Ok((0, Hash::new_unique()))),
+            std::iter::once(Ok((0, Hash::new_unique(), None))),
         );
         freeze_with_block_id(&bank);
         assert_commitment_failure(
@@ -1067,6 +1271,7 @@ mod tests {
                     executed_units: 0,
                     accounts_deltas: None,
                     receipt_roots: None,
+                    receipt_leaves: None,
                 },
                 programs_modified_by_tx: HashMap::new(),
             },

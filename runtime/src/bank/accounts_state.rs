@@ -82,7 +82,9 @@ use {
     super::{
         Bank,
         accounts_delta::lt_hash_prefix,
-        block_commitment::{CommitmentFailure, CommitmentSlot, INACTIVE_COMMITMENT_SLOT},
+        block_commitment::{
+            CommitmentFailure, CommitmentSlot, CommitmentVector, INACTIVE_COMMITMENT_SLOT,
+        },
     },
     agave_feature_set as feature_set,
     log::*,
@@ -477,6 +479,69 @@ impl AccountsState {
         self.generations.iter().find(|g| g.epoch == epoch)
     }
 
+    /// Proof of the state of `address` in generation `generation_in_use` of
+    /// this state, opened against `vector`, the commitment vector of the
+    /// bank that holds this state (see [`Bank::accounts_state_proof`]).
+    ///
+    /// With [`BaseWait::NoWait`], fails with
+    /// [`AccountsStateProofError::BaseNotReady`] instead of waiting for a base
+    /// tree (or root) that the background job has not finished.
+    pub fn account_proof(
+        &self,
+        generation_in_use: Option<Epoch>,
+        vector: &CommitmentVector,
+        address: &Pubkey,
+        base_wait: BaseWait,
+    ) -> Result<AccountProof, AccountsStateProofError> {
+        let generation = generation_in_use
+            .and_then(|epoch| self.generation(epoch))
+            .ok_or(AccountsStateProofError::NoGeneration)?;
+        if base_wait == BaseWait::NoWait
+            && generation.base.root_if_known().is_none()
+            && !generation.base.is_finished()
+        {
+            return Err(AccountsStateProofError::BaseNotReady);
+        }
+        let base_root = generation
+            .base
+            .wait_root()
+            .map_err(AccountsStateProofError::BaseUnavailable)?;
+        let opening = AccountsStateOpening {
+            generation: generation.epoch,
+            base_root,
+            overlay_root: generation.overlay.root(),
+            slot_proof: vector
+                .inclusion_proof(CommitmentSlot::AccountsStateRoot.index())
+                .expect("slot 5 is in range"),
+        };
+        if opening.accounts_state_root() != vector.get(CommitmentSlot::AccountsStateRoot) {
+            return Err(AccountsStateProofError::BaseUnavailable(
+                "the base root differs from the one committed in slot 5".into(),
+            ));
+        }
+        let address = address.to_bytes();
+        let lookup = match account_lookup(&generation.overlay, None, &address) {
+            Some(lookup) => lookup,
+            None => {
+                if base_wait == BaseWait::NoWait && !generation.base.is_finished() {
+                    return Err(AccountsStateProofError::BaseNotReady);
+                }
+                let base = generation
+                    .base
+                    .wait_tree()
+                    .map_err(AccountsStateProofError::BaseUnavailable)?;
+                if base.root() != base_root {
+                    return Err(AccountsStateProofError::BaseUnavailable(
+                        "the base leaves do not match the base root".into(),
+                    ));
+                }
+                account_lookup(&generation.overlay, Some(&base), &address)
+                    .expect("the base tree is given")
+            }
+        };
+        Ok(AccountProof { opening, lookup })
+    }
+
     /// The form persisted in snapshots: overlays, base identities and the base
     /// roots known now.
     pub fn to_snapshot(&self) -> SnapshotAccountsState {
@@ -551,6 +616,16 @@ pub enum AccountsStateProofError {
     NoGeneration,
     #[error("the base tree is not available: {0}")]
     BaseUnavailable(String),
+    #[error("the base tree is still being computed")]
+    BaseNotReady,
+}
+
+/// Whether [`AccountsState::account_proof`] waits for a base tree that is
+/// still being computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseWait {
+    Wait,
+    NoWait,
 }
 
 impl Bank {
@@ -866,45 +941,12 @@ impl Bank {
         let state = self
             .accounts_state()
             .ok_or(AccountsStateProofError::NoCommitmentVector)?;
-        let generation = self
-            .accounts_state_generation_in_use()
-            .and_then(|epoch| state.generation(epoch))
-            .ok_or(AccountsStateProofError::NoGeneration)?;
-        let base_root = generation
-            .base
-            .wait_root()
-            .map_err(AccountsStateProofError::BaseUnavailable)?;
-        let opening = AccountsStateOpening {
-            generation: generation.epoch,
-            base_root,
-            overlay_root: generation.overlay.root(),
-            slot_proof: vector
-                .inclusion_proof(CommitmentSlot::AccountsStateRoot.index())
-                .expect("slot 5 is in range"),
-        };
-        if opening.accounts_state_root() != vector.get(CommitmentSlot::AccountsStateRoot) {
-            return Err(AccountsStateProofError::BaseUnavailable(
-                "the base root differs from the one committed in slot 5".into(),
-            ));
-        }
-        let address = address.to_bytes();
-        let lookup = match account_lookup(&generation.overlay, None, &address) {
-            Some(lookup) => lookup,
-            None => {
-                let base = generation
-                    .base
-                    .wait_tree()
-                    .map_err(AccountsStateProofError::BaseUnavailable)?;
-                if base.root() != base_root {
-                    return Err(AccountsStateProofError::BaseUnavailable(
-                        "the base leaves do not match the base root".into(),
-                    ));
-                }
-                account_lookup(&generation.overlay, Some(&base), &address)
-                    .expect("the base tree is given")
-            }
-        };
-        Ok(AccountProof { opening, lookup })
+        state.account_proof(
+            self.accounts_state_generation_in_use(),
+            &vector,
+            address,
+            BaseWait::Wait,
+        )
     }
 
     /// The overlay entry of `address` in generation `epoch` of this bank.
