@@ -56,9 +56,8 @@
 //! be served.
 
 use {
-    super::Bank,
+    super::{Bank, block_commitment::CommitmentFailure},
     agave_feature_set as feature_set,
-    log::*,
     smallvec::SmallVec,
     solana_account::ReadableAccount,
     solana_accounts_db::accounts_db::AccountsDb,
@@ -206,27 +205,27 @@ impl AccountsDeltaPrefixes {
     }
 }
 
+/// The accounts delta of a frozen bank, or the commitment failure that
+/// prevents computing it.
+pub(super) type AccountsDeltaState = Result<Arc<AccountsDelta>, CommitmentFailure>;
+
 impl Bank {
-    /// Whether the Accounts Delta Root feature is active for this bank. The
-    /// root is computed only if [`Self::is_block_commitment_root_active`] is
-    /// true as well.
+    /// Whether this bank computes `accounts_delta_root`: both the Accounts
+    /// Delta Root feature and the Block Commitment Root feature, which
+    /// carries the root, must be active.
     pub fn is_accounts_delta_root_active(&self) -> bool {
         self.feature_set
             .is_active(&feature_set::accounts_delta_root::id())
-    }
-
-    /// Whether this bank computes `accounts_delta_root` when it is frozen.
-    fn computes_accounts_delta_root(&self) -> bool {
-        self.is_block_commitment_root_active() && self.is_accounts_delta_root_active()
+            && self.is_block_commitment_root_active()
     }
 
     /// Whether a bank created from `parent` in `epoch` must collect the
     /// accounts delta prefixes. Decided before the bank's first account
     /// update: the features can only become active for a bank that starts a
     /// new epoch, so collecting in those banks and in every bank whose parent
-    /// has both features active covers every bank that computes the root.
+    /// computes the root covers every bank that computes the root.
     pub(super) fn collects_accounts_delta_after(parent: &Bank, epoch: Epoch) -> bool {
-        parent.computes_accounts_delta_root() || parent.epoch() < epoch
+        parent.is_accounts_delta_root_active() || parent.epoch() < epoch
     }
 
     /// Whether this bank keeps the account hashes for the accounts delta root
@@ -237,65 +236,76 @@ impl Bank {
     }
 
     /// The changed accounts of this bank and their root, set when the bank is
-    /// frozen with both features active. `None` otherwise, including for a
-    /// bank loaded from a snapshot.
+    /// frozen with [`Self::is_accounts_delta_root_active`]. `None` otherwise,
+    /// including for a bank loaded from a snapshot, and for a bank whose
+    /// accounts delta could not be computed (a commitment failure).
     pub fn accounts_delta(&self) -> Option<Arc<AccountsDelta>> {
-        self.accounts_delta.read().unwrap().clone()
-    }
-
-    /// `accounts_delta_root` of this bank, if it has one.
-    pub fn accounts_delta_root(&self) -> Option<Hash> {
         self.accounts_delta
             .read()
             .unwrap()
             .as_ref()
-            .map(|delta| delta.root())
+            .and_then(|delta| delta.as_ref().ok())
+            .cloned()
     }
 
-    /// Builds the accounts delta from the collected prefixes. Called once,
-    /// from `freeze()`, after the last account update of the bank has been
-    /// hashed. Returns the number of addresses updated in the bank (0 if this
-    /// bank does not collect).
+    /// `accounts_delta_root` of this bank, if it has one.
+    pub fn accounts_delta_root(&self) -> Option<Hash> {
+        self.accounts_delta().map(|delta| delta.root())
+    }
+
+    /// `accounts_delta_root` for the commitment vector: `None` if the feature
+    /// is inactive, and a commitment failure if the bank could not compute
+    /// it. Called from `freeze()` after [`Self::finish_accounts_delta`].
+    pub(super) fn accounts_delta_root_for_commitment(
+        &self,
+    ) -> Result<Option<Hash>, CommitmentFailure> {
+        if !self.is_accounts_delta_root_active() {
+            return Ok(None);
+        }
+        match self.accounts_delta.read().unwrap().as_ref() {
+            Some(Ok(delta)) => Ok(Some(delta.root())),
+            Some(Err(failure)) => Err(failure.clone()),
+            // `finish_accounts_delta()` sets it for every bank that computes
+            // the root, before the commitment vector is computed.
+            None => Err(CommitmentFailure::AccountsDeltaNotCollected),
+        }
+    }
+
+    /// Builds the accounts delta from the collected prefixes, or records why
+    /// it cannot be built (a commitment failure, reported by `freeze()`).
+    /// Called once, from `freeze()`, after the last account update of the bank
+    /// has been hashed. Returns the number of addresses updated in the bank
+    /// (0 if this bank does not collect).
     pub(super) fn finish_accounts_delta(&self) -> usize {
-        let Some(prefixes) = self
+        let prefixes = self
             .accounts_lt_hash_async_progress
-            .take_accounts_delta_prefixes()
-        else {
-            if self.computes_accounts_delta_root() {
-                // Unreachable through `new_from_parent` (see
-                // `collects_accounts_delta_after`); only a test that activates
-                // the feature on an existing bank gets here. Commitment slot 2
-                // then stays zero rather than holding an incomplete root.
-                error!(
-                    "bank {} has accounts_delta_root active but did not collect the account \
-                     hashes from its first update; accounts_delta_root is left unset",
-                    self.slot()
-                );
-                datapoint_error!(
-                    "bank-accounts_delta_not_collected",
-                    ("slot", self.slot(), i64),
-                );
-            }
-            return 0;
-        };
-        let num_addresses = prefixes.num_addresses();
-        if !self.computes_accounts_delta_root() {
+            .take_accounts_delta_prefixes();
+        let num_addresses = prefixes
+            .as_ref()
+            .map_or(0, |prefixes| prefixes.num_addresses());
+        if !self.is_accounts_delta_root_active() {
             return num_addresses;
         }
-        let delta = prefixes.into_accounts_delta().unwrap_or_else(|err| {
+        let delta = match prefixes {
+            // Unreachable through `new_from_parent` (see
+            // `collects_accounts_delta_after`): only a bank whose feature set
+            // changed after its first account update (a test that activates
+            // the feature on an existing bank) gets here. Without the account
+            // hashes of its first updates the root cannot be computed.
+            None => Err(CommitmentFailure::AccountsDeltaNotCollected),
             // Each address's updates chain from its state before the block to
-            // its state after it, which is what keeps the accounts lattice hash
-            // correct. A broken chain means an update was lost or duplicated,
-            // and then the lattice hash, and so the bank hash, is wrong too.
-            panic!(
-                "bank {}: account updates of {} do not chain from the state before the block to \
-                 the state after it ({} unmatched prefixes)",
-                self.slot(),
-                err.address,
-                err.num_prefixes,
-            )
-        });
-        *self.accounts_delta.write().unwrap() = Some(Arc::new(delta));
+            // its state after it, which is what keeps the accounts lattice
+            // hash correct. A broken chain means an update was lost or
+            // duplicated, and then the lattice hash, and so the bank hash, is
+            // wrong too.
+            Some(prefixes) => prefixes.into_accounts_delta().map(Arc::new).map_err(|err| {
+                CommitmentFailure::InconsistentAccountUpdates {
+                    address: err.address,
+                    num_prefixes: err.num_prefixes,
+                }
+            }),
+        };
+        *self.accounts_delta.write().unwrap() = Some(delta);
         num_addresses
     }
 }
@@ -456,6 +466,7 @@ mod bank_tests {
         crate::{
             bank::block_commitment::{
                 COMMITMENT_VECTOR_LEN, CommitmentSlot, CommitmentVector, INACTIVE_COMMITMENT_SLOT,
+                tests::assert_commitment_failure,
             },
             bank_forks::BankForks,
             genesis_utils::{
@@ -721,15 +732,64 @@ mod bank_tests {
         bank32.freeze();
         assert!(bank32.accounts_delta().is_none());
 
-        // Delta feature only: no root without the base feature.
+        // Delta feature only: no root without the base feature, and
+        // `is_accounts_delta_root_active` requires both.
         let Setup { genesis_config, .. } = setup(false, Some(Some(0)));
         let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-        assert!(bank0.is_accounts_delta_root_active());
+        assert!(
+            bank0
+                .feature_set
+                .is_active(&feature_set::accounts_delta_root::id())
+        );
+        assert!(!bank0.is_accounts_delta_root_active());
         bank0.freeze();
         assert!(bank0.accounts_delta().is_none());
         assert!(bank0.block_commitment().is_none());
         let bank1 = new_child(&bank_forks, &bank0, 1);
         assert!(!bank1.collects_accounts_delta());
+    }
+
+    /// A bank that computes the root but did not keep the account hashes from
+    /// its first update (its feature set changed after it was created) has a
+    /// commitment failure instead of a zero slot 2.
+    #[test]
+    fn test_accounts_delta_not_collected_is_commitment_failure() {
+        let Setup { genesis_config, .. } = setup(true, None);
+        let (bank0, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        bank0.freeze();
+        bank0.set_block_id(Some(BlockId::from(Hash::new_unique())));
+        let mut bank1 = Bank::new_from_parent(bank0.clone(), *bank0.leader(), 1);
+        assert!(!bank1.collects_accounts_delta());
+        bank1.activate_feature(&feature_set::accounts_delta_root::id());
+        assert!(bank1.is_accounts_delta_root_active());
+        bank1.freeze();
+        assert_eq!(bank1.accounts_delta(), None);
+        assert_eq!(bank1.accounts_delta_root(), None);
+        assert_commitment_failure(&bank1, CommitmentFailure::AccountsDeltaNotCollected);
+    }
+
+    /// Account updates that do not chain (here a previous version without
+    /// its update) are a commitment failure, not a panic.
+    #[test]
+    fn test_inconsistent_account_updates_is_commitment_failure() {
+        let Setup { genesis_config, .. } = setup_active();
+        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        freeze_and_check(None, &bank0);
+        let bank1 = new_child(&bank_forks, &bank0, 1);
+        let address = Pubkey::new_unique();
+        bank1
+            .accounts_lt_hash_async_progress
+            .record_unmatched_prev_for_tests(&address, Hash::new_unique());
+        bank1.freeze();
+        assert_eq!(bank1.accounts_delta(), None);
+        assert_eq!(bank1.accounts_delta_root(), None);
+        assert_commitment_failure(
+            &bank1,
+            CommitmentFailure::InconsistentAccountUpdates {
+                address,
+                num_prefixes: 1,
+            },
+        );
     }
 
     #[test]

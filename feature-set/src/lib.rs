@@ -2901,10 +2901,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             transaction_receipt_tree::id(),
             "SIMD-XXXX: Transaction receipt tree",
         ),
-        (
-            accounts_delta_root::id(),
-            "SIMD-XXXX: Accounts delta root",
-        ),
+        (accounts_delta_root::id(), "SIMD-XXXX: Accounts delta root"),
         (
             epoch_validator_set_root::id(),
             "SIMD-XXXX: Epoch validator set root",
