@@ -48,6 +48,7 @@ members = [
     "lattice-hash",
     "leader-schedule",
     "ledger",
+    "light-client",
     "local-cluster",
     "logger",
     "math-utils",
@@ -434,6 +435,7 @@ solana-last-restart-slot = "3.2.0"
 solana-lattice-hash = { path = "lattice-hash", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-leader-schedule = { path = "leader-schedule", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-ledger = { path = "ledger", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-light-client = { path = "light-client", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-loader-v2-interface = "3.1.0"
 solana-loader-v3-interface = "9.0.0"
 solana-loader-v4-interface = "3.1.0"

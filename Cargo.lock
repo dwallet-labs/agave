@@ -9088,6 +9088,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-light-client"
+version = "5.0.0-alpha.0"
+dependencies = [
+ "agave-bls-cert-verify",
+ "agave-feature-set",
+ "agave-votor-messages",
+ "bitvec",
+ "blake3",
+ "solana-account",
+ "solana-accounts-db",
+ "solana-bls-signatures",
+ "solana-entry",
+ "solana-epoch-schedule",
+ "solana-feature-gate-interface",
+ "solana-fee-calculator",
+ "solana-genesis-config",
+ "solana-hash",
+ "solana-instruction 4.0.0",
+ "solana-keypair",
+ "solana-ledger",
+ "solana-light-client",
+ "solana-merkle-tree",
+ "solana-pubkey 4.4.0",
+ "solana-runtime",
+ "solana-runtime-transaction",
+ "solana-sdk-ids",
+ "solana-sha256-hasher",
+ "solana-signer",
+ "solana-signer-store",
+ "solana-system-transaction",
+ "solana-transaction",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solana-loader-v2-interface"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
