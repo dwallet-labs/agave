@@ -315,6 +315,14 @@ impl Bank {
         self.block_commitment.read().unwrap().clone()
     }
 
+    /// Block commitment state written to a snapshot of this bank: `None`
+    /// unless the feature is active for the bank, so that a snapshot taken
+    /// before activation has the format it had before the field existed.
+    pub(crate) fn block_commitment_for_snapshot(&self) -> Option<BlockCommitment> {
+        self.block_commitment()
+            .filter(|_| self.is_block_commitment_root_active())
+    }
+
     /// `commitment_root` of this bank, set when the bank is frozen with the
     /// feature active, or loaded from a snapshot. `None` for a bank with a
     /// [`Self::commitment_failure`].
@@ -935,6 +943,26 @@ pub(crate) mod tests {
         assert_eq!(bank3.commitment_failure(), None);
         assert!(bank3.commitment_root().is_some());
         assert_eq!(bank3.verify_commitment_root(), Ok(()));
+    }
+
+    #[test]
+    fn test_block_commitment_for_snapshot() {
+        let mut genesis = create_genesis_config(1_000_000_000).genesis_config;
+        activate_feature(&mut genesis, feature_set::block_commitment_root::id());
+        let mut bank0 = Bank::new_for_tests(&genesis);
+        bank0.freeze();
+        bank0.set_block_id(Some(BlockId::new_unique()));
+        assert!(bank0.block_commitment().is_some());
+        assert_eq!(
+            bank0.block_commitment_for_snapshot(),
+            bank0.block_commitment()
+        );
+        // State held without the feature active (which only a test can
+        // produce) is not written to a snapshot.
+        bank0.deactivate_feature(&feature_set::block_commitment_root::id());
+        assert!(bank0.block_commitment().is_some());
+        assert_eq!(bank0.block_commitment_for_snapshot(), None);
+        assert_eq!(bank0.get_fields_to_serialize().block_commitment, None);
     }
 
     #[test]
