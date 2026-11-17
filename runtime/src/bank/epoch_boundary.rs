@@ -30,7 +30,8 @@
 //! - No parent: the genesis bank, whose epoch has no previous epoch. It has
 //!   no state, so no block of the genesis epoch has one either; slot 4 is
 //!   zero until the first block of the next epoch. (Snapshot banks have no
-//!   parent either but are frozen when loaded and keep the snapshot value.)
+//!   parent either but are frozen when loaded and keep the snapshot value;
+//!   see the last case.)
 //! - Feature activation: features activate in the first bank of an epoch,
 //!   which is `F` and computes the value. A bank whose parent is in the same
 //!   epoch but has no state (activation in the middle of an epoch, which the
@@ -47,6 +48,13 @@
 //! - `P` without a block id: a commitment failure. The block history of `F`
 //!   (its last leaf, or its anchor leaf) needs the same block id and fails
 //!   first, with `MissingParentBlockId`.
+//! - A bank restored from a snapshot without the state (written before the
+//!   field existed) while the feature is in effect for it, outside the
+//!   genesis epoch: the state is unknown, not absent (see
+//!   [`Bank::is_epoch_boundary_unknown`]). Its children in the same epoch
+//!   fail with `MissingParentEpochBoundary` instead of committing to zero;
+//!   its first child in the next epoch computes a new boundary and does not
+//!   need it. The two zero cases above are not affected.
 
 use {
     super::{Bank, block_commitment::CommitmentFailure},
@@ -80,11 +88,40 @@ impl Bank {
             .filter(|_| self.is_epoch_boundary_commitment_active())
     }
 
+    /// Whether this bank needs an epoch boundary state that it does not have:
+    /// it was restored from a snapshot without one while the feature is in
+    /// effect for it, outside the genesis epoch. Never true for a bank built
+    /// from a parent or from genesis.
+    pub fn is_epoch_boundary_unknown(&self) -> bool {
+        self.epoch_boundary_unknown
+    }
+
+    /// [`Self::is_epoch_boundary_unknown`] for a bank just restored from a
+    /// snapshot, once its feature set is known.
+    ///
+    /// A bank with the feature in effect legitimately has no state in the
+    /// genesis epoch (no previous epoch) and in an epoch whose first block
+    /// did not have the feature in effect (activation within the epoch). The
+    /// second case cannot be restored: the feature set of a restored bank is
+    /// computed from its feature accounts, and a feature account activates
+    /// when a bank starts a new epoch (`apply_feature_activations`), that is
+    /// in the first block of the epoch, which then had the feature. Only
+    /// in-memory activation, which tests use, takes effect within an epoch,
+    /// and a snapshot does not carry it. So the epoch tells the cases apart
+    /// and the snapshot needs no extra field.
+    pub(super) fn is_epoch_boundary_unknown_after_snapshot_restore(&self) -> bool {
+        let genesis_epoch = self.epoch_schedule.get_epoch(0);
+        self.epoch() != genesis_epoch
+            && self.is_epoch_boundary_commitment_active()
+            && self.epoch_boundary().is_none()
+    }
+
     /// The epoch boundary of this bank, given its parent and the length of
     /// its block history `H(B)`. Used for commitment slot 4 and for the state
     /// stored at freeze, with the same inputs. Fails if this bank is the
     /// first of its epoch and its parent has no block id, or has
-    /// `block_commitment_root` active but no commitment root.
+    /// `block_commitment_root` active but no commitment root; or if this bank
+    /// is not the first of its epoch and its parent's state is unknown.
     pub(super) fn compute_epoch_boundary(
         &self,
         parent: Option<&Bank>,
@@ -134,6 +171,11 @@ impl Bank {
             }))
         } else {
             let epoch_boundary = parent.epoch_boundary();
+            if epoch_boundary.is_none() && parent.is_epoch_boundary_unknown() {
+                return Err(CommitmentFailure::MissingParentEpochBoundary {
+                    parent_slot: parent.slot(),
+                });
+            }
             debug_assert!(
                 epoch_boundary.is_none_or(|epoch_boundary| epoch_boundary.epoch == self.epoch())
             );
@@ -516,6 +558,63 @@ mod tests {
         assert!(bank33.is_epoch_boundary_commitment_active());
         assert_eq!(bank33.epoch_boundary(), None);
         assert_eq!(slot4(&bank33), INACTIVE_COMMITMENT_SLOT);
+        // Its children have a parent with the feature in effect and no state,
+        // which is not a failure: the state is absent, not unknown.
+        assert!(!bank33.is_epoch_boundary_unknown());
+        let bank34 = child(&bank33, 34);
+        assert_eq!(bank34.commitment_failure(), None);
+        assert_eq!(bank34.epoch_boundary(), None);
+        assert_eq!(slot4(&bank34), INACTIVE_COMMITMENT_SLOT);
+        // The next epoch has one.
+        let bank64 = child(&bank34, 64);
+        assert_eq!(bank64.epoch_boundary().unwrap().parent_slot, 34);
+    }
+
+    #[test]
+    fn test_genesis_epoch_children_are_not_failures() {
+        // Within the genesis epoch, a parent with the feature in effect and no
+        // state is the normal case.
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis(&both_features())));
+        freeze_with_block_id(&bank0);
+        assert!(!bank0.is_epoch_boundary_unknown());
+        let bank1 = child(&bank0, 1);
+        let bank2 = child(&bank1, 2);
+        assert_eq!(bank2.commitment_failure(), None);
+        assert_eq!(slot4(&bank2), INACTIVE_COMMITMENT_SLOT);
+    }
+
+    /// A parent whose state is unknown (restored from a snapshot without it,
+    /// see `test_epoch_boundary_snapshot_round_trip` in `serde_snapshot`)
+    /// gives a commitment failure to its children in the same epoch, never a
+    /// zero slot 4, and not to its child that starts the next epoch.
+    #[test]
+    fn test_unknown_parent_state_is_commitment_failure() {
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis(&both_features())));
+        freeze_with_block_id(&bank0);
+        let bank33 = child(&bank0, 33);
+        let mut bank40 = Bank::new_from_parent(bank33.clone(), SlotLeader::default(), 40);
+        // As restored: no state, marked unknown.
+        bank40.epoch_boundary_unknown = true;
+        let bank40 = Arc::new(bank40);
+        freeze_with_block_id(&bank40);
+        *bank40.epoch_boundary.write().unwrap() = None;
+        let bank41 = child(&bank40, 41);
+        assert_commitment_failure(
+            &bank41,
+            CommitmentFailure::MissingParentEpochBoundary { parent_slot: 40 },
+        );
+        assert_eq!(bank41.epoch_boundary(), None);
+        let bank64 = child(&bank40, 64);
+        assert_eq!(bank64.commitment_failure(), None);
+        assert_eq!(bank64.epoch_boundary().unwrap().parent_slot, 40);
+        // A known state is copied even if the mark is set.
+        let mut bank42 = Bank::new_from_parent(bank33.clone(), SlotLeader::default(), 42);
+        bank42.epoch_boundary_unknown = true;
+        let bank42 = Arc::new(bank42);
+        freeze_with_block_id(&bank42);
+        assert_eq!(bank42.epoch_boundary(), bank33.epoch_boundary());
+        let bank43 = child(&bank42, 43);
+        assert_eq!(bank43.epoch_boundary(), bank33.epoch_boundary());
     }
 
     #[test]
