@@ -910,6 +910,7 @@ mod serde_snapshot_tests {
             let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
             let block_id = Some(bank_fields.block_id);
             let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
+            let epoch_boundary = bank_fields.epoch_boundary.map(Into::into);
             serde_snapshot::serialize_bank_snapshot_into(
                 &mut writer,
                 bank_fields,
@@ -922,6 +923,7 @@ mod serde_snapshot_tests {
                     accounts_lt_hash,
                     block_id,
                     block_commitment,
+                    epoch_boundary,
                 },
             )
             .unwrap();
@@ -1133,14 +1135,153 @@ mod serde_snapshot_tests {
                 accounts_lt_hash,
                 block_id,
                 block_commitment: None,
+                epoch_boundary: None,
             },
         )
         .unwrap();
-        // Drop the `None` tag of `block_commitment`.
+        // Drop the `None` tags of `epoch_boundary` and `block_commitment`.
+        assert_eq!(old_buf.pop(), Some(0));
         assert_eq!(old_buf.pop(), Some(0));
         let dbank = deserialize(&old_buf);
         assert_eq!(dbank.block_commitment(), None);
         assert_eq!(dbank.block_id(), Some(block_id1));
+    }
+
+    /// Round-trips the Epoch Boundary Commitment state of a bank in the
+    /// middle of an epoch through a snapshot: the restored bank keeps it, its
+    /// children in the same epoch copy it, and the first child of the next
+    /// epoch computes the boundary with the restored bank as `P`, exactly as
+    /// a child of the original bank does. A snapshot without the field loads
+    /// without epoch boundary state.
+    #[test]
+    fn test_epoch_boundary_snapshot_round_trip() {
+        agave_logger::setup();
+        let leader_id = Pubkey::new_unique();
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_leader(500, &leader_id, LAMPORTS_PER_SOL);
+        genesis_config.epoch_schedule = EpochSchedule::custom(32, 32, false);
+        for feature_id in [
+            agave_feature_set::block_commitment_root::id(),
+            agave_feature_set::epoch_boundary_commitment::id(),
+        ] {
+            crate::genesis_utils::activate_feature(&mut genesis_config, feature_id);
+        }
+
+        let (bank0, _bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        bank0.set_block_id(Some(BlockId::new_unique()));
+        bank0.freeze();
+        bank0.squash();
+        // First block of epoch 1, slots 30 to 32 skipped.
+        let bank29 = Arc::new(Bank::new_from_parent(bank0.clone(), *bank0.leader(), 29));
+        bank29.set_block_id(Some(BlockId::new_unique()));
+        bank29.freeze();
+        bank29.squash();
+        let bank33 = Arc::new(Bank::new_from_parent(bank29.clone(), *bank29.leader(), 33));
+        bank33.set_block_id(Some(BlockId::new_unique()));
+        bank33.freeze();
+        bank33.squash();
+        let bank40 = Arc::new(Bank::new_from_parent(bank33.clone(), *bank33.leader(), 40));
+        let block_id40 = BlockId::new_unique();
+        bank40.set_block_id(Some(block_id40));
+        bank40.freeze();
+        bank40.rc.accounts.add_root(bank40.bank_id());
+        bank40.force_flush_accounts_cache();
+        let boundary = bank40.epoch_boundary().unwrap();
+        assert_eq!(boundary.epoch, 1);
+        assert_eq!(boundary.first_slot, 33);
+        assert_eq!(boundary.parent_slot, 29);
+        assert_eq!(bank33.epoch_boundary(), Some(boundary));
+
+        let deserialize = |buf: &[u8]| {
+            let mut reader = std::io::BufReader::new(buf);
+            let mut snapshot_streams = SnapshotStreams {
+                full_snapshot_stream: &mut reader,
+                incremental_snapshot_stream: None,
+            };
+            let (_accounts_dir, dbank_paths) = get_temp_accounts_paths(4).unwrap();
+            let copied_accounts = TempDir::new().unwrap();
+            let storage_and_next_append_vec_id =
+                copy_append_vecs(&bank40.rc.accounts.accounts_db, copied_accounts.path()).unwrap();
+            crate::serde_snapshot::bank_from_streams(
+                &mut snapshot_streams,
+                &dbank_paths,
+                storage_and_next_append_vec_id,
+                &genesis_config,
+                &RuntimeConfig::default(),
+                None,
+                None,
+                false,
+                ACCOUNTS_DB_CONFIG_FOR_TESTING,
+                None,
+                Arc::default(),
+            )
+            .unwrap()
+            .0
+        };
+
+        let mut buf = vec![];
+        crate::serde_snapshot::bank_to_stream(
+            &mut std::io::BufWriter::new(Cursor::new(&mut buf)),
+            &bank40,
+        )
+        .unwrap();
+        let dbank = Arc::new(deserialize(&buf));
+        assert_eq!(dbank.epoch_boundary(), Some(boundary));
+        assert_eq!(dbank.block_commitment(), bank40.block_commitment());
+
+        // Same epoch: the child copies the value.
+        let child = Bank::new_from_parent(dbank.clone(), *dbank.leader(), 41);
+        child.freeze();
+        assert_eq!(child.epoch_boundary(), Some(boundary));
+
+        // Next epoch: the restored bank is `P`.
+        let next = Bank::new_from_parent(dbank.clone(), *dbank.leader(), 64);
+        next.freeze();
+        let expected_next = Bank::new_from_parent(bank40.clone(), *bank40.leader(), 64);
+        expected_next.freeze();
+        let next_boundary = next.epoch_boundary().unwrap();
+        assert_eq!(Some(next_boundary), expected_next.epoch_boundary());
+        assert_eq!(next_boundary.epoch, 2);
+        assert_eq!(next_boundary.first_slot, 64);
+        assert_eq!(next_boundary.parent_slot, 40);
+        assert_eq!(next_boundary.parent_block_id, block_id40.to_hash());
+        assert_eq!(
+            Some(next_boundary.parent_commitment_root),
+            dbank.commitment_root()
+        );
+        assert_eq!(next.commitment_root(), expected_next.commitment_root());
+
+        // A snapshot written before the field existed (it ends right after
+        // `block_commitment`) restores without epoch boundary state.
+        let mut bank_fields = bank40.get_fields_to_serialize();
+        let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
+        let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
+        let block_id = Some(bank_fields.block_id);
+        let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
+        let mut old_buf = vec![];
+        serde_snapshot::serialize_bank_snapshot_into(
+            &mut old_buf,
+            bank_fields,
+            bank40.get_bank_hash_stats(),
+            ExtraFieldsToSerialize {
+                lamports_per_signature: bank40.fee_rate_governor.lamports_per_signature,
+                unused_incremental_snapshot_persistence: None,
+                unused_epoch_accounts_hash: None,
+                versioned_epoch_stakes,
+                accounts_lt_hash,
+                block_id,
+                block_commitment,
+                epoch_boundary: None,
+            },
+        )
+        .unwrap();
+        // Drop the `None` tag of `epoch_boundary`.
+        assert_eq!(old_buf.pop(), Some(0));
+        let dbank = deserialize(&old_buf);
+        assert_eq!(dbank.epoch_boundary(), None);
+        assert_eq!(dbank.block_commitment(), bank40.block_commitment());
     }
 
     #[test]

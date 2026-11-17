@@ -86,6 +86,7 @@ pub struct FeatureSnapshot {
     pub transaction_receipt_tree: bool,
     pub accounts_delta_root: bool,
     pub epoch_validator_set_root: bool,
+    pub epoch_boundary_commitment: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -195,6 +196,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             transaction_receipt_tree: is_active(&transaction_receipt_tree::ID),
             accounts_delta_root: is_active(&accounts_delta_root::ID),
             epoch_validator_set_root: is_active(&epoch_validator_set_root::ID),
+            epoch_boundary_commitment: is_active(&epoch_boundary_commitment::ID),
         }
     }
 }
@@ -1662,6 +1664,18 @@ pub mod epoch_validator_set_root {
     solana_pubkey::declare_id!("3c2JAGjKSiwqVSRiR2csJN7Cwk7ZDgCsxyEJYgvT8zEd");
 }
 
+/// Epoch Boundary Commitment (draft SIMD, number not yet assigned).
+///
+/// Every block of epoch `E` commits to the last block before `E` on its chain
+/// with `epoch_boundary`, slot 4 of the commitment vector of
+/// `block_commitment_root`, and banks and snapshots carry that value. Has no
+/// effect unless `block_commitment_root` is also active. Must be activated at
+/// an epoch boundary (as every feature is). Placeholder key: replace with the
+/// real feature key once the SIMD is accepted.
+pub mod epoch_boundary_commitment {
+    solana_pubkey::declare_id!("Cbf2GyYQviJZRnDKG4oDsPW2499WoXHiqtJQLavz8ubu");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2823,6 +2837,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             epoch_validator_set_root::id(),
             "SIMD-XXXX: Epoch validator set root",
+        ),
+        (
+            epoch_boundary_commitment::id(),
+            "SIMD-XXXX: Epoch boundary commitment",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/

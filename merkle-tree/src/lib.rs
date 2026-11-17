@@ -3,6 +3,7 @@
 
 pub mod accounts_delta;
 pub mod commitment_tree;
+pub mod epoch_boundary;
 pub mod merkle_tree;
 pub mod receipt_tree;
 pub mod validator_set;
