@@ -84,6 +84,7 @@ pub struct FeatureSnapshot {
     pub loaderv3_programdata_size_floor: bool,
     pub block_commitment_root: bool,
     pub accounts_delta_root: bool,
+    pub accounts_state_root: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -191,6 +192,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             loaderv3_programdata_size_floor: is_active(&loaderv3_programdata_size_floor::ID),
             block_commitment_root: is_active(&block_commitment_root::ID),
             accounts_delta_root: is_active(&accounts_delta_root::ID),
+            accounts_state_root: is_active(&accounts_state_root::ID),
         }
     }
 }
@@ -1635,6 +1637,19 @@ pub mod accounts_delta_root {
     solana_pubkey::declare_id!("8RSGq3ZhGWtbeSpgACfMWj91qHh8BQYZQ44xwbsmSKTJ");
 }
 
+/// Accounts State Root (draft SIMD, number not yet assigned).
+///
+/// Commits to the state of every account with `accounts_state_root`, slot 5
+/// of the commitment vector of `block_commitment_root`: a base tree over the
+/// state at the start of an epoch, built off the block path, and an overlay
+/// over the accounts changed since, updated at bank freeze. Has no effect
+/// unless `block_commitment_root` and `accounts_delta_root` are also active.
+/// Placeholder key: replace with the real feature key once the SIMD is
+/// accepted.
+pub mod accounts_state_root {
+    solana_pubkey::declare_id!("4HLKMuRARnWNXk8cZGLo5y9GrHK6MZkeD5VzJ5ySQMGT");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2786,6 +2801,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             "SIMD-XXXX: Block commitment root",
         ),
         (accounts_delta_root::id(), "SIMD-XXXX: Accounts delta root"),
+        (accounts_state_root::id(), "SIMD-XXXX: Accounts state root"),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
     ]

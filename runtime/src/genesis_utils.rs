@@ -51,10 +51,12 @@ use {
 /// `block_commitment_root` changes the block footer version that replay
 /// accepts and the derivation of the block id, so it is activated explicitly
 /// by the tests that exercise it (see `activate_feature`).
-/// `accounts_delta_root` fills slot 2 of that commitment and follows it.
+/// `accounts_delta_root` fills slot 2 of that commitment and follows it, and
+/// `accounts_state_root` (slot 5) follows both.
 pub const FEATURES_INACTIVE_IN_TEST_GENESIS: &[Pubkey] = &[
     agave_feature_set::block_commitment_root::ID,
     agave_feature_set::accounts_delta_root::ID,
+    agave_feature_set::accounts_state_root::ID,
 ];
 
 /// `FeatureSet::all_enabled()` minus [`FEATURES_INACTIVE_IN_TEST_GENESIS`].
