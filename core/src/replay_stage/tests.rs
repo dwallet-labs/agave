@@ -29,7 +29,7 @@ use {
         slot_status_notifier::SlotStatusNotifierInterface,
     },
     solana_runtime::{
-        bank::{BankId, BankTestConfig},
+        bank::{BankId, BankTestConfig, block_commitment::CommitmentFailure},
         genesis_utils::GenesisConfigInfo,
         transaction_execution::{
             TransactionHistoryPurgeInput, TransactionHistoryPurgeSource, TransactionStatusMessage,
@@ -1976,4 +1976,125 @@ fn test_latest_parent_coalesces() {
     );
     assert_eq!(receiver.try_recv().unwrap().start_slot, 20);
     assert!(receiver.try_recv().is_err());
+}
+
+/// Replay side of a leader slot whose bank cannot compute its commitment root.
+/// Replay freezes the complete leader bank, finds the commitment failure and
+/// marks the slot dead in the same pass; the block creation loop, which saw
+/// the bank frozen and did not publish the footer, then clears the bank through
+/// the bank forks controller, whose commands replay processes on its own
+/// thread, so the clear always comes after the slot is marked dead. Clearing a
+/// dead slot removes the bank and its progress entry and keeps the dead mark,
+/// and a late replay result for the cleared slot is ignored. The block creation
+/// side is covered by `test_leader_commitment_failure_aborts_slot`.
+#[test]
+fn test_leader_commitment_failure_marked_dead_then_cleared() {
+    let AlpenglowReplayComponents {
+        blockstore,
+        bank_forks,
+        mut progress,
+        my_pubkey,
+        leader_schedule_cache,
+        ..
+    } = alpenglow_replay_components(tr(0));
+    let bank0 = bank_forks.read().unwrap().root_bank();
+    // bank1 predates block_commitment_root and has no block id, so a child
+    // with the feature active cannot compute the anchor leaf of its history.
+    let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
+    bank1.fill_bank_with_ticks_for_tests();
+    bank1.freeze();
+    let bank1 = bank_forks
+        .write()
+        .unwrap()
+        .insert(bank1)
+        .clone_without_scheduler();
+    progress.insert(1, ForkProgress::new(bank1.last_blockhash(), 0, 0, None));
+    assert!(!bank1.is_block_commitment_root_active());
+    assert_eq!(bank1.block_id(), None);
+    let slot = 2;
+    let leader = leader_schedule_cache
+        .slot_leader_at(slot, Some(&bank1))
+        .unwrap();
+    assert_eq!(leader.id, my_pubkey);
+    let mut leader_bank = Bank::new_from_parent(bank1, leader, slot);
+    leader_bank.activate_feature(&agave_feature_set::block_commitment_root::id());
+    let leader_bank = leader_bank.mark_leader_bank();
+    blockstore_processor::set_alpenglow_ticks(
+        &leader_bank,
+        &bank_forks.read().unwrap().migration_status(),
+    );
+    let bank = bank_forks.write().unwrap().insert(leader_bank);
+    progress.insert(slot, ForkProgress::new(bank.last_blockhash(), 0, 0, None));
+    bank.fill_bank_with_ticks_for_tests();
+    assert!(bank.is_complete());
+    assert!(!bank.is_frozen());
+
+    let context = ProcessActiveBanksContext::new_for_tests(bank_forks.clone(), blockstore.clone());
+    let leader_replay_result = || ReplaySlotFromBlockstore {
+        is_slot_dead: false,
+        bank_slot: slot,
+        replay_result: None,
+    };
+    let new_frozen_slots = ReplayStage::process_replay_results(
+        &context,
+        &mut progress,
+        &mut Vec::new(),
+        &[leader_replay_result()],
+        &my_pubkey,
+    )
+    .unwrap();
+
+    let expected_failure = CommitmentFailure::MissingParentBlockId { parent_slot: 1 };
+    assert!(bank.is_frozen());
+    assert_eq!(bank.commitment_failure(), Some(expected_failure));
+    assert!(new_frozen_slots.is_empty());
+    assert_eq!(
+        progress.get(&slot).unwrap().dead_reason,
+        Some(DeadSlotReason::Hard)
+    );
+    assert!(blockstore.is_dead(slot));
+    assert!(bank_forks.read().unwrap().get(slot).is_some());
+
+    // The block creation loop aborts the slot.
+    let (drop_bank_sender, _drop_bank_receiver) = bounded(1024);
+    let (votor_commitment_sender, _votor_commitment_receiver) = bounded(1024);
+    let bank_forks_context = ProcessBankForksContext {
+        bank_forks: bank_forks.clone(),
+        blockstore: blockstore.clone(),
+        snapshot_controller: None,
+        bank_notification_sender: None,
+        transaction_status_sender: None,
+        rpc_subscriptions: None,
+        drop_bank_sender,
+        leader_schedule_cache,
+        votor_commitment_sender,
+    };
+    let (response_sender, response_receiver) = bounded(1);
+    drop(bank);
+    ReplayStage::process_bank_forks_command(
+        BankForksCommand::ClearBank {
+            slot,
+            response_sender,
+        },
+        &bank_forks_context,
+        &mut progress,
+        &mut Vec::new(),
+    );
+    response_receiver.try_recv().unwrap();
+    assert!(bank_forks.read().unwrap().get(slot).is_none());
+    assert!(!progress.contains_key(&slot));
+    assert!(blockstore.is_dead(slot));
+
+    // A replay result for the cleared slot is ignored, not handled twice.
+    let new_frozen_slots = ReplayStage::process_replay_results(
+        &context,
+        &mut progress,
+        &mut Vec::new(),
+        &[leader_replay_result()],
+        &my_pubkey,
+    )
+    .unwrap();
+    assert!(new_frozen_slots.is_empty());
+    assert!(!progress.contains_key(&slot));
+    assert!(bank_forks.read().unwrap().get(slot).is_none());
 }
