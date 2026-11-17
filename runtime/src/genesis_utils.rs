@@ -53,10 +53,12 @@ use {
 /// by the tests that exercise it (see `activate_feature`).
 /// `transaction_receipt_tree` fills slot 1 of that commitment and follows it.
 /// `accounts_delta_root` fills slot 2 of that commitment and follows it.
+/// `epoch_validator_set_root` fills slot 3 of that commitment and follows it.
 pub const FEATURES_INACTIVE_IN_TEST_GENESIS: &[Pubkey] = &[
     agave_feature_set::block_commitment_root::ID,
     agave_feature_set::transaction_receipt_tree::ID,
     agave_feature_set::accounts_delta_root::ID,
+    agave_feature_set::epoch_validator_set_root::ID,
 ];
 
 /// `FeatureSet::all_enabled()` minus [`FEATURES_INACTIVE_IN_TEST_GENESIS`].
