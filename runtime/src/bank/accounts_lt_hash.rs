@@ -1364,6 +1364,8 @@ mod tests {
         for _ in 0..9 {
             let slot = bank.slot() + 1;
             let leader = *bank.leader();
+            // A child's block history leaf needs its parent's block id.
+            bank.set_block_id(Some(BlockId::new_unique()));
             bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, leader, slot);
             for _ in 0..3 {
                 bank.register_unique_recent_blockhash_for_test();
@@ -1390,6 +1392,8 @@ mod tests {
         for i in 0..num_accounts {
             let slot = bank.slot() + 1;
             let leader = *bank.leader();
+            // A child's block history leaf needs its parent's block id.
+            bank.set_block_id(Some(BlockId::new_unique()));
             bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, leader, slot);
             bank.register_unique_recent_blockhash_for_test();
 
@@ -1478,6 +1482,8 @@ mod tests {
         for _ in 0..3 {
             let slot = bank.slot() + 1;
             let leader = *bank.leader();
+            // A child's block history leaf needs its parent's block id.
+            bank.set_block_id(Some(BlockId::new_unique()));
             bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, leader, slot);
             bank.register_unique_recent_blockhash_for_test();
             bank.transfer(amount, &mint_keypair, &pubkey::new_rand())
