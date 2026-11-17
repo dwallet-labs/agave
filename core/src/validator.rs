@@ -1075,7 +1075,10 @@ impl Validator {
                 exit.clone(),
             )
         };
-        let (record_sender, record_receiver) = record_channels(transaction_status_sender.is_some());
+        // Transaction indexes are always tracked: besides transaction status,
+        // they place the receipts of the leader's transactions in block order
+        // (Transaction Receipt Tree, see `Committer::commit_transactions`).
+        let (record_sender, record_receiver) = record_channels(true);
         let transaction_recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
         let (bank_forks_controller, bank_forks_controller_receiver) =

@@ -278,6 +278,7 @@ fn new_executed_processing_result(
                 return_data: None,
                 executed_units: 0,
                 accounts_deltas,
+                receipt_roots: None,
             },
             programs_modified_by_tx: HashMap::new(),
         },
@@ -2333,6 +2334,7 @@ fn test_status_cache_ignores_nonce(case: NonceTestCase, separate_nonce: bool) {
         std::slice::from_ref(&tx),
         vec![result],
         &ProcessedTransactionCounts::default(),
+        ReceiptOrder::CommitOrder,
         &mut ExecuteTimings::default(),
     );
 
@@ -8914,6 +8916,7 @@ fn test_collect_transaction_logs() {
             accounts_resize_delta: 0,
             accounts_uninitialized_size: 0,
         }),
+        receipt_roots: None,
     };
 
     let transaction = RuntimeTransaction::<SanitizedTransaction>::try_create(

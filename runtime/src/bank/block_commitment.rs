@@ -263,13 +263,12 @@ impl Bank {
         CommitmentVector(vector)
     }
 
-    /// Commitment slot 1: `receipts_root` (Transaction Receipt Tree SIMD).
-    ///
-    /// Extension point: not implemented yet, so the slot is inactive and
-    /// zero. The implementation must return [`INACTIVE_COMMITMENT_SLOT`]
-    /// unless its own feature is active for this bank.
-    pub fn commitment_slot_receipts_root(&self, _inputs: &CommitmentInputs) -> Hash {
-        INACTIVE_COMMITMENT_SLOT
+    /// Commitment slot 1: `receipts_root` (Transaction Receipt Tree SIMD),
+    /// [`INACTIVE_COMMITMENT_SLOT`] unless the `transaction_receipt_tree`
+    /// feature is active for this bank. See `bank::transaction_receipts`.
+    pub fn commitment_slot_receipts_root(&self, inputs: &CommitmentInputs) -> Hash {
+        self.receipts_root_for_commitment(inputs.parent)
+            .unwrap_or(INACTIVE_COMMITMENT_SLOT)
     }
 
     /// Commitment slot 2: `accounts_delta_root` (Accounts Delta Root SIMD).

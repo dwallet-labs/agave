@@ -89,6 +89,7 @@ solana-instruction-error = { workspace = true }
 solana-instructions-sysvar = { workspace = true }
 solana-loader-v3-interface = { workspace = true, features = ["wincode"] }
 solana-loader-v4-interface = { workspace = true }
+solana-merkle-tree = { workspace = true }
 solana-message = { workspace = true }
 solana-nonce = { workspace = true, features = ["wincode"] }
 solana-nonce-account = { workspace = true, features = ["wincode"] }

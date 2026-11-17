@@ -19,8 +19,9 @@ use {
             AccountsDeltas, ExecutedTransaction, TransactionExecutionDetails,
         },
         transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
+        transaction_receipt::compute_receipt_roots,
     },
-    log::debug,
+    log::{debug, error},
     solana_account::{AccountSharedData, ReadableAccount, state_traits::StateMutWincode as _},
     solana_clock::{Epoch, Slot},
     solana_hash::Hash,
@@ -170,6 +171,14 @@ pub struct TransactionProcessingConfig<'a> {
     ///
     /// This is a leader-side filtering policy. It must not be enabled for replay.
     pub drop_bail_out_transactions: bool,
+    /// Record the events emitted by the logging syscalls and compute the
+    /// `instruction_trace_root` and `events_root` of every successful
+    /// transaction (Transaction Receipt Tree SIMD), returned in
+    /// [`TransactionExecutionDetails::receipt_roots`].
+    ///
+    /// This is consensus-relevant: the bank sets it from its feature set, and
+    /// it must be the same for block production and replay.
+    pub compute_receipt_roots: bool,
 }
 
 /// Runtime environment for transaction batch processing.
@@ -1172,6 +1181,9 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             compute_budget,
             self.execution_cost,
         );
+        if config.compute_receipt_roots {
+            invoke_context.enable_event_recording();
+        }
 
         let mut process_message_time = Measure::start("process_message_time");
         let process_result = invoke_context
@@ -1179,6 +1191,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             .map_err(|(index, err)| TransactionError::InstructionError(index, err));
         process_message_time.stop();
 
+        let recorded_events = invoke_context.take_recorded_events();
         drop(invoke_context);
 
         execute_timings.execute_accessories.process_message_us += process_message_time.as_us();
@@ -1218,6 +1231,21 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             log_collector.and_then(|log_collector| {
                 Rc::try_unwrap(log_collector)
                     .map(|log_collector| log_collector.into_inner().into_messages())
+                    .ok()
+            });
+
+        // The trace is consumed below, so the receipt roots are computed now
+        // and kept only if the transaction still succeeds after the final
+        // balance check.
+        let receipt_roots = recorded_events
+            .filter(|_| post_account_state_info_result.is_ok())
+            .and_then(|recorded_events| {
+                compute_receipt_roots(&transaction_context, recorded_events)
+                    .inspect_err(|err| {
+                        // Unreachable: the trace of a successful transaction is
+                        // always consistent. The bank reports a missing root.
+                        error!("failed to compute transaction receipt roots: {err}");
+                    })
                     .ok()
             });
 
@@ -1280,6 +1308,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             None
         };
 
+        let receipt_roots = receipt_roots.filter(|_| status.is_ok());
+
         ExecutedTransaction {
             execution_details: TransactionExecutionDetails {
                 status,
@@ -1288,6 +1318,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 return_data,
                 executed_units,
                 accounts_deltas,
+                receipt_roots,
             },
             loaded_transaction,
             programs_modified_by_tx: program_cache_for_tx_batch.drain_modified_entries(),
