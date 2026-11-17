@@ -97,6 +97,7 @@ fn is_update_parent_recoverable_replay_error(err: &BlockstoreProcessorError) -> 
         | BlockstoreProcessorError::FailedToPurgeTransactionHistory(..)
         | BlockstoreProcessorError::BankHashMismatch(..)
         | BlockstoreProcessorError::CommitmentRootMismatch(..)
+        | BlockstoreProcessorError::CommitmentFailure(..)
         | BlockstoreProcessorError::RootBankWithMismatchedCapitalization(_) => false,
     }
 }

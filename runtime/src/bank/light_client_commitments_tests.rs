@@ -278,7 +278,7 @@ fn check_commitment(bank: &Bank, transactions: Option<&BlockTransactions>) -> Co
             block_history: &commitment.block_history,
             parent: parent.as_deref(),
         }),
-        vector
+        Ok(vector)
     );
     assert_eq!(vector.root(), commitment_root);
 
