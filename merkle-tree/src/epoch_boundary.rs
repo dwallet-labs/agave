@@ -15,9 +15,11 @@
 //! ```
 //!
 //! `history_len(F)` is the number of leaves in the block history tree of
-//! `F`; `P`'s history leaf is the last of them. `P.commitment_root` is 32 zero
-//! bytes if `P` has none (Block Commitment Root not active for `P`), in which
-//! case `history_len(F)` is 0.
+//! `F`; `P`'s history leaf is the last of them, at index
+//! `history_len(F) - 1`. `P.commitment_root` is 32 zero bytes if `P` predates
+//! Block Commitment Root, in which case `history_len(F)` is 1: the history of
+//! `F` is the anchor leaf of `P` alone (`P`'s leaf with a zero commitment
+//! root), at index 0.
 
 use {
     crate::commitment_tree::EPOCH_BOUNDARY_PREFIX, solana_hash::Hash, solana_sha256_hasher::hashv,
@@ -35,7 +37,8 @@ pub struct EpochBoundary {
     pub parent_slot: u64,
     /// `P.block_id`.
     pub parent_block_id: Hash,
-    /// `P.commitment_root`, or 32 zero bytes if `P` has none.
+    /// `P.commitment_root`, or 32 zero bytes if `P` predates Block Commitment
+    /// Root.
     pub parent_commitment_root: Hash,
     /// `history_len(F)`: number of leaves in the block history tree of `F`.
     pub history_len: u64,
@@ -55,7 +58,9 @@ impl EpochBoundary {
         ])
     }
 
-    /// Index of `P`'s leaf in the block history tree, if `P` has one.
+    /// Index of `P`'s leaf in the block history tree of `F` (the anchor leaf,
+    /// at index 0, if `P` predates Block Commitment Root). `None` only for a
+    /// value with `history_len` 0, which no block with a parent has.
     pub fn parent_history_index(&self) -> Option<u64> {
         self.history_len.checked_sub(1)
     }
@@ -63,8 +68,9 @@ impl EpochBoundary {
     /// Number of blocks of a chain from `F` of `self` (inclusive) to `F` of
     /// `next` (exclusive), i.e. the blocks of `self.epoch` and of any empty
     /// epochs up to `next.epoch`, when both are taken from the same chain
-    /// with Block Commitment Root active since before `self`'s `F`. `None`
-    /// if `next` is not later.
+    /// with Block Commitment Root active at or before `self`'s `F` (if it
+    /// activated at that boundary, the anchor leaf of `self`'s `P` counts in
+    /// both). `None` if `next` is not later.
     pub fn blocks_until(&self, next: &EpochBoundary) -> Option<u64> {
         if next.epoch <= self.epoch {
             return None;
@@ -99,14 +105,26 @@ mod tests {
         );
         assert_eq!(boundary.parent_history_index(), Some(1233));
 
-        // P without a commitment root.
+        // P predating Block Commitment Root: zero commitment root, and the
+        // history of F is P's anchor leaf alone.
         let boundary = EpochBoundary {
             epoch: 1,
             first_slot: 32,
             parent_slot: 0,
             parent_block_id: Hash::new_from_array([0x33; 32]),
             parent_commitment_root: Hash::default(),
+            history_len: 1,
+        };
+        assert_eq!(
+            boundary.hash(),
+            hash_from_hex("58cfe62e7b103fe269adbe705f86b151b424ccf68096cfa093a2a0413cdcdaf1")
+        );
+        assert_eq!(boundary.parent_history_index(), Some(0));
+
+        // A value without history leaves (no block with a parent has one).
+        let boundary = EpochBoundary {
             history_len: 0,
+            ..boundary
         };
         assert_eq!(
             boundary.hash(),
