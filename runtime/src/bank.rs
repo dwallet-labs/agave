@@ -2414,7 +2414,7 @@ impl Bank {
             versioned_epoch_stakes: self.epoch_stakes.clone(),
             accounts_lt_hash: self.accounts_lt_hash.lock().unwrap().clone(),
             block_id: self.block_id().expect("block id must be set"),
-            block_commitment: self.block_commitment(),
+            block_commitment: self.block_commitment_for_snapshot(),
         }
     }
 
