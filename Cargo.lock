@@ -553,6 +553,7 @@ name = "agave-votor"
 version = "5.0.0-alpha.0"
 dependencies = [
  "agave-bls-sigverify",
+ "agave-feature-set",
  "agave-logger",
  "agave-math-utils",
  "agave-votor",

@@ -107,10 +107,31 @@ pub fn history_leaf(slot: Slot, block_id: &Hash, commitment_root: &Hash) -> [u8;
     leaf
 }
 
+/// `anchor_leaf = u64_le(parent.slot) || parent.block_id || 32 zero bytes`:
+/// the history leaf of the last block before activation, which has no
+/// commitment root.
+pub fn anchor_leaf(slot: Slot, block_id: &Hash) -> [u8; HISTORY_LEAF_LEN] {
+    history_leaf(slot, block_id, &Hash::default())
+}
+
+/// `H(B)` of the first block `B` with the feature active: the anchor leaf of
+/// its parent alone.
+pub fn anchor_block_history(parent_slot: Slot, parent_block_id: &Hash) -> AppendOnlyFrontier {
+    let mut history = AppendOnlyFrontier::new();
+    history
+        .append(
+            TreeId::BLOCK_HISTORY,
+            &anchor_leaf(parent_slot, parent_block_id),
+        )
+        .expect("an empty block history has room for one leaf");
+    history
+}
+
 /// Block commitment state of a frozen bank `B` (or of a snapshot bank).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockCommitment {
-    /// Frontier of `H(B)`: the history leaves of all ancestors of `B` for
+    /// Frontier of `H(B)`: the anchor leaf of the last block before
+    /// activation, followed by the history leaves of all ancestors of `B` for
     /// which the feature was active, oldest first. `B` itself is not in it.
     pub block_history: AppendOnlyFrontier,
     /// `commitment_root` of `B`.
@@ -164,6 +185,11 @@ pub enum CommitmentFailure {
     /// its own, so `H(B)` is unknown.
     #[error("parent {parent_slot} has a commitment failure")]
     ParentCommitmentFailure { parent_slot: Slot },
+    /// Slot 0: the parent has the feature active but neither block commitment
+    /// state nor a recorded failure (for example a bank restored from a
+    /// snapshot written before the field existed), so `H(B)` is unknown.
+    #[error("parent {parent_slot} has the feature active but no block commitment state")]
+    MissingParentCommitment { parent_slot: Slot },
     /// Slot 4: this bank is the first of its epoch and its parent has no
     /// block id, so the epoch boundary cannot be computed.
     #[error("parent {parent_slot} has no block id for the epoch boundary")]
@@ -176,6 +202,7 @@ impl CommitmentFailure {
         match self {
             Self::MissingParentBlockId { .. } => "missing_parent_block_id",
             Self::ParentCommitmentFailure { .. } => "parent_commitment_failure",
+            Self::MissingParentCommitment { .. } => "missing_parent_commitment",
             Self::EpochBoundaryMissingParentBlockId { .. } => {
                 "epoch_boundary_missing_parent_block_id"
             }
@@ -326,9 +353,17 @@ impl Bank {
         })
     }
 
-    /// `H(B)` for this bank `B`: `H(parent)` with `history_leaf(parent)`
-    /// appended if the feature was active for the parent, empty otherwise
-    /// (first block with the feature active, or no parent).
+    /// `H(B)` for this bank `B`:
+    ///
+    /// - no parent (genesis): empty;
+    /// - parent with the feature inactive (first block with the feature
+    ///   active): the anchor leaf of the parent alone;
+    /// - otherwise `H(parent)` with `history_leaf(parent)` appended.
+    ///
+    /// The parent's block id is required in both cases that have a parent. A
+    /// parent with the feature active must have block commitment state; a
+    /// parent with a commitment failure, or with neither state nor failure,
+    /// leaves `H(B)` unknown.
     fn block_history_for_commitment(
         &self,
         parent: Option<&Bank>,
@@ -336,25 +371,35 @@ impl Bank {
         let Some(parent) = parent else {
             return Ok(AppendOnlyFrontier::new());
         };
-        let Some(parent_commitment) = parent.block_commitment() else {
+        let parent_slot = parent.slot();
+        let parent_commitment = if parent.is_block_commitment_root_active() {
             if parent.commitment_failure().is_some() {
-                return Err(CommitmentFailure::ParentCommitmentFailure {
-                    parent_slot: parent.slot(),
-                });
+                return Err(CommitmentFailure::ParentCommitmentFailure { parent_slot });
             }
-            return Ok(AppendOnlyFrontier::new());
+            Some(
+                parent
+                    .block_commitment()
+                    .ok_or(CommitmentFailure::MissingParentCommitment { parent_slot })?,
+            )
+        } else {
+            None
         };
         // Every frozen bank that a child is built on has a block id in a
         // running validator: replayed banks get it from the blockstore before
         // freezing, leader banks from broadcast once the last shred is made,
-        // snapshot banks from the snapshot. Without it the history leaf, and
-        // so this bank's commitment root, cannot be computed.
+        // snapshot banks from the snapshot. Without it the history leaf (or
+        // the anchor leaf), and so this bank's commitment root, cannot be
+        // computed.
         let parent_block_id = parent
             .block_id()
-            .ok_or(CommitmentFailure::MissingParentBlockId {
-                parent_slot: parent.slot(),
-            })?;
-        Ok(parent_commitment.child_block_history(parent.slot(), &parent_block_id.to_hash()))
+            .ok_or(CommitmentFailure::MissingParentBlockId { parent_slot })?
+            .to_hash();
+        Ok(match parent_commitment {
+            Some(parent_commitment) => {
+                parent_commitment.child_block_history(parent_slot, &parent_block_id)
+            }
+            None => anchor_block_history(parent_slot, &parent_block_id),
+        })
     }
 
     /// Computes the commitment vector of this bank from its inputs.
@@ -536,7 +581,7 @@ pub(crate) mod tests {
         assert!(bank0.is_block_commitment_root_active());
         let block_id0 = freeze_with_block_id(&bank0);
         let commitment0 = bank0.block_commitment().unwrap();
-        // First block with the feature active: empty history.
+        // A block with no parent (genesis) has an empty history.
         assert_eq!(commitment0.block_history.leaf_count(), 0);
         let expected_vector0 = CommitmentVector({
             let mut v = [INACTIVE_COMMITMENT_SLOT; COMMITMENT_VECTOR_LEN];
@@ -594,15 +639,96 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_parent_without_feature_starts_empty_history() {
+    fn test_first_active_block_has_anchor_leaf() {
         let bank0 = new_bank(false);
-        freeze_with_block_id(&bank0);
+        let block_id0 = freeze_with_block_id(&bank0);
+        assert_eq!(bank0.block_commitment(), None);
+        let mut bank1 = Bank::new_from_parent(bank0.clone(), SlotLeader::default(), 1);
+        bank1.activate_feature(&feature_set::block_commitment_root::id());
+        let bank1 = Arc::new(bank1);
+        let block_id1 = freeze_with_block_id(&bank1);
+        let commitment1 = bank1.block_commitment().unwrap();
+
+        // H(bank1) is exactly the anchor leaf of bank0: its history leaf
+        // with a zero commitment root.
+        let mut anchor = [0u8; HISTORY_LEAF_LEN];
+        anchor[..8].copy_from_slice(&0u64.to_le_bytes());
+        anchor[8..40].copy_from_slice(block_id0.as_ref());
+        assert_eq!(anchor_leaf(0, &block_id0), anchor);
+        assert_eq!(commitment1.block_history.leaf_count(), 1);
+        assert_eq!(
+            commitment1.block_history_root(),
+            compute_root(TreeId::BLOCK_HISTORY, &[anchor])
+        );
+        let mut vector1 = [INACTIVE_COMMITMENT_SLOT; COMMITMENT_VECTOR_LEN];
+        vector1[0] = compute_root(TreeId::BLOCK_HISTORY, &[anchor]);
+        assert_eq!(
+            bank1.commitment_root(),
+            Some(CommitmentVector(vector1).root())
+        );
+
+        // The next block appends bank1's leaf after the anchor leaf, which
+        // stays at index 0.
+        let bank2 = new_child(&bank1, 2);
+        freeze_with_block_id(&bank2);
+        let leaves = [
+            anchor,
+            history_leaf(1, &block_id1, &commitment1.commitment_root),
+        ];
+        let commitment2 = bank2.block_commitment().unwrap();
+        assert_eq!(commitment2.block_history.leaf_count(), 2);
+        assert_eq!(
+            commitment2.block_history_root(),
+            compute_root(TreeId::BLOCK_HISTORY, &leaves)
+        );
+        let proof = make_inclusion_proof(TreeId::BLOCK_HISTORY, &leaves, 0).unwrap();
+        assert!(proof.verify(
+            TreeId::BLOCK_HISTORY,
+            &anchor,
+            &commitment2.block_history_root()
+        ));
+    }
+
+    #[test]
+    fn test_first_active_block_without_parent_block_id_is_commitment_failure() {
+        let bank0 = new_bank(false);
+        goto_end_of_slot(bank0.clone());
+        bank0.freeze();
+        // The parent predates the feature and has no block id, so the anchor
+        // leaf cannot be computed.
+        assert_eq!(bank0.block_id(), None);
         let mut bank1 = Bank::new_from_parent(bank0.clone(), SlotLeader::default(), 1);
         bank1.activate_feature(&feature_set::block_commitment_root::id());
         let bank1 = Arc::new(bank1);
         freeze_with_block_id(&bank1);
-        let commitment1 = bank1.block_commitment().unwrap();
-        assert_eq!(commitment1.block_history.leaf_count(), 0);
+        assert_commitment_failure(
+            &bank1,
+            CommitmentFailure::MissingParentBlockId { parent_slot: 0 },
+        );
+    }
+
+    #[test]
+    fn test_active_parent_without_commitment_state_is_commitment_failure() {
+        let bank0 = new_bank(true);
+        freeze_with_block_id(&bank0);
+        // A bank with the feature active but neither block commitment state
+        // nor a recorded failure, as one restored from a snapshot written
+        // before the field existed. Its child must not restart the history.
+        *bank0.block_commitment.write().unwrap() = None;
+        assert_eq!(bank0.commitment_failure(), None);
+        let bank1 = new_child(&bank0, 1);
+        freeze_with_block_id(&bank1);
+        assert_commitment_failure(
+            &bank1,
+            CommitmentFailure::MissingParentCommitment { parent_slot: 0 },
+        );
+        // And the failure propagates.
+        let bank2 = new_child(&bank1, 2);
+        freeze_with_block_id(&bank2);
+        assert_commitment_failure(
+            &bank2,
+            CommitmentFailure::ParentCommitmentFailure { parent_slot: 1 },
+        );
     }
 
     #[test]
