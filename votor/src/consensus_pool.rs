@@ -24,6 +24,7 @@ use {
     log::trace,
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
+    solana_rpc::light_client_proofs::LightClientProofStore,
     solana_runtime::{
         bank::Bank, epoch_stakes::BLSPubkeyToRankMap,
         validated_block_finalization::ValidatedBlockFinalizationCert,
@@ -90,6 +91,9 @@ pub(crate) struct ConsensusPool {
     pending_safe_to_notar: Vec<Block>,
     /// The slot at which the state was last pruned.
     last_pruned_slot: Slot,
+    /// Light-client proof store to give every completed certificate to, on
+    /// nodes that serve light-client proofs.
+    light_client_proofs: Option<Arc<LightClientProofStore>>,
 }
 
 impl ConsensusPool {
@@ -115,7 +119,17 @@ impl ConsensusPool {
             generated_cert_types,
             pending_safe_to_notar: vec![],
             last_pruned_slot: 0,
+            light_client_proofs: None,
         }
+    }
+
+    /// Gives every completed certificate to `light_client_proofs` as well.
+    pub(crate) fn with_light_client_proofs(
+        mut self,
+        light_client_proofs: Option<Arc<LightClientProofStore>>,
+    ) -> Self {
+        self.light_client_proofs = light_client_proofs;
+        self
     }
 
     fn update_vote_pool(
@@ -146,6 +160,9 @@ impl ConsensusPool {
         );
         self.completed_certificates
             .insert(cert.cert_type, cert.clone());
+        if let Some(light_client_proofs) = &self.light_client_proofs {
+            light_client_proofs.on_certificate(&cert);
+        }
         match cert.cert_type {
             CertificateType::NotarizeFallback(block) => {
                 events.push(VotorEvent::BlockNotarFallback(block));

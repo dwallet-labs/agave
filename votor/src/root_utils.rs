@@ -125,6 +125,14 @@ pub fn check_and_handle_new_root<CB>(
     let mut rooted_banks = root_bank.parents();
     let oldest_parent = rooted_banks.last().map(|last| last.parent_slot());
     rooted_banks.push(root_bank.clone());
+    // Light-client proofs: the data of every newly rooted bank, taken while
+    // the banks are alive. Only on nodes that serve the proofs.
+    if let Some(light_client_proofs) = bank_notification_sender
+        .as_ref()
+        .and_then(|config| config.light_client_proofs.as_ref())
+    {
+        light_client_proofs.on_rooted_banks(&rooted_banks);
+    }
     let rooted_slots: Vec<_> = rooted_banks.iter().map(|bank| bank.slot()).collect();
     let rooted_slot_notifications = bank_notification_sender
         .as_ref()
