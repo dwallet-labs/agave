@@ -959,3 +959,5 @@ fn test_all_light_client_commitments_inactive() {
         assert_eq!(fields.accounts_state, None);
     }
 }
+
+mod activation_order;

@@ -1092,6 +1092,47 @@ mod tests {
         );
     }
 
+    /// The companion features of Block Commitment Root, active without it,
+    /// do not change the footer: V1 is accepted and V2 rejected, as with no
+    /// feature active.
+    #[test]
+    fn test_footer_version_with_companions_only() {
+        let mut genesis_config_info = create_genesis_config(10_000);
+        for feature_id in [
+            agave_feature_set::transaction_receipt_tree::id(),
+            agave_feature_set::accounts_delta_root::id(),
+            agave_feature_set::epoch_validator_set_root::id(),
+            agave_feature_set::epoch_boundary_commitment::id(),
+            agave_feature_set::accounts_state_root::id(),
+        ] {
+            crate::genesis_utils::activate_feature(
+                &mut genesis_config_info.genesis_config,
+                feature_id,
+            );
+        }
+        let (parent, bank_forks) =
+            Bank::new_with_bank_forks_for_tests(&genesis_config_info.genesis_config);
+        assert!(!parent.is_block_commitment_root_active());
+        parent.set_block_id(Some(BlockId::new_unique()));
+        let bank = create_child_bank(&bank_forks, &parent, 1);
+        let v2 = VersionedBlockFooter::new_for_feature(footer_v1_for(&parent), true);
+        assert_matches!(
+            process_footer(parent.clone(), &bank, v2),
+            Err(BlockComponentProcessorError::InvalidBlockFooterVersion {
+                expected: 1,
+                actual: 2
+            })
+        );
+        let v1 = VersionedBlockFooter::new_for_feature(footer_v1_for(&parent), false);
+        process_footer(parent, &bank, v1).unwrap();
+        assert_eq!(bank.expected_commitment_root(), None);
+        bank.fill_bank_with_ticks_for_tests();
+        bank.freeze();
+        assert_eq!(bank.commitment_root(), None);
+        assert_eq!(bank.commitment_failure(), None);
+        assert_eq!(bank.verify_commitment_root(), Ok(()));
+    }
+
     #[test]
     fn test_on_footer_sets_timestamp() {
         let my_pubkey = Pubkey::new_unique();

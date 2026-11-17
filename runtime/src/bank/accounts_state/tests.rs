@@ -824,9 +824,24 @@ fn test_inactive_feature() {
     }
     assert!(parent.accounts_state_bases.cells.lock().unwrap().is_empty());
 
+    // State held while the feature is not in effect (which only a test can
+    // produce) is not written to a snapshot.
+    let mut genesis_config = genesis_config;
+    let (state_genesis, _) = genesis(
+        EpochSchedule::custom(SLOTS_PER_EPOCH, SLOTS_PER_EPOCH, false),
+        Some(true),
+    );
+    let mut bank0 = Bank::new_for_tests(&state_genesis);
+    bank0.freeze();
+    bank0.set_block_id(Some(block_id_of(0)));
+    assert!(bank0.accounts_state_for_snapshot().is_some());
+    bank0.deactivate_feature(&feature_set::accounts_delta_root::id());
+    assert!(bank0.accounts_state().is_some());
+    assert!(bank0.accounts_state_for_snapshot().is_none());
+    assert_eq!(bank0.get_fields_to_serialize().accounts_state, None);
+
     // The accounts state feature alone, without accounts_delta_root, does
     // nothing either.
-    let mut genesis_config = genesis_config;
     activate_feature(&mut genesis_config, feature_set::accounts_state_root::id());
     genesis_config
         .accounts
