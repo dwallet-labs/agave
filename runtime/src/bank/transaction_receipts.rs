@@ -38,9 +38,8 @@
 //! zero or be contiguous.
 
 use {
-    super::Bank,
+    super::{Bank, block_commitment::CommitmentFailure},
     agave_feature_set as feature_set,
-    log::*,
     solana_hash::Hash,
     solana_merkle_tree::{
         commitment_tree::{InclusionProof, make_inclusion_proof_from_leaf_hashes},
@@ -60,75 +59,127 @@ use {
 pub enum ReceiptOrder<'a> {
     /// `positions[i]` is the position in the block of transaction `i` of
     /// the batch. Entries of transactions that are not committed are
-    /// ignored. Used by replay and block production.
+    /// ignored. Used by replay and block production. A committed transaction
+    /// without an entry is a commitment failure.
     BlockPositions(&'a [usize]),
     /// Receipts are appended in commit order. Only sound when a single caller
-    /// commits all transactions of the bank sequentially and never mixes this
-    /// with [`Self::BlockPositions`] (tests, tools that execute transactions
-    /// directly against a bank).
+    /// commits all transactions of the bank sequentially (tests, tools that
+    /// execute transactions directly against a bank). Mixing it with
+    /// [`Self::BlockPositions`] in one bank is a commitment failure, since
+    /// the positions could collide.
     CommitOrder,
+    /// The caller does not know where the batch's transactions are in the
+    /// block: block production when the record channel does not give a
+    /// transaction index (the validator always enables it). Committing a
+    /// transaction this way is a commitment failure.
+    Unknown,
 }
 
-/// Receipts committed to a bank so far, as `(position, leaf hash)`.
+/// Receipts committed to a bank so far.
 #[derive(Debug, Default)]
 pub(crate) struct ReceiptAccumulator {
-    entries: Mutex<Vec<(u64, Hash)>>,
+    state: Mutex<ReceiptAccumulatorState>,
+}
+
+#[derive(Debug, Default)]
+struct ReceiptAccumulatorState {
+    /// `(position, leaf hash)` of every receipt.
+    entries: Vec<(u64, Hash)>,
+    /// Whether a batch was committed with [`ReceiptOrder::BlockPositions`].
+    uses_block_positions: bool,
+    /// Whether a batch was committed with [`ReceiptOrder::CommitOrder`].
+    uses_commit_order: bool,
+    /// The first reason the receipts cannot be put in block order.
+    failure: Option<CommitmentFailure>,
+}
+
+impl ReceiptAccumulatorState {
+    fn fail(&mut self, failure: CommitmentFailure) {
+        self.failure.get_or_insert(failure);
+    }
 }
 
 impl ReceiptAccumulator {
-    fn push(&self, order: ReceiptOrder, receipts: impl Iterator<Item = (usize, Hash)>) {
-        let mut entries = self.entries.lock().unwrap();
+    /// Adds the receipts of a batch, `(index in the batch, leaf hash)`, or
+    /// the failure to compute one of them.
+    fn push(
+        &self,
+        order: ReceiptOrder,
+        receipts: impl Iterator<Item = Result<(usize, Hash), CommitmentFailure>>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let state = &mut *state;
+        let mut num_receipts = 0usize;
+        for receipt in receipts {
+            let (index_in_batch, leaf_hash) = match receipt {
+                Ok(receipt) => receipt,
+                Err(failure) => {
+                    state.fail(failure);
+                    continue;
+                }
+            };
+            num_receipts = num_receipts.saturating_add(1);
+            let position = match order {
+                ReceiptOrder::BlockPositions(positions) => match positions.get(index_in_batch) {
+                    Some(&position) => position as u64,
+                    None => {
+                        state.fail(CommitmentFailure::MissingBlockPosition { index_in_batch });
+                        continue;
+                    }
+                },
+                ReceiptOrder::CommitOrder => state.entries.len() as u64,
+                ReceiptOrder::Unknown => continue,
+            };
+            state.entries.push((position, leaf_hash));
+        }
+        if num_receipts == 0 {
+            return;
+        }
         match order {
-            ReceiptOrder::BlockPositions(positions) => {
-                for (index_in_batch, leaf_hash) in receipts {
-                    let position = positions.get(index_in_batch).copied().unwrap_or_else(|| {
-                        // The caller passed fewer positions than committed
-                        // transactions. Sorting this receipt last keeps the
-                        // root deterministic; it will not match the cluster.
-                        error!("missing block position for committed transaction {index_in_batch}");
-                        usize::MAX
-                    });
-                    entries.push((position as u64, leaf_hash));
-                }
+            ReceiptOrder::BlockPositions(_) => state.uses_block_positions = true,
+            ReceiptOrder::CommitOrder => state.uses_commit_order = true,
+            ReceiptOrder::Unknown => {
+                state.fail(CommitmentFailure::UnknownReceiptOrder { num_receipts });
             }
-            ReceiptOrder::CommitOrder => {
-                for (_, leaf_hash) in receipts {
-                    let position = entries.len() as u64;
-                    entries.push((position, leaf_hash));
-                }
-            }
+        }
+        if state.uses_block_positions && state.uses_commit_order {
+            state.fail(CommitmentFailure::MixedReceiptOrder);
         }
     }
 
-    /// Leaf hashes in block order.
-    fn leaf_hashes_in_block_order(&self) -> Vec<Hash> {
-        let mut entries = self.entries.lock().unwrap().clone();
-        // The tie-break on the leaf hash only matters if two receipts claim
-        // the same position, which is a bug; it keeps the result independent
-        // of commit order even then.
-        entries.sort_unstable();
-        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            error!("two transaction receipts have the same position in the block");
+    /// Leaf hashes in block order, or why they cannot be put in block order.
+    fn leaf_hashes_in_block_order(&self) -> Result<Vec<Hash>, CommitmentFailure> {
+        let mut entries = {
+            let state = self.state.lock().unwrap();
+            if let Some(failure) = &state.failure {
+                return Err(failure.clone());
+            }
+            state.entries.clone()
+        };
+        entries.sort_unstable_by_key(|(position, _)| *position);
+        if let Some(pair) = entries.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(CommitmentFailure::DuplicateBlockPosition {
+                position: pair[0].0,
+            });
         }
-        entries
+        Ok(entries
             .into_iter()
             .map(|(_, leaf_hash)| leaf_hash)
-            .collect()
-    }
-
-    fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+            .collect())
     }
 }
 
 /// The receipt of a processed transaction.
+///
+/// Fails if the transaction executed successfully but has no receipt roots,
+/// which the SVM always computes while the feature is active.
 pub fn transaction_receipt(
     transaction: &impl TransactionWithMeta,
     processed_transaction: &ProcessedTransaction,
-) -> TransactionReceipt {
+) -> Result<TransactionReceipt, CommitmentFailure> {
     let signature = (*transaction.signature()).into();
     let message_hash = *transaction.message_hash();
-    match processed_transaction {
+    Ok(match processed_transaction {
         ProcessedTransaction::Executed(executed_tx) => {
             let fee = executed_tx.loaded_transaction.fee_details.total_fee();
             let details = &executed_tx.execution_details;
@@ -147,18 +198,9 @@ pub fn transaction_receipt(
                     events_root,
                 ),
                 (Ok(()), None) => {
-                    // The bank always asks the SVM for the roots while the
-                    // feature is active, so this is unreachable. Report it
-                    // and still produce a deterministic receipt.
-                    error!(
-                        "successful transaction {} has no receipt roots",
-                        transaction.signature()
-                    );
-                    datapoint_error!(
-                        "bank-transaction_receipt_missing_roots",
-                        ("signature", transaction.signature().to_string(), String),
-                    );
-                    TransactionReceipt::failed(signature, message_hash, fee)
+                    return Err(CommitmentFailure::MissingReceiptRoots {
+                        signature: *transaction.signature(),
+                    });
                 }
                 (Err(_), _) => TransactionReceipt::failed(signature, message_hash, fee),
             }
@@ -170,7 +212,7 @@ pub fn transaction_receipt(
         ),
         // Recorded in the block, but charged nothing.
         ProcessedTransaction::NoOp(_) => TransactionReceipt::failed(signature, message_hash, 0),
-    }
+    })
 }
 
 impl Bank {
@@ -185,7 +227,8 @@ impl Bank {
 
     /// Adds the receipts of the processed transactions of a batch. Called
     /// from `commit_transactions`, so every committed transaction gets its
-    /// receipt.
+    /// receipt. A receipt that cannot be computed or placed in the block is
+    /// recorded as a commitment failure, reported when the bank is frozen.
     pub(super) fn accumulate_transaction_receipts(
         &self,
         transactions: &[impl TransactionWithMeta],
@@ -201,56 +244,63 @@ impl Bank {
             .enumerate()
             .filter_map(|(index_in_batch, (transaction, processing_result))| {
                 let processed_transaction = processing_result.as_ref().ok()?;
-                let receipt = transaction_receipt(transaction, processed_transaction);
-                Some((index_in_batch, receipt.leaf_hash()))
+                Some(
+                    transaction_receipt(transaction, processed_transaction)
+                        .map(|receipt| (index_in_batch, receipt.leaf_hash())),
+                )
             });
         self.transaction_receipts.push(order, receipts);
     }
 
-    /// Leaf hashes of the receipts committed so far, in block order.
-    pub fn transaction_receipt_leaf_hashes(&self) -> Vec<Hash> {
+    /// Leaf hashes of the receipts committed so far, in block order, or the
+    /// commitment failure that prevents putting them in block order.
+    pub fn transaction_receipt_leaf_hashes(&self) -> Result<Vec<Hash>, CommitmentFailure> {
         self.transaction_receipts.leaf_hashes_in_block_order()
     }
 
     /// `receipts_root` over the receipts committed so far, `None` while the
-    /// feature is inactive. On a frozen bank this is the value in slot 1 of
-    /// its commitment vector.
+    /// feature is inactive, and while the receipts cannot be put in block
+    /// order (see [`Self::transaction_receipt_leaf_hashes`]). On a frozen
+    /// bank with a commitment root this is the value in slot 1 of its
+    /// commitment vector.
     pub fn receipts_root(&self) -> Option<Hash> {
-        self.is_transaction_receipt_tree_active()
-            .then(|| receipts_root_from_leaf_hashes(&self.transaction_receipt_leaf_hashes()))
+        if !self.is_transaction_receipt_tree_active() {
+            return None;
+        }
+        let leaf_hashes = self.transaction_receipt_leaf_hashes().ok()?;
+        Some(receipts_root_from_leaf_hashes(&leaf_hashes))
     }
 
     /// Proof of the receipt at `index` (in block order) against
     /// [`Self::receipts_root`].
     pub fn transaction_receipt_inclusion_proof(&self, index: usize) -> Option<InclusionProof> {
-        make_inclusion_proof_from_leaf_hashes(&self.transaction_receipt_leaf_hashes(), index)
+        make_inclusion_proof_from_leaf_hashes(&self.transaction_receipt_leaf_hashes().ok()?, index)
     }
 
-    /// `receipts_root` for the commitment vector, checking that every
-    /// transaction committed to this bank has a receipt.
-    pub(super) fn receipts_root_for_commitment(&self, parent: Option<&Bank>) -> Option<Hash> {
+    /// `receipts_root` for the commitment vector (`None` while the feature is
+    /// inactive), checking that every transaction committed to this bank has
+    /// exactly one receipt and that the receipts are in block order.
+    pub(super) fn receipts_root_for_commitment(
+        &self,
+        parent: Option<&Bank>,
+    ) -> Result<Option<Hash>, CommitmentFailure> {
         if !self.is_transaction_receipt_tree_active() {
-            return None;
+            return Ok(None);
         }
+        let leaf_hashes = self.transaction_receipt_leaf_hashes()?;
         if let Some(parent) = parent {
             let committed = self
                 .transaction_count()
                 .saturating_sub(parent.transaction_count());
-            let receipts = self.transaction_receipts.len() as u64;
+            let receipts = leaf_hashes.len() as u64;
             if committed != receipts {
-                error!(
-                    "bank {} committed {committed} transactions but has {receipts} receipts",
-                    self.slot()
-                );
-                datapoint_error!(
-                    "bank-transaction_receipt_count_mismatch",
-                    ("slot", self.slot(), i64),
-                    ("committed", committed, i64),
-                    ("receipts", receipts, i64),
-                );
+                return Err(CommitmentFailure::ReceiptCountMismatch {
+                    committed,
+                    receipts,
+                });
             }
         }
-        self.receipts_root()
+        Ok(Some(receipts_root_from_leaf_hashes(&leaf_hashes)))
     }
 }
 
@@ -262,7 +312,7 @@ mod tests {
             bank::{
                 block_commitment::{
                     COMMITMENT_VECTOR_LEN, CommitmentSlot, CommitmentVector,
-                    INACTIVE_COMMITMENT_SLOT,
+                    INACTIVE_COMMITMENT_SLOT, tests::assert_commitment_failure,
                 },
                 test_utils::goto_end_of_slot,
             },
@@ -288,11 +338,15 @@ mod tests {
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sdk_ids::{bpf_loader_upgradeable, system_program},
         solana_signer::Signer,
-        solana_svm::transaction_processor::ExecutionRecordingConfig,
+        solana_svm::{
+            account_loader::LoadedTransaction,
+            transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+            transaction_processor::ExecutionRecordingConfig,
+        },
         solana_svm_timings::ExecuteTimings,
         solana_system_transaction as system_transaction,
         solana_transaction::Transaction,
-        std::sync::Arc,
+        std::{collections::HashMap, sync::Arc},
     };
 
     /// See `runtime/tests/fixtures/receipt_test_program/receipt_test_program.c`.
@@ -510,7 +564,10 @@ mod tests {
             TransactionReceipt::failed(signature_bytes(&fail_tx), message_hash(&fail_tx), fail_fee),
         ];
         let expected_leaves: Vec<_> = expected.iter().map(TransactionReceipt::leaf_hash).collect();
-        assert_eq!(bank.transaction_receipt_leaf_hashes(), expected_leaves);
+        assert_eq!(
+            bank.transaction_receipt_leaf_hashes().unwrap(),
+            expected_leaves
+        );
         // One receipt per committed transaction.
         assert_eq!(bank.executed_transaction_count(), 3);
         let expected_root = receipts_root(&expected);
@@ -611,7 +668,7 @@ mod tests {
                 events_root(&events),
             );
             assert_eq!(
-                bank.transaction_receipt_leaf_hashes()[1],
+                bank.transaction_receipt_leaf_hashes().unwrap()[1],
                 expected.leaf_hash(),
                 "log_messages_bytes_limit: {log_messages_bytes_limit:?}"
             );
@@ -645,7 +702,7 @@ mod tests {
         bank.transfer(1, &base_only.mint_keypair, &Pubkey::new_unique())
             .unwrap();
         assert_eq!(bank.receipts_root(), None);
-        assert!(bank.transaction_receipt_leaf_hashes().is_empty());
+        assert!(bank.transaction_receipt_leaf_hashes().unwrap().is_empty());
         freeze_with_block_id(&bank);
         let commitment = bank.block_commitment().unwrap();
         let mut vector = [INACTIVE_COMMITMENT_SLOT; COMMITMENT_VECTOR_LEN];
@@ -661,7 +718,7 @@ mod tests {
         assert!(!bank.is_transaction_receipt_tree_active());
         bank.transfer(1, &receipts_only.mint_keypair, &Pubkey::new_unique())
             .unwrap();
-        assert!(bank.transaction_receipt_leaf_hashes().is_empty());
+        assert!(bank.transaction_receipt_leaf_hashes().unwrap().is_empty());
         freeze_with_block_id(&bank);
         assert_eq!(bank.commitment_root(), None);
     }
@@ -722,6 +779,184 @@ mod tests {
                 .leaf_hash()
             })
             .collect();
-        assert_eq!(bank.transaction_receipt_leaf_hashes(), expected);
+        assert_eq!(bank.transaction_receipt_leaf_hashes().unwrap(), expected);
+    }
+    fn transfers(setup: &Setup, bank: &Bank, count: usize) -> Vec<Transaction> {
+        (0..count)
+            .map(|_| {
+                system_transaction::transfer(
+                    &setup.mint_keypair,
+                    &Pubkey::new_unique(),
+                    1_000_000,
+                    bank.last_blockhash(),
+                )
+            })
+            .collect()
+    }
+
+    /// Commits `txs` as one batch whose receipts are placed with `order`.
+    fn commit_batch(bank: &Bank, txs: Vec<Transaction>, order: ReceiptOrder) {
+        let batch = bank.prepare_batch_for_tests(txs);
+        let (commit_results, _) = bank
+            .load_execute_and_commit_transactions_with_pre_commit_callback(
+                &batch,
+                ExecutionRecordingConfig::new_single_setting(false),
+                &mut ExecuteTimings::default(),
+                None,
+                order,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(commit_results.iter().all(|result| result.is_ok()));
+    }
+
+    /// The receipts of `bank` cannot be put in block order because of
+    /// `failure`: no receipts root, and once frozen, no commitment root and a
+    /// failed verification with that reason.
+    fn assert_receipt_failure(bank: &Arc<Bank>, failure: CommitmentFailure) {
+        assert_eq!(bank.transaction_receipt_leaf_hashes(), Err(failure.clone()));
+        assert_eq!(bank.receipts_root(), None);
+        assert!(bank.transaction_receipt_inclusion_proof(0).is_none());
+        freeze_with_block_id(bank);
+        assert_commitment_failure(bank, failure);
+    }
+
+    #[test]
+    fn test_missing_block_position_is_commitment_failure() {
+        let setup = setup(true, true);
+        let bank = new_child(&setup.bank0);
+        // Two committed transactions, one position.
+        commit_batch(
+            &bank,
+            transfers(&setup, &bank, 2),
+            ReceiptOrder::BlockPositions(&[0]),
+        );
+        assert_receipt_failure(
+            &bank,
+            CommitmentFailure::MissingBlockPosition { index_in_batch: 1 },
+        );
+    }
+
+    #[test]
+    fn test_duplicate_block_position_is_commitment_failure() {
+        let setup = setup(true, true);
+        let bank = new_child(&setup.bank0);
+        for tx in transfers(&setup, &bank, 2) {
+            commit_batch(&bank, vec![tx], ReceiptOrder::BlockPositions(&[3]));
+        }
+        assert_receipt_failure(
+            &bank,
+            CommitmentFailure::DuplicateBlockPosition { position: 3 },
+        );
+    }
+
+    #[test]
+    fn test_mixed_receipt_order_is_commitment_failure() {
+        let setup = setup(true, true);
+        let bank = new_child(&setup.bank0);
+        // Block position 0, then a transaction in commit order, which would
+        // also get position 1 or less.
+        let mut txs = transfers(&setup, &bank, 2);
+        commit_batch(
+            &bank,
+            vec![txs.remove(0)],
+            ReceiptOrder::BlockPositions(&[0]),
+        );
+        commit_batch(&bank, txs, ReceiptOrder::CommitOrder);
+        assert_receipt_failure(&bank, CommitmentFailure::MixedReceiptOrder);
+
+        // Either way round.
+        let bank = new_child(&setup.bank0);
+        bank.transfer(1, &setup.mint_keypair, &Pubkey::new_unique())
+            .unwrap();
+        commit_batch(
+            &bank,
+            transfers(&setup, &bank, 1),
+            ReceiptOrder::BlockPositions(&[7]),
+        );
+        assert_receipt_failure(&bank, CommitmentFailure::MixedReceiptOrder);
+    }
+
+    #[test]
+    fn test_unknown_receipt_order_is_commitment_failure() {
+        let setup = setup(true, true);
+        let bank = new_child(&setup.bank0);
+        commit_batch(&bank, transfers(&setup, &bank, 2), ReceiptOrder::Unknown);
+        assert_receipt_failure(
+            &bank,
+            CommitmentFailure::UnknownReceiptOrder { num_receipts: 2 },
+        );
+
+        // A batch without committed transactions has no receipt to place.
+        let bank = new_child(&setup.bank0);
+        let batch = bank.prepare_batch_for_tests(Vec::<Transaction>::new());
+        bank.load_execute_and_commit_transactions_with_pre_commit_callback(
+            &batch,
+            ExecutionRecordingConfig::new_single_setting(false),
+            &mut ExecuteTimings::default(),
+            None,
+            ReceiptOrder::Unknown,
+            |_| Ok(()),
+        )
+        .unwrap();
+        freeze_with_block_id(&bank);
+        assert_eq!(bank.commitment_failure(), None);
+        assert_eq!(bank.verify_commitment_root(), Ok(()));
+    }
+
+    #[test]
+    fn test_receipt_count_mismatch_is_commitment_failure() {
+        let setup = setup(true, true);
+        let bank = new_child(&setup.bank0);
+        commit_batch(
+            &bank,
+            transfers(&setup, &bank, 1),
+            ReceiptOrder::BlockPositions(&[0]),
+        );
+        // A receipt for a transaction that was not committed.
+        bank.transaction_receipts.push(
+            ReceiptOrder::BlockPositions(&[1]),
+            std::iter::once(Ok((0, Hash::new_unique()))),
+        );
+        assert_eq!(bank.transaction_receipt_leaf_hashes().unwrap().len(), 2);
+        freeze_with_block_id(&bank);
+        assert_commitment_failure(
+            &bank,
+            CommitmentFailure::ReceiptCountMismatch {
+                committed: 1,
+                receipts: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn test_missing_receipt_roots_is_commitment_failure() {
+        let setup = setup(true, true);
+        let bank = new_child(&setup.bank0);
+        let tx = transfers(&setup, &bank, 1).remove(0);
+        let signature = tx.signatures[0];
+        // Executed successfully, but without the roots that the SVM computes
+        // while the feature is active.
+        let processing_result = Ok(ProcessedTransaction::Executed(Box::new(
+            ExecutedTransaction {
+                loaded_transaction: LoadedTransaction::default(),
+                execution_details: TransactionExecutionDetails {
+                    status: Ok(()),
+                    log_messages: None,
+                    inner_instructions: None,
+                    return_data: None,
+                    executed_units: 0,
+                    accounts_deltas: None,
+                    receipt_roots: None,
+                },
+                programs_modified_by_tx: HashMap::new(),
+            },
+        )));
+        bank.accumulate_transaction_receipts(
+            &[RuntimeTransaction::from_transaction_for_tests(tx)],
+            &[processing_result],
+            ReceiptOrder::BlockPositions(&[0]),
+        );
+        assert_receipt_failure(&bank, CommitmentFailure::MissingReceiptRoots { signature });
     }
 }

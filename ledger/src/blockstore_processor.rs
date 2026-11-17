@@ -3670,14 +3670,17 @@ pub mod tests {
             }
         }
         process_entries_for_tests_with_scheduler(&bank, entries).unwrap();
-        let replayed = bank.transaction_receipt_leaf_hashes();
+        let replayed = bank.transaction_receipt_leaf_hashes().unwrap();
         assert_eq!(replayed.len(), txs.len());
 
         let (reference, _reference_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         for (i, tx) in txs.iter().enumerate() {
             assert_eq!(reference.process_transaction(tx).is_ok(), i % 5 != 4);
         }
-        assert_eq!(replayed, reference.transaction_receipt_leaf_hashes());
+        assert_eq!(
+            replayed,
+            reference.transaction_receipt_leaf_hashes().unwrap()
+        );
         assert_eq!(bank.receipts_root(), reference.receipts_root());
     }
 

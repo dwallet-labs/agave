@@ -71,8 +71,11 @@ impl Committer {
             Some(positions) => ReceiptOrder::BlockPositions(positions),
             // Only when the record channel does not track transaction
             // indexes, which the validator always enables (see
-            // `record_channels`): receipts then follow commit order.
-            None => ReceiptOrder::CommitOrder,
+            // `record_channels`). The receipts cannot be placed in the block
+            // then, which the bank records as a commitment failure if the
+            // receipt feature is active: the leader does not publish the
+            // block rather than publishing a wrong `receipts_root`.
+            None => ReceiptOrder::Unknown,
         };
         let (commit_results, commit_time_us) = measure_us!(bank.commit_transactions(
             batch.sanitized_transactions(),

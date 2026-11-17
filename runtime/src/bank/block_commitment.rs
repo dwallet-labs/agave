@@ -44,6 +44,7 @@ use {
     solana_merkle_tree::commitment_tree::{
         AppendOnlyFrontier, InclusionProof, TreeId, compute_root, make_inclusion_proof,
     },
+    solana_signature::Signature,
 };
 
 /// Number of slots in the commitment vector.
@@ -164,6 +165,30 @@ pub enum CommitmentFailure {
     /// its own, so `H(B)` is unknown.
     #[error("parent {parent_slot} has a commitment failure")]
     ParentCommitmentFailure { parent_slot: Slot },
+    /// Slot 1: a committed batch gave no block position for one of its
+    /// committed transactions, so its receipt cannot be placed in the block.
+    #[error("no block position for committed transaction {index_in_batch} of its batch")]
+    MissingBlockPosition { index_in_batch: usize },
+    /// Slot 1: two receipts claim the same position in the block.
+    #[error("two transaction receipts have block position {position}")]
+    DuplicateBlockPosition { position: u64 },
+    /// Slot 1: the number of receipts differs from the number of
+    /// transactions committed to the bank.
+    #[error("{committed} transactions committed but {receipts} transaction receipts")]
+    ReceiptCountMismatch { committed: u64, receipts: u64 },
+    /// Slot 1: some batches were committed with block positions and others
+    /// in commit order, so the commit-order positions may collide with block
+    /// positions.
+    #[error("transaction receipts committed both with block positions and in commit order")]
+    MixedReceiptOrder,
+    /// Slot 1: a batch was committed without its block positions (the
+    /// leader's record channel did not give a transaction index).
+    #[error("{num_receipts} transaction receipts committed without block positions")]
+    UnknownReceiptOrder { num_receipts: usize },
+    /// Slot 1: a successfully executed transaction has no instruction trace
+    /// and events roots, so its receipt cannot be computed.
+    #[error("successful transaction {signature} has no receipt roots")]
+    MissingReceiptRoots { signature: Signature },
 }
 
 impl CommitmentFailure {
@@ -172,6 +197,12 @@ impl CommitmentFailure {
         match self {
             Self::MissingParentBlockId { .. } => "missing_parent_block_id",
             Self::ParentCommitmentFailure { .. } => "parent_commitment_failure",
+            Self::MissingBlockPosition { .. } => "missing_block_position",
+            Self::DuplicateBlockPosition { .. } => "duplicate_block_position",
+            Self::ReceiptCountMismatch { .. } => "receipt_count_mismatch",
+            Self::MixedReceiptOrder => "mixed_receipt_order",
+            Self::UnknownReceiptOrder { .. } => "unknown_receipt_order",
+            Self::MissingReceiptRoots { .. } => "missing_receipt_roots",
         }
     }
 }
@@ -366,7 +397,7 @@ impl Bank {
         inputs: &CommitmentInputs,
     ) -> std::result::Result<Hash, CommitmentFailure> {
         Ok(self
-            .receipts_root_for_commitment(inputs.parent)
+            .receipts_root_for_commitment(inputs.parent)?
             .unwrap_or(INACTIVE_COMMITMENT_SLOT))
     }
 
