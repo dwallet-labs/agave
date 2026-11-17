@@ -54,7 +54,7 @@ use {
         ReadResult, SchemaRead, SchemaReadOwned, SchemaWrite, WriteResult,
         adapter::{DefaultOnEmptyRead, DiscardSeq},
         config::Config,
-        io::{Reader, std_write::WriteAdapter},
+        io::{Reader, Writer, std_write::WriteAdapter},
         len::BincodeLen,
     },
 };
@@ -464,17 +464,8 @@ struct ExtraFieldsToDeserialize {
     accounts_lt_hash: Option<SerdeAccountsLtHash>,
     #[wincode(with = "DefaultOnEmptyRead<Option<BlockId>>")]
     block_id: Option<BlockId>,
-    /// Block Commitment Root state of the snapshot bank (block history
-    /// frontier and commitment root).
-    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeBlockCommitment>>")]
-    block_commitment: Option<SerdeBlockCommitment>,
-    /// Epoch Boundary Commitment state of the snapshot bank.
-    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeEpochBoundary>>")]
-    epoch_boundary: Option<SerdeEpochBoundary>,
-    /// Accounts State Root state of the snapshot bank (overlays and known
-    /// base roots).
-    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeAccountsState>>")]
-    accounts_state: Option<SerdeAccountsState>,
+    /// Each field `None` if missing at the end of the stream.
+    commitments: CommitmentExtraFields,
 }
 
 /// Extra fields that are serialized at the end of snapshots.
@@ -489,7 +480,7 @@ struct ExtraFieldsToDeserialize {
     // Write-only type (its deserialize counterpart is `ExtraFieldsToDeserialize`), so the abi digest
     // only verifies the serialized wire format; there is no roundtrip.
     frozen_abi(
-        abi_digest = "CxsqSdHnZ5AuFVG54mhYcSALum7iefVtjT55GUMQMBQr",
+        abi_digest = "9Z3L2TgeHZxhsQD2xfThJ1rAj6oudvqkpZ39cPmGtE1P",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )
@@ -503,15 +494,114 @@ pub struct ExtraFieldsToSerialize {
     pub versioned_epoch_stakes: HashMap<u64, VersionedEpochStakes>,
     pub accounts_lt_hash: Option<SerdeAccountsLtHash>,
     pub block_id: Option<BlockId>,
-    /// None when the Block Commitment Root feature is not active for the
-    /// snapshot bank.
+    /// Only the fields up to the last present one are written.
+    pub commitments: CommitmentExtraFields,
+}
+
+/// Extra fields of the light-client commitment features, at the end of the
+/// snapshot, after `block_id`.
+///
+/// The fields are positional. Each one is written only when it is needed: the
+/// fields after the last present one are not written at all, and an absent
+/// field followed by a present one is written as `None`. A reader takes a
+/// field missing at the end of the stream as `None`, as for the other extra
+/// fields. So a snapshot of a bank for which none of the features is active
+/// has exactly the format it had before these fields existed, and a release
+/// that reads the fields can be deployed before any release writes them.
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, SchemaRead)]
+pub struct CommitmentExtraFields {
+    /// Block Commitment Root state of the snapshot bank (block history
+    /// frontier and commitment root). None unless the feature is active for
+    /// the snapshot bank.
+    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeBlockCommitment>>")]
     pub block_commitment: Option<SerdeBlockCommitment>,
-    /// None when the Epoch Boundary Commitment feature is not active for the
-    /// snapshot bank.
+    /// Epoch Boundary Commitment state of the snapshot bank. None unless the
+    /// feature is in effect for the snapshot bank and it has an epoch
+    /// boundary.
+    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeEpochBoundary>>")]
     pub epoch_boundary: Option<SerdeEpochBoundary>,
-    /// None when the Accounts State Root feature is not active for the
-    /// snapshot bank.
+    /// Accounts State Root state of the snapshot bank (overlays and known
+    /// base roots). None unless the feature is in effect for the snapshot
+    /// bank.
+    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeAccountsState>>")]
     pub accounts_state: Option<SerdeAccountsState>,
+}
+
+impl CommitmentExtraFields {
+    /// The fields of a snapshot of the bank with `bank_fields`.
+    pub fn new(bank_fields: &BankFieldsToSerialize) -> Self {
+        Self {
+            block_commitment: bank_fields.block_commitment.clone().map(Into::into),
+            epoch_boundary: bank_fields.epoch_boundary.map(Into::into),
+            accounts_state: bank_fields.accounts_state.clone().map(Into::into),
+        }
+    }
+
+    /// The number of fields written: every field up to the last present one.
+    fn num_written(&self) -> usize {
+        let Self {
+            block_commitment,
+            epoch_boundary,
+            accounts_state,
+        } = self;
+        [
+            block_commitment.is_some(),
+            epoch_boundary.is_some(),
+            accounts_state.is_some(),
+        ]
+        .iter()
+        .rposition(|present| *present)
+        .map_or(0, |last| last + 1)
+    }
+}
+
+// SAFETY: `TYPE_META` is left `Dynamic`, and `size_of` adds up the sizes of
+// exactly the fields that `write` writes.
+unsafe impl<C: Config> SchemaWrite<C> for CommitmentExtraFields {
+    type Src = Self;
+
+    fn size_of(src: &Self) -> WriteResult<usize> {
+        let Self {
+            block_commitment,
+            epoch_boundary,
+            accounts_state,
+        } = src;
+        let num_written = src.num_written();
+        let mut size = 0;
+        if num_written > 0 {
+            size += <Option<SerdeBlockCommitment> as SchemaWrite<C>>::size_of(block_commitment)?;
+        }
+        if num_written > 1 {
+            size += <Option<SerdeEpochBoundary> as SchemaWrite<C>>::size_of(epoch_boundary)?;
+        }
+        if num_written > 2 {
+            size += <Option<SerdeAccountsState> as SchemaWrite<C>>::size_of(accounts_state)?;
+        }
+        Ok(size)
+    }
+
+    fn write(mut writer: impl Writer, src: &Self) -> WriteResult<()> {
+        let Self {
+            block_commitment,
+            epoch_boundary,
+            accounts_state,
+        } = src;
+        let num_written = src.num_written();
+        if num_written > 0 {
+            <Option<SerdeBlockCommitment> as SchemaWrite<C>>::write(
+                writer.by_ref(),
+                block_commitment,
+            )?;
+        }
+        if num_written > 1 {
+            <Option<SerdeEpochBoundary> as SchemaWrite<C>>::write(writer.by_ref(), epoch_boundary)?;
+        }
+        if num_written > 2 {
+            <Option<SerdeAccountsState> as SchemaWrite<C>>::write(writer.by_ref(), accounts_state)?;
+        }
+        Ok(())
+    }
 }
 
 /// Deserializable counterpart of [`SerializableBankSnapshot`], read as one struct (wincode reads
@@ -523,7 +613,7 @@ pub struct ExtraFieldsToSerialize {
     feature = "stable-abi",
     derive(SchemaWrite, StableAbi, StableAbiSample),
     frozen_abi(
-        abi_digest = "3psM4ktwFwZrbYZTEt3fFVRirt5UbE2tqEXtT15xByjj",
+        abi_digest = "JBAfbxio5k5J71hg2d2Bo54dXuLE9WFEFHYkLBNNauE9",
         abi_serializer = "wincode",
         test_roundtrip = "wire_only"
     )
@@ -556,9 +646,12 @@ impl DeserializableBankSnapshot {
             versioned_epoch_stakes,
             accounts_lt_hash,
             block_id,
-            block_commitment,
-            epoch_boundary,
-            accounts_state,
+            commitments:
+                CommitmentExtraFields {
+                    block_commitment,
+                    epoch_boundary,
+                    accounts_state,
+                },
         } = extra_fields;
 
         bank_fields.fee_rate_governor = bank_fields
@@ -676,9 +769,7 @@ where
     let versioned_epoch_stakes = std::mem::take(&mut bank_fields.versioned_epoch_stakes);
     let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
     let block_id = Some(bank_fields.block_id);
-    let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
-    let epoch_boundary = bank_fields.epoch_boundary.map(Into::into);
-    let accounts_state = bank_fields.accounts_state.clone().map(Into::into);
+    let commitments = CommitmentExtraFields::new(&bank_fields);
     serialize_bank_snapshot_into(
         stream,
         bank_fields,
@@ -690,9 +781,7 @@ where
             versioned_epoch_stakes,
             accounts_lt_hash,
             block_id,
-            block_commitment,
-            epoch_boundary,
-            accounts_state,
+            commitments,
         },
     )
 }
@@ -705,7 +794,7 @@ where
     // Write-only type (its deserialize counterparts are `DeserializableVersionedBank`,
     // `AccountsDbFields` and `ExtraFieldsToDeserialize`), so there is no roundtrip.
     frozen_abi(
-        abi_digest = "3psM4ktwFwZrbYZTEt3fFVRirt5UbE2tqEXtT15xByjj",
+        abi_digest = "JBAfbxio5k5J71hg2d2Bo54dXuLE9WFEFHYkLBNNauE9",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )
