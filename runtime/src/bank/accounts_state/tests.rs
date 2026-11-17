@@ -996,6 +996,63 @@ fn snapshot_round_trip(snapshot_slot: Slot, descendants: &[Slot], strip_base_roo
     }
 }
 
+/// A snapshot whose base root is not the root of the base leaves rebuilt
+/// from its accounts is invalid: once the rebuild has found the difference,
+/// a bank that needs that base has a commitment failure. It uses neither
+/// root, and the bad root is not written to a later snapshot.
+#[test]
+fn test_snapshot_base_root_mismatch_is_commitment_failure() {
+    let (mut h, bank0) = Harness::new(
+        EpochSchedule::custom(SLOTS_PER_EPOCH, SLOTS_PER_EPOCH, false),
+        Some(true),
+    );
+    let mut parent = bank0;
+    for slot in [1, 63, 64, 100, 128, 140] {
+        let bank = h.child(&parent, slot);
+        h.transfer(&bank, &Pubkey::new_unique(), LAMPORTS_PER_SOL);
+        h.freeze(&bank);
+        parent = bank;
+    }
+    let snapshot_bank = parent;
+    // Slot 150 is before the switch slot of epoch 2 and uses generation 1.
+    let mut snapshot_state = snapshot_bank.accounts_state_for_snapshot().unwrap();
+    let generation = snapshot_state
+        .generations
+        .iter_mut()
+        .find(|generation| generation.epoch == 1)
+        .unwrap();
+    let rebuilt = generation.base_root.unwrap();
+    let snapshot = Hash::new_unique();
+    generation.base_root = Some(snapshot);
+    // As if the bank had been loaded from a snapshot with that root.
+    *snapshot_bank.accounts_state.write().unwrap() = Bank::accounts_state_from_snapshot(
+        Some(snapshot_state),
+        &snapshot_bank.accounts_state_bases,
+    );
+
+    // The rebuild starts with the first child.
+    let child = h.child(&snapshot_bank, 150);
+    let state = snapshot_bank.accounts_state().unwrap();
+    while !state.generations.iter().all(|g| g.base.is_finished()) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let base = &state.generation(1).unwrap().base;
+    assert_eq!(base.snapshot_mismatch(), Some((snapshot, rebuilt)));
+    assert_eq!(base.root_if_known(), None);
+    assert!(base.wait_root().is_err());
+    assert!(base.wait_tree().is_err());
+
+    goto_end_of_slot(child.clone());
+    assert_commitment_failure(
+        &child,
+        CommitmentFailure::AccountsStateSnapshotBaseMismatch {
+            generation: 1,
+            snapshot,
+            rebuilt,
+        },
+    );
+}
+
 /// Snapshot of a bank in epoch 2 before its switch slot (two generations).
 #[test]
 fn test_snapshot_before_switch_slot() {
