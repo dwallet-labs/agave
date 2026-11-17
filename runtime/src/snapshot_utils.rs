@@ -4,11 +4,11 @@ use {
     crate::{
         bank::BankFieldsToDeserialize,
         serde_snapshot::{
-            self, AccountsDbFields, ExtraFieldsToSerialize, LegacyObsoleteAccountsMap,
-            LegacyStoragesList, OBSOLETE_ACCOUNTS_CONFIG, STARTUP_HINTS_CONFIG,
-            STORAGES_LIST_CONFIG, SerdeObsoleteAccountsMap, SnapshotAccountsDbFields,
-            SnapshotBankFields, SnapshotStreams, StartupHints, StorageListItem, StoragesList,
-            deserialize_from, serialize_into,
+            self, AccountsDbFields, CommitmentExtraFields, ExtraFieldsToSerialize,
+            LegacyObsoleteAccountsMap, LegacyStoragesList, OBSOLETE_ACCOUNTS_CONFIG,
+            STARTUP_HINTS_CONFIG, STORAGES_LIST_CONFIG, SerdeObsoleteAccountsMap,
+            SnapshotAccountsDbFields, SnapshotBankFields, SnapshotStreams, StartupHints,
+            StorageListItem, StoragesList, deserialize_from, serialize_into,
         },
         snapshot_package::BankSnapshotPackage,
         snapshot_utils::snapshot_storage_rebuilder::{
@@ -516,7 +516,7 @@ pub fn serialize_snapshot(
                 versioned_epoch_stakes,
                 accounts_lt_hash: Some(bank_fields.accounts_lt_hash.clone().into()),
                 block_id: Some(bank_fields.block_id),
-                block_commitment: bank_fields.block_commitment.clone().map(Into::into),
+                commitments: CommitmentExtraFields::new(&bank_fields),
             };
             serde_snapshot::serialize_bank_snapshot_into(
                 stream,
