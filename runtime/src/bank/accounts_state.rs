@@ -925,7 +925,9 @@ impl Bank {
     /// The state of a snapshot bank's accounts state, for snapshots. `None`
     /// if the feature is inactive for the bank or it has no accounts state.
     pub(crate) fn accounts_state_for_snapshot(&self) -> Option<SnapshotAccountsState> {
-        self.accounts_state().map(|state| state.to_snapshot())
+        self.accounts_state()
+            .filter(|_| self.is_accounts_state_root_active())
+            .map(|state| state.to_snapshot())
     }
 
     /// Accounts state of a bank built from snapshot fields.
