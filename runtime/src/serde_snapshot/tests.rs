@@ -1170,9 +1170,23 @@ mod serde_snapshot_tests {
         // Drop the `None` tags of `accounts_state` and `block_commitment`.
         assert_eq!(old_buf.pop(), Some(0));
         assert_eq!(old_buf.pop(), Some(0));
-        let dbank = deserialize(&old_buf);
+        let dbank = Arc::new(deserialize(&old_buf));
         assert_eq!(dbank.block_commitment(), None);
         assert_eq!(dbank.block_id(), Some(block_id1));
+
+        // The feature is active for the restored bank, so its child cannot
+        // compute its block history: a commitment failure, not a history
+        // restarted from scratch.
+        assert!(dbank.is_block_commitment_root_active());
+        assert_eq!(dbank.commitment_failure(), None);
+        let bank2 = Bank::new_from_parent(dbank.clone(), *dbank.leader(), 2);
+        bank2.freeze();
+        crate::bank::block_commitment::tests::assert_commitment_failure(
+            &bank2,
+            crate::bank::block_commitment::CommitmentFailure::MissingParentCommitment {
+                parent_slot: 1,
+            },
+        );
     }
 
     #[test]
