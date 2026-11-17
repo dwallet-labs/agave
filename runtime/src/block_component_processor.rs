@@ -838,7 +838,7 @@ mod tests {
     use {
         super::*,
         crate::{
-            bank::{Bank, SlotLeader},
+            bank::{Bank, SlotLeader, block_commitment::CommitmentVerificationError},
             bank_forks::BankForks,
             genesis_utils::{create_genesis_config, create_genesis_config_with_tower_leader},
         },
@@ -1060,6 +1060,9 @@ mod tests {
         // recorded for verification at freeze.
         let (parent, bank_forks) = create_test_bank_with_block_commitment_root();
         assert!(parent.is_block_commitment_root_active());
+        // The parent's history leaf needs its block id, which replay or
+        // broadcast sets on every bank a child is built on.
+        parent.set_block_id(Some(BlockId::new_unique()));
         let bank = create_child_bank(&bank_forks, &parent, 1);
         let v1 = VersionedBlockFooter::new_for_feature(footer_v1_for(&parent), false);
         assert_matches!(
@@ -1082,7 +1085,10 @@ mod tests {
         bank.freeze();
         assert_eq!(
             bank.verify_commitment_root(),
-            Err((commitment_root, bank.commitment_root().unwrap()))
+            Err(CommitmentVerificationError::Mismatch {
+                expected: commitment_root,
+                computed: bank.commitment_root().unwrap(),
+            })
         );
     }
 

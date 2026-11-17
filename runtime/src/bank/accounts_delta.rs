@@ -705,11 +705,12 @@ mod bank_tests {
         assert!(!bank1.collects_accounts_delta());
         bank1.freeze();
         assert!(bank1.accounts_delta().is_none());
-        let vector =
-            bank1.compute_commitment_vector(&crate::bank::block_commitment::CommitmentInputs {
+        let vector = bank1
+            .compute_commitment_vector(&crate::bank::block_commitment::CommitmentInputs {
                 block_history: &bank1.block_commitment().unwrap().block_history,
                 parent: Some(&bank0),
-            });
+            })
+            .unwrap();
         assert_eq!(
             vector.get(CommitmentSlot::AccountsDeltaRoot),
             INACTIVE_COMMITMENT_SLOT
