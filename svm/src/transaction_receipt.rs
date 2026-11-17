@@ -34,6 +34,26 @@ pub struct ReceiptRoots {
     pub events_root: Hash,
 }
 
+/// The leaves under [`ReceiptRoots`]: the instruction trace records in
+/// execution order and the events in emission order. Not needed for
+/// consensus; kept only for nodes that serve receipt proofs
+/// (`TransactionProcessingConfig::retain_receipt_leaves`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReceiptLeaves {
+    pub records: Vec<InstructionRecord>,
+    pub events: Vec<EventRecord>,
+}
+
+impl ReceiptLeaves {
+    /// The roots of these leaves.
+    pub fn roots(&self) -> ReceiptRoots {
+        ReceiptRoots {
+            instruction_trace_root: instruction_trace_root(&self.records),
+            events_root: events_root(&self.events),
+        }
+    }
+}
+
 /// Indices in the [`TransactionContext`] trace, in execution order.
 fn execution_order(
     transaction_context: &TransactionContext,
@@ -146,12 +166,19 @@ pub fn compute_receipt_roots(
     transaction_context: &TransactionContext,
     recorded_events: Vec<RecordedEvent>,
 ) -> Result<ReceiptRoots, InstructionError> {
+    compute_receipt_leaves(transaction_context, recorded_events).map(|leaves| leaves.roots())
+}
+
+/// The instruction trace records and events of a transaction that executed
+/// successfully with `transaction_context` and emitted `recorded_events`:
+/// the leaves of the trees whose roots [`compute_receipt_roots`] returns.
+pub fn compute_receipt_leaves(
+    transaction_context: &TransactionContext,
+    recorded_events: Vec<RecordedEvent>,
+) -> Result<ReceiptLeaves, InstructionError> {
     let (records, record_index_of_trace_index) = instruction_trace_records(transaction_context)?;
     let events = event_records(recorded_events, &record_index_of_trace_index)?;
-    Ok(ReceiptRoots {
-        instruction_trace_root: instruction_trace_root(&records),
-        events_root: events_root(&events),
-    })
+    Ok(ReceiptLeaves { records, events })
 }
 
 #[cfg(test)]

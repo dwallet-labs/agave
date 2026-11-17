@@ -222,6 +222,7 @@ mod tests {
                     executed_units: 0,
                     accounts_deltas,
                     receipt_roots: None,
+                    receipt_leaves: None,
                 },
                 loaded_transaction,
                 programs_modified_by_tx: HashMap::new(),

@@ -1,4 +1,4 @@
-pub use crate::transaction_receipt::ReceiptRoots;
+pub use crate::transaction_receipt::{ReceiptLeaves, ReceiptRoots};
 use {
     crate::account_loader::LoadedTransaction,
     solana_message::inner_instruction::InnerInstructionsList,
@@ -42,6 +42,10 @@ pub struct TransactionExecutionDetails {
     /// receipt. Set IFF `status` is `Ok` and receipt roots were requested
     /// (`TransactionProcessingConfig::compute_receipt_roots`).
     pub receipt_roots: Option<ReceiptRoots>,
+    /// The leaves under `receipt_roots`. Set IFF `receipt_roots` is set and
+    /// the leaves were requested
+    /// (`TransactionProcessingConfig::retain_receipt_leaves`).
+    pub receipt_leaves: Option<Box<ReceiptLeaves>>,
 }
 
 impl TransactionExecutionDetails {

@@ -677,6 +677,8 @@ impl PartialEq for Bank {
             rc: _,
             status_cache: _,
             store_transaction_signatures_in_status_cache,
+            // Only decides what is kept for light-client provers.
+            retain_light_client_proof_data: _,
             blockhash_queue,
             max_processing_age,
             partitioned_rewards_stake_account_stores_per_block,
@@ -874,6 +876,9 @@ pub struct Bank {
 
     /// Derived from RuntimeConfig::skip_transaction_signatures_in_status_cache.
     store_transaction_signatures_in_status_cache: bool,
+
+    /// Derived from RuntimeConfig::retain_light_client_proof_data.
+    retain_light_client_proof_data: bool,
 
     /// FIFO queue of `recent_blockhash` items
     blockhash_queue: RwLock<BlockhashQueue>,
@@ -1325,6 +1330,7 @@ impl Bank {
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
             store_transaction_signatures_in_status_cache: !RuntimeConfig::default()
                 .skip_transaction_signatures_in_status_cache,
+            retain_light_client_proof_data: false,
             blockhash_queue: RwLock::<BlockhashQueue>::default(),
             max_processing_age: MAX_PROCESSING_AGE,
             partitioned_rewards_stake_account_stores_per_block,
@@ -1450,6 +1456,7 @@ impl Bank {
         bank.compute_budget = runtime_config.compute_budget;
         bank.store_transaction_signatures_in_status_cache =
             !runtime_config.skip_transaction_signatures_in_status_cache;
+        bank.retain_light_client_proof_data = runtime_config.retain_light_client_proof_data;
         if let Some(compute_budget) = &bank.compute_budget {
             bank.transaction_processor
                 .set_execution_cost(compute_budget.to_cost());
@@ -1575,6 +1582,7 @@ impl Bank {
             status_cache,
             store_transaction_signatures_in_status_cache: parent
                 .store_transaction_signatures_in_status_cache,
+            retain_light_client_proof_data: parent.retain_light_client_proof_data,
             slot,
             bank_id,
             epoch,
@@ -2362,6 +2370,7 @@ impl Bank {
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
             store_transaction_signatures_in_status_cache: !runtime_config
                 .skip_transaction_signatures_in_status_cache,
+            retain_light_client_proof_data: runtime_config.retain_light_client_proof_data,
             blockhash_queue: RwLock::new(fields.blockhash_queue),
             max_processing_age: MAX_PROCESSING_AGE,
             partitioned_rewards_stake_account_stores_per_block,
@@ -4248,6 +4257,7 @@ impl Bank {
                 drop_bail_out_transactions: true,
                 // Set from the feature set in `do_load_and_execute_transactions`.
                 compute_receipt_roots: false,
+                retain_receipt_leaves: false,
             },
         );
 
@@ -4451,6 +4461,8 @@ impl Bank {
         // Decided here, from the bank's feature set, so that block production
         // and replay always agree.
         processing_config.compute_receipt_roots = self.is_transaction_receipt_tree_active();
+        processing_config.retain_receipt_leaves =
+            processing_config.compute_receipt_roots && self.retain_light_client_proof_data;
 
         let (check_results, check_us) = measure_us!(self.check_transactions_before_execution(
             sanitized_txs,
@@ -5022,6 +5034,7 @@ impl Bank {
                     drop_bail_out_transactions: false,
                     // Set from the feature set in `do_load_and_execute_transactions`.
                     compute_receipt_roots: false,
+                    retain_receipt_leaves: false,
                 },
             )
         } else {
@@ -7385,6 +7398,13 @@ impl Bank {
             self,
             OwnedOrBorrowed::Owned(sanitized_txs),
         )
+    }
+
+    /// Sets what `RuntimeConfig::retain_light_client_proof_data` sets for a
+    /// bank built from genesis or a snapshot; children inherit it.
+    /// NOTE: This fn is *ONLY FOR TESTS*
+    pub fn set_retain_light_client_proof_data_for_tests(&mut self, retain: bool) {
+        self.retain_light_client_proof_data = retain;
     }
 
     /// Set the initial accounts data size
