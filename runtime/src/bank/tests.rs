@@ -12802,6 +12802,7 @@ fn test_new_for_txn_tests_system_transfer() {
         block_id: None,
         block_commitment: None,
         epoch_boundary: None,
+        accounts_state: None,
     };
 
     let bank = Bank::new_for_txn_tests(bank_rc, fields, FeatureSet::all_enabled(), epoch_stakes);
@@ -12976,6 +12977,7 @@ fn test_new_for_block_tests_with_vote_account() {
         block_id: None,
         block_commitment: None,
         epoch_boundary: None,
+        accounts_state: None,
     };
 
     let bank = Bank::new_for_block_tests(

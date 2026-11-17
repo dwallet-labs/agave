@@ -518,6 +518,7 @@ pub fn serialize_snapshot(
                 block_id: Some(bank_fields.block_id),
                 block_commitment: bank_fields.block_commitment.clone().map(Into::into),
                 epoch_boundary: bank_fields.epoch_boundary.map(Into::into),
+                accounts_state: bank_fields.accounts_state.clone().map(Into::into),
             };
             serde_snapshot::serialize_bank_snapshot_into(
                 stream,

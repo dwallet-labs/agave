@@ -87,6 +87,7 @@ pub struct FeatureSnapshot {
     pub accounts_delta_root: bool,
     pub epoch_validator_set_root: bool,
     pub epoch_boundary_commitment: bool,
+    pub accounts_state_root: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -197,6 +198,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             accounts_delta_root: is_active(&accounts_delta_root::ID),
             epoch_validator_set_root: is_active(&epoch_validator_set_root::ID),
             epoch_boundary_commitment: is_active(&epoch_boundary_commitment::ID),
+            accounts_state_root: is_active(&accounts_state_root::ID),
         }
     }
 }
@@ -1747,6 +1749,19 @@ pub mod epoch_boundary_commitment {
     solana_pubkey::declare_id!("Cbf2GyYQviJZRnDKG4oDsPW2499WoXHiqtJQLavz8ubu");
 }
 
+/// Accounts State Root (draft SIMD, number not yet assigned).
+///
+/// Commits to the state of every account with `accounts_state_root`, slot 5
+/// of the commitment vector of `block_commitment_root`: a base tree over the
+/// state at the start of an epoch, built off the block path, and an overlay
+/// over the accounts changed since, updated at bank freeze. Has no effect
+/// unless `block_commitment_root` and `accounts_delta_root` are also active.
+/// Placeholder key: replace with the real feature key once the SIMD is
+/// accepted.
+pub mod accounts_state_root {
+    solana_pubkey::declare_id!("4HLKMuRARnWNXk8cZGLo5y9GrHK6MZkeD5VzJ5ySQMGT");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2910,6 +2925,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             epoch_boundary_commitment::id(),
             "SIMD-XXXX: Epoch boundary commitment",
         ),
+        (accounts_state_root::id(), "SIMD-XXXX: Accounts state root"),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
     ]
