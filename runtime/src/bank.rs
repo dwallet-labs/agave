@@ -256,6 +256,8 @@ mod check_transactions;
 pub mod entry_bytes_budget;
 mod epoch_boundary;
 mod fee_distribution;
+#[cfg(test)]
+mod light_client_commitments_tests;
 mod metrics;
 pub(crate) mod partitioned_epoch_rewards;
 mod recent_blockhashes_account;
