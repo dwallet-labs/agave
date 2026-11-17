@@ -668,6 +668,7 @@ impl PartialEq for Bank {
             hard_forks,
             transaction_count,
             non_vote_transaction_count_since_restart: _,
+            committed_transaction_count: _,
             transaction_error_count: _,
             transaction_entries_count: _,
             transactions_per_entry_max: _,
@@ -874,6 +875,13 @@ pub struct Bank {
     /// blockstore for the RPC method "getPerformanceSamples". It is not
     /// retained within snapshots, but is preserved in `Bank::new_from_parent`.
     non_vote_transaction_count_since_restart: AtomicU64,
+
+    /// The number of transactions committed to this bank. Unlike
+    /// `transaction_count` it is not inherited: it starts at zero for every
+    /// bank, whether created from a parent, from genesis (which commits no
+    /// transactions) or from a snapshot (whose block is not executed again).
+    /// Checked against the number of transaction receipts.
+    committed_transaction_count: AtomicU64,
 
     /// The number of transaction errors in this slot
     transaction_error_count: AtomicU64,
@@ -1265,6 +1273,7 @@ impl Bank {
             hard_forks: Arc::<RwLock<HardForks>>::default(),
             transaction_count: AtomicU64::default(),
             non_vote_transaction_count_since_restart: AtomicU64::default(),
+            committed_transaction_count: AtomicU64::default(),
             transaction_error_count: AtomicU64::default(),
             transaction_entries_count: AtomicU64::default(),
             transactions_per_entry_max: AtomicU64::default(),
@@ -1522,6 +1531,7 @@ impl Bank {
             non_vote_transaction_count_since_restart: AtomicU64::new(
                 parent.non_vote_transaction_count_since_restart(),
             ),
+            committed_transaction_count: AtomicU64::new(0),
             transaction_error_count: AtomicU64::new(0),
             transaction_entries_count: AtomicU64::new(0),
             transactions_per_entry_max: AtomicU64::new(0),
@@ -2274,6 +2284,7 @@ impl Bank {
             hard_forks: Arc::new(RwLock::new(fields.hard_forks)),
             transaction_count: AtomicU64::new(fields.transaction_count),
             non_vote_transaction_count_since_restart: AtomicU64::default(),
+            committed_transaction_count: AtomicU64::default(),
             transaction_error_count: AtomicU64::default(),
             transaction_entries_count: AtomicU64::default(),
             transactions_per_entry_max: AtomicU64::default(),
@@ -5508,6 +5519,13 @@ impl Bank {
         self.non_vote_transaction_count_since_restart.load(Relaxed)
     }
 
+    /// Number of transactions committed to this bank itself, counted from
+    /// zero whatever the bank was created from (see
+    /// `committed_transaction_count`).
+    pub fn committed_transaction_count(&self) -> u64 {
+        self.committed_transaction_count.load(Relaxed)
+    }
+
     /// Return the transaction count executed only in this bank
     pub fn executed_transaction_count(&self) -> u64 {
         self.transaction_count()
@@ -5560,6 +5578,8 @@ impl Bank {
 
     fn increment_transaction_count(&self, tx_count: u64) {
         self.transaction_count.fetch_add(tx_count, Relaxed);
+        self.committed_transaction_count
+            .fetch_add(tx_count, Relaxed);
     }
 
     fn increment_non_vote_transaction_count_since_restart(&self, tx_count: u64) {

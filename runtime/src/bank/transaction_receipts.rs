@@ -280,25 +280,25 @@ impl Bank {
     /// `receipts_root` for the commitment vector (`None` while the feature is
     /// inactive), checking that every transaction committed to this bank has
     /// exactly one receipt and that the receipts are in block order.
-    pub(super) fn receipts_root_for_commitment(
-        &self,
-        parent: Option<&Bank>,
-    ) -> Result<Option<Hash>, CommitmentFailure> {
+    ///
+    /// The number of committed transactions is the bank's own count
+    /// ([`Bank::committed_transaction_count`]), so the check applies to every
+    /// bank, with or without a parent: it starts at zero for a bank created
+    /// from genesis (which commits no transactions), from a snapshot (whose
+    /// block is not executed again, and whose receipts are not stored), or by
+    /// test and tool constructors that take a cumulative `transaction_count`.
+    pub(super) fn receipts_root_for_commitment(&self) -> Result<Option<Hash>, CommitmentFailure> {
         if !self.is_transaction_receipt_tree_active() {
             return Ok(None);
         }
         let leaf_hashes = self.transaction_receipt_leaf_hashes()?;
-        if let Some(parent) = parent {
-            let committed = self
-                .transaction_count()
-                .saturating_sub(parent.transaction_count());
-            let receipts = leaf_hashes.len() as u64;
-            if committed != receipts {
-                return Err(CommitmentFailure::ReceiptCountMismatch {
-                    committed,
-                    receipts,
-                });
-            }
+        let committed = self.committed_transaction_count();
+        let receipts = leaf_hashes.len() as u64;
+        if committed != receipts {
+            return Err(CommitmentFailure::ReceiptCountMismatch {
+                committed,
+                receipts,
+            });
         }
         Ok(Some(receipts_root_from_leaf_hashes(&leaf_hashes)))
     }
@@ -927,6 +927,125 @@ mod tests {
                 receipts: 2,
             },
         );
+    }
+
+    /// A bank created from genesis, with both features active, that is not
+    /// frozen yet and has no parent.
+    fn new_genesis_bank() -> (Arc<Bank>, Keypair) {
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(1_000_000_000_000, &Pubkey::new_unique(), 1_000_000);
+        activate_feature(
+            &mut genesis_config,
+            feature_set::transaction_receipt_tree::id(),
+        );
+        activate_feature(
+            &mut genesis_config,
+            feature_set::block_commitment_root::id(),
+        );
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        assert!(bank.parent().is_none());
+        (bank, mint_keypair)
+    }
+
+    fn genesis_transfers(bank: &Bank, mint_keypair: &Keypair, count: usize) -> Vec<Transaction> {
+        (0..count)
+            .map(|_| {
+                system_transaction::transfer(
+                    mint_keypair,
+                    &Pubkey::new_unique(),
+                    1_000_000,
+                    bank.last_blockhash(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_receipt_count_checked_without_parent() {
+        // Genesis commits no transactions, so a bank created from it counts
+        // from zero.
+        let (bank, mint_keypair) = new_genesis_bank();
+        assert_eq!(bank.committed_transaction_count(), 0);
+        commit_batch(
+            &bank,
+            genesis_transfers(&bank, &mint_keypair, 2),
+            ReceiptOrder::BlockPositions(&[0, 1]),
+        );
+        assert_eq!(bank.committed_transaction_count(), 2);
+        let leaf_hashes = bank.transaction_receipt_leaf_hashes().unwrap();
+        assert_eq!(leaf_hashes.len(), 2);
+        freeze_with_block_id(&bank);
+        assert_eq!(bank.commitment_failure(), None);
+        assert_eq!(bank.verify_commitment_root(), Ok(()));
+        assert_eq!(
+            bank.receipts_root(),
+            Some(receipts_root_from_leaf_hashes(&leaf_hashes))
+        );
+
+        // Without a parent, a receipt for a transaction that was not
+        // committed is caught as well.
+        let (bank, mint_keypair) = new_genesis_bank();
+        commit_batch(
+            &bank,
+            genesis_transfers(&bank, &mint_keypair, 1),
+            ReceiptOrder::BlockPositions(&[0]),
+        );
+        bank.transaction_receipts.push(
+            ReceiptOrder::BlockPositions(&[1]),
+            std::iter::once(Ok((0, Hash::new_unique()))),
+        );
+        freeze_with_block_id(&bank);
+        assert_commitment_failure(
+            &bank,
+            CommitmentFailure::ReceiptCountMismatch {
+                committed: 1,
+                receipts: 2,
+            },
+        );
+
+        // A parentless bank whose cumulative transaction count does not start
+        // at zero, as the test and tool constructors that take bank fields
+        // create (`Bank::new_for_block_tests`), compares its own count.
+        let (bank, mint_keypair) = new_genesis_bank();
+        bank.transaction_count
+            .store(1_000, std::sync::atomic::Ordering::Relaxed);
+        commit_batch(
+            &bank,
+            genesis_transfers(&bank, &mint_keypair, 1),
+            ReceiptOrder::BlockPositions(&[0]),
+        );
+        assert_eq!(bank.transaction_count(), 1_001);
+        assert_eq!(bank.committed_transaction_count(), 1);
+        freeze_with_block_id(&bank);
+        assert_eq!(bank.commitment_failure(), None);
+        assert_eq!(bank.verify_commitment_root(), Ok(()));
+    }
+
+    #[test]
+    fn test_committed_transaction_count_is_per_bank() {
+        let setup = setup(true, true);
+        let bank1 = new_child(&setup.bank0);
+        commit_batch(
+            &bank1,
+            transfers(&setup, &bank1, 2),
+            ReceiptOrder::BlockPositions(&[0, 1]),
+        );
+        freeze_with_block_id(&bank1);
+        let bank2 = new_child(&bank1);
+        assert_eq!(bank2.committed_transaction_count(), 0);
+        assert_eq!(bank2.transaction_count(), bank1.transaction_count());
+        commit_batch(
+            &bank2,
+            transfers(&setup, &bank2, 1),
+            ReceiptOrder::BlockPositions(&[0]),
+        );
+        assert_eq!(bank2.committed_transaction_count(), 1);
+        assert_eq!(bank2.executed_transaction_count(), 1);
+        freeze_with_block_id(&bank2);
+        assert_eq!(bank2.verify_commitment_root(), Ok(()));
     }
 
     #[test]
