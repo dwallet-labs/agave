@@ -3,7 +3,10 @@ use {
     clap::{Arg, ArgMatches, value_t},
     solana_accounts_db::accounts_index::AccountSecondaryIndexes,
     solana_clap_utils::input_validators::is_parsable,
-    solana_rpc::rpc::{JsonRpcConfig, RpcBigtableConfig},
+    solana_rpc::{
+        light_client_proofs::DEFAULT_RETAINED_BLOCKS,
+        rpc::{JsonRpcConfig, RpcBigtableConfig},
+    },
     std::sync::LazyLock,
 };
 
@@ -63,6 +66,13 @@ impl FromClapArgMatches for JsonRpcConfig {
             .ok()
             .map(|mb| mb * MB),
             disable_health_check: false,
+            enable_light_client_proofs: matches.is_present("enable_light_client_proofs"),
+            light_client_proof_retained_blocks: value_t!(
+                matches,
+                "light_client_proof_retained_blocks",
+                usize
+            )
+            .unwrap_or(DEFAULT_RETAINED_BLOCKS),
         })
     }
 }
@@ -164,6 +174,24 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
             .long("full-rpc-api")
             .takes_value(false)
             .help("Expose RPC methods for querying chain state and transaction history"),
+        Arg::with_name("enable_light_client_proofs")
+            .long("enable-light-client-proofs")
+            .takes_value(false)
+            .requires("full_rpc_api")
+            .help(
+                "Serve light-client proofs over JSON RPC (getFinalityProof, getTransactionProof, \
+                 ...). Keeps the data the proofs need for recent finalized blocks in memory",
+            ),
+        Arg::with_name("light_client_proof_retained_blocks")
+            .long("light-client-proof-retained-blocks")
+            .value_name("NUMBER")
+            .takes_value(true)
+            .validator(is_parsable::<usize>)
+            .requires("enable_light_client_proofs")
+            .help(
+                "Number of finalized blocks whose light-client proof data is kept in memory \
+                 [default: 1024]",
+            ),
         Arg::with_name("rpc_scan_and_fix_roots")
             .long("rpc-scan-and-fix-roots")
             .takes_value(false)
@@ -254,6 +282,42 @@ pub(super) mod tests {
                     "--enable-rpc-transaction-history", // required by enable_extended_tx_metadata_storage
                     "--enable-extended-tx-metadata-storage",
                 ],
+                expected_args,
+            );
+        }
+    }
+
+    #[test]
+    fn verify_args_struct_by_command_run_with_enable_light_client_proofs() {
+        let default_run_args = crate::commands::run::args::RunArgs::default();
+        assert!(!default_run_args.json_rpc_config.enable_light_client_proofs);
+        for (args, retained_blocks) in [
+            (
+                vec!["--full-rpc-api", "--enable-light-client-proofs"],
+                DEFAULT_RETAINED_BLOCKS,
+            ),
+            (
+                vec![
+                    "--full-rpc-api",
+                    "--enable-light-client-proofs",
+                    "--light-client-proof-retained-blocks",
+                    "77",
+                ],
+                77,
+            ),
+        ] {
+            let expected_args = RunArgs {
+                json_rpc_config: JsonRpcConfig {
+                    full_api: true,
+                    enable_light_client_proofs: true,
+                    light_client_proof_retained_blocks: retained_blocks,
+                    ..default_run_args.json_rpc_config.clone()
+                },
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args.clone(),
+                args,
                 expected_args,
             );
         }

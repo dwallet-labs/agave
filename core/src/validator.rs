@@ -104,6 +104,7 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rpc::{
+        light_client_proofs::{LightClientProofConfig, LightClientProofStore},
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
             BankNotificationSenderConfig, OptimisticallyConfirmedBank,
@@ -1233,6 +1234,15 @@ impl Validator {
                     cancel.clone(),
                 )
             };
+            let light_client_proofs = light_client_proofs_enabled(config).then(|| {
+                Arc::new(LightClientProofStore::new(
+                    LightClientProofConfig {
+                        retained_blocks: config.rpc_config.light_client_proof_retained_blocks,
+                        ..LightClientProofConfig::default()
+                    },
+                    blockstore.clone(),
+                ))
+            });
             let rpc_svc_config = JsonRpcServiceConfig {
                 rpc_addr,
                 rpc_config: config.rpc_config.clone(),
@@ -1256,6 +1266,7 @@ impl Validator {
                     max_complete_and_rooted_transaction_status_slot.clone(),
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
                 rpc_tpu_client_args,
+                light_client_proofs: light_client_proofs.clone(),
             };
             let json_rpc_service =
                 JsonRpcService::new_with_config(rpc_svc_config).map_err(ValidatorError::Other)?;
@@ -1334,6 +1345,7 @@ impl Validator {
                 sender: bank_notification_sender,
                 should_send_parents: geyser_plugin_service.is_some(),
                 dependency_tracker,
+                light_client_proofs,
             });
             (
                 Some(json_rpc_service),
@@ -2202,6 +2214,12 @@ fn initialize_event_system(
     Ok(event_system)
 }
 
+/// Whether the node serves light-client proofs: they need the JSON RPC
+/// service, with `JsonRpcConfig::enable_light_client_proofs`.
+fn light_client_proofs_enabled(config: &ValidatorConfig) -> bool {
+    config.rpc_addrs.is_some() && config.rpc_config.enable_light_client_proofs
+}
+
 #[allow(clippy::type_complexity)]
 fn load_blockstore(
     config: &ValidatorConfig,
@@ -2239,7 +2257,13 @@ fn load_blockstore(
         new_hard_forks: config.new_hard_forks.clone(),
         debug_keys: config.debug_keys.clone(),
         accounts_db_config: config.accounts_db_config.clone(),
-        runtime_config: config.runtime_config.clone(),
+        runtime_config: RuntimeConfig {
+            // Banks keep their receipts' leaves for the light-client proof
+            // store; see `light_client_proofs_enabled`.
+            retain_light_client_proof_data: config.runtime_config.retain_light_client_proof_data
+                || light_client_proofs_enabled(config),
+            ..config.runtime_config.clone()
+        },
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
         ..blockstore_processor::ProcessOptions::default()
     };

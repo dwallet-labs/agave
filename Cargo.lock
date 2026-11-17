@@ -9949,6 +9949,7 @@ dependencies = [
 name = "solana-rpc"
 version = "5.0.0-alpha.0"
 dependencies = [
+ "agave-bls-cert-verify",
  "agave-feature-set",
  "agave-fs",
  "agave-math-utils",
@@ -10002,6 +10003,7 @@ dependencies = [
  "solana-keypair",
  "solana-leader-schedule",
  "solana-ledger",
+ "solana-light-client",
  "solana-measure",
  "solana-message",
  "solana-metrics",
