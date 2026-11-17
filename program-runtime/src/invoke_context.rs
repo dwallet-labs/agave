@@ -26,6 +26,7 @@ use {
     solana_hash::Hash,
     solana_instruction::Instruction,
     solana_instruction_error::InstructionError,
+    solana_merkle_tree::receipt_tree::{EventKind, log_data_payload},
     solana_pubkey::Pubkey,
     solana_sbpf::{
         ebpf::MM_HEAP_START,
@@ -191,6 +192,24 @@ impl<'a> EnvironmentConfig<'a> {
     }
 }
 
+/// An event emitted by a logging syscall, recorded for the transaction
+/// receipt (Transaction Receipt Tree SIMD).
+///
+/// Events are recorded independently of the log collector: neither its byte
+/// limit nor whether it is enabled has any influence on them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedEvent {
+    /// Program that called the syscall.
+    pub program_id: Pubkey,
+    /// Index of the emitting instruction in the [`TransactionContext`]
+    /// instruction trace. This is not the execution order index committed in
+    /// the receipt: the SVM maps one to the other once the transaction is
+    /// done.
+    pub index_in_trace: usize,
+    pub kind: EventKind,
+    pub payload: Vec<u8>,
+}
+
 /// Main pipeline from runtime to program execution.
 pub struct InvokeContext<'a, 'ix_data> {
     /// Information about the currently executing transaction.
@@ -204,6 +223,9 @@ pub struct InvokeContext<'a, 'ix_data> {
     /// The compute cost for the current invocation.
     execution_cost: SVMTransactionExecutionCost,
     log_collector: Option<Rc<RefCell<LogCollector>>>,
+    /// Events for the transaction receipt, `Some` only when event recording
+    /// is enabled for this transaction (see [`Self::enable_event_recording`]).
+    recorded_events: Option<RefCell<Vec<RecordedEvent>>>,
     /// Time spent so far executing nested program calls.
     pub total_nested_exec_time: Duration,
     pub timings: ExecuteDetailsTimings,
@@ -229,6 +251,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             program_cache_for_tx_batch,
             environment_config,
             log_collector,
+            recorded_events: None,
             compute_budget,
             execution_cost,
             total_nested_exec_time: Duration::ZERO,
@@ -746,6 +769,59 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
     /// Get this invocation's LogCollector
     pub fn get_log_collector(&self) -> Option<Rc<RefCell<LogCollector>>> {
         self.log_collector.clone()
+    }
+
+    /// Starts recording the events emitted by the logging syscalls of this
+    /// transaction, for its receipt.
+    pub fn enable_event_recording(&mut self) {
+        self.recorded_events = Some(RefCell::new(Vec::new()));
+    }
+
+    /// Whether events are recorded for this transaction.
+    pub fn is_event_recording_enabled(&self) -> bool {
+        self.recorded_events.is_some()
+    }
+
+    /// Takes the events recorded so far, in emission order. Returns `None` if
+    /// event recording is not enabled.
+    pub fn take_recorded_events(&mut self) -> Option<Vec<RecordedEvent>> {
+        self.recorded_events
+            .as_ref()
+            .map(|events| std::mem::take(&mut *events.borrow_mut()))
+    }
+
+    /// Records a `sol_log_data` event with `fields` for the currently
+    /// executing instruction. Does nothing unless event recording is enabled.
+    pub fn record_log_data_event<T: AsRef<[u8]>>(
+        &self,
+        fields: &[T],
+    ) -> Result<(), InstructionError> {
+        self.record_event(EventKind::LogData, || log_data_payload(fields))
+    }
+
+    /// Records a `sol_log_` event with `message` for the currently executing
+    /// instruction. Does nothing unless event recording is enabled.
+    pub fn record_log_event(&self, message: &[u8]) -> Result<(), InstructionError> {
+        self.record_event(EventKind::Log, || message.to_vec())
+    }
+
+    fn record_event(
+        &self,
+        kind: EventKind,
+        payload: impl FnOnce() -> Vec<u8>,
+    ) -> Result<(), InstructionError> {
+        let Some(recorded_events) = self.recorded_events.as_ref() else {
+            return Ok(());
+        };
+        let instruction_context = self.transaction_context.get_current_instruction_context()?;
+        let event = RecordedEvent {
+            program_id: *instruction_context.get_program_key()?,
+            index_in_trace: instruction_context.get_index_in_trace(),
+            kind,
+            payload: payload(),
+        };
+        recorded_events.borrow_mut().push(event);
+        Ok(())
     }
 
     /// Get this invocation's compute budget
