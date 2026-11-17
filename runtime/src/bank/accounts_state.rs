@@ -55,8 +55,11 @@
 //!   `S`: an address without an overlay entry has its current state in the
 //!   base, an address with one has its base hash in the entry. The scan starts
 //!   when the first child of `S` is created; slot 5 uses the base roots from
-//!   the snapshot without waiting for it, and a rebuilt root that differs from
-//!   the snapshot's fails the cell.
+//!   the snapshot without waiting for it. A rebuilt root that differs from
+//!   the snapshot's makes the snapshot invalid: from then on every bank that
+//!   needs that base has a
+//!   [`CommitmentFailure::AccountsStateSnapshotBaseMismatch`], with no
+//!   fallback to either root.
 //!
 //! Base cells are keyed by `(E, P.slot, P.bank_hash)`, so forks with different
 //! `P` get different bases and forks with the same `P` share one job.
@@ -153,6 +156,16 @@ enum BaseState {
     Pending,
     Ready(Arc<BaseTree>),
     Failed(String),
+    /// The leaves rebuilt from a snapshot do not have the base root the
+    /// snapshot carries: the snapshot is invalid. Final.
+    SnapshotMismatch {
+        snapshot: Hash,
+        rebuilt: Hash,
+    },
+}
+
+fn snapshot_mismatch_reason(snapshot: &Hash, rebuilt: &Hash) -> String {
+    format!("rebuilt base root {rebuilt} differs from the snapshot's base root {snapshot}")
 }
 
 /// The base tree of one generation on one chain, computed by a background
@@ -195,21 +208,29 @@ impl BaseCell {
     }
 
     /// Stores the result of the job. A cell that is ready keeps its tree. A
-    /// tree whose root differs from the known root is a failure.
+    /// tree whose root differs from the known root makes the snapshot that
+    /// carried the root invalid, see [`Self::snapshot_mismatch`].
     fn finish(&self, result: Result<BaseTree, String>) {
-        let result = result.and_then(|tree| match self.known_root {
-            Some(known) if known != tree.root() => Err(format!(
-                "rebuilt base root {} differs from the known base root {known}",
-                tree.root()
-            )),
-            _ => Ok(tree),
-        });
         let mut state = self.state.lock().unwrap();
-        if matches!(*state, BaseState::Ready(_)) {
+        if matches!(
+            *state,
+            BaseState::Ready(_) | BaseState::SnapshotMismatch { .. }
+        ) {
             return;
         }
         *state = match result {
-            Ok(tree) => BaseState::Ready(Arc::new(tree)),
+            Ok(tree) => match self.known_root {
+                Some(snapshot) if snapshot != tree.root() => {
+                    let rebuilt = tree.root();
+                    error!(
+                        "accounts state base {:?}: invalid snapshot: {}",
+                        self.id,
+                        snapshot_mismatch_reason(&snapshot, &rebuilt)
+                    );
+                    BaseState::SnapshotMismatch { snapshot, rebuilt }
+                }
+                _ => BaseState::Ready(Arc::new(tree)),
+            },
             Err(reason) => {
                 warn!("accounts state base {:?} failed: {reason}", self.id);
                 BaseState::Failed(reason)
@@ -225,6 +246,9 @@ impl BaseCell {
             match &*state {
                 BaseState::Ready(tree) => return Ok(tree.clone()),
                 BaseState::Failed(reason) => return Err(reason.clone()),
+                BaseState::SnapshotMismatch { snapshot, rebuilt } => {
+                    return Err(snapshot_mismatch_reason(snapshot, rebuilt));
+                }
                 BaseState::Pending => {
                     if self.from_snapshot && !self.rebuild_started.load(Ordering::Acquire) {
                         return Err(
@@ -237,21 +261,35 @@ impl BaseCell {
         }
     }
 
-    /// `base_root`, waiting for the job if the root is not known yet.
+    /// `(snapshot, rebuilt)` base roots, if the leaves rebuilt from a
+    /// snapshot turned out not to have the root the snapshot carries.
+    pub fn snapshot_mismatch(&self) -> Option<(Hash, Hash)> {
+        match &*self.state.lock().unwrap() {
+            BaseState::SnapshotMismatch { snapshot, rebuilt } => Some((*snapshot, *rebuilt)),
+            _ => None,
+        }
+    }
+
+    /// `base_root`, waiting for the job if the root is not known yet. A root
+    /// from a snapshot is used until the rebuilt leaves contradict it.
     pub fn wait_root(&self) -> Result<Hash, String> {
+        if let Some((snapshot, rebuilt)) = self.snapshot_mismatch() {
+            return Err(snapshot_mismatch_reason(&snapshot, &rebuilt));
+        }
         match self.known_root {
             Some(root) => Ok(root),
             None => self.wait_tree().map(|tree| tree.root()),
         }
     }
 
-    /// `base_root` if it is known now, without waiting.
+    /// `base_root` if it is known now, without waiting. `None` once a
+    /// snapshot's root has been contradicted.
     pub fn root_if_known(&self) -> Option<Hash> {
-        self.known_root
-            .or_else(|| match &*self.state.lock().unwrap() {
-                BaseState::Ready(tree) => Some(tree.root()),
-                _ => None,
-            })
+        match &*self.state.lock().unwrap() {
+            BaseState::Ready(tree) => Some(tree.root()),
+            BaseState::SnapshotMismatch { .. } => None,
+            BaseState::Pending | BaseState::Failed(_) => self.known_root,
+        }
     }
 
     /// Whether the job has finished (successfully or not).
@@ -724,10 +762,26 @@ impl Bank {
     /// `base_root` of `generation`, waiting for its job; if the job failed,
     /// rebuilt synchronously by a scan of the parent.
     fn resolve_base_root(&self, generation: &Generation) -> Result<Hash, CommitmentFailure> {
+        let snapshot_mismatch = || {
+            generation
+                .base
+                .snapshot_mismatch()
+                .map(
+                    |(snapshot, rebuilt)| CommitmentFailure::AccountsStateSnapshotBaseMismatch {
+                        generation: generation.epoch,
+                        snapshot,
+                        rebuilt,
+                    },
+                )
+        };
         let reason = match generation.base.wait_root() {
             Ok(root) => return Ok(root),
             Err(reason) => reason,
         };
+        // An invalid snapshot is not repaired by another scan.
+        if let Some(failure) = snapshot_mismatch() {
+            return Err(failure);
+        }
         warn!(
             "bank {} rebuilds the base of generation {} synchronously: {reason}",
             self.slot(),
@@ -736,9 +790,13 @@ impl Bank {
         // TODO(simd-accounts-state-root): this blocks the freeze for a full
         // scan; it only runs when the background job failed.
         self.rebuild_base_from_parent(generation)
-            .map_err(|rebuild| CommitmentFailure::AccountsStateBaseUnavailable {
-                generation: generation.epoch,
-                reason: format!("{reason}; synchronous rebuild: {rebuild}"),
+            .map_err(|rebuild| {
+                snapshot_mismatch().unwrap_or_else(|| {
+                    CommitmentFailure::AccountsStateBaseUnavailable {
+                        generation: generation.epoch,
+                        reason: format!("{reason}; synchronous rebuild: {rebuild}"),
+                    }
+                })
             })
     }
 
@@ -763,18 +821,24 @@ impl Bank {
         };
         let tree = scan_base_trees(&parent, &[&overlay])?.remove(0);
         let root = tree.root();
-        if let Some(known) = generation.base.known_root
-            && known != root
-        {
-            return Err(format!(
-                "rebuilt base root {root} differs from the known root {known}"
-            ));
-        }
-        // Replace the failure, so that the other banks of the chain use it.
+        // Replace the failure, so that the other banks of the chain use the
+        // result.
         let mut state = generation.base.state.lock().unwrap();
-        *state = BaseState::Ready(Arc::new(tree));
+        let result = match generation.base.known_root {
+            Some(snapshot) if snapshot != root => {
+                *state = BaseState::SnapshotMismatch {
+                    snapshot,
+                    rebuilt: root,
+                };
+                Err(snapshot_mismatch_reason(&snapshot, &root))
+            }
+            _ => {
+                *state = BaseState::Ready(Arc::new(tree));
+                Ok(root)
+            }
+        };
         generation.base.ready.notify_all();
-        Ok(root)
+        result
     }
 
     /// Proof of the state of `address` at the end of this frozen bank, from

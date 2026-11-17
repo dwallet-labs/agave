@@ -219,6 +219,18 @@ pub enum CommitmentFailure {
     /// (the background job and the synchronous rebuild both failed).
     #[error("the base tree of generation {generation} is unavailable: {reason}")]
     AccountsStateBaseUnavailable { generation: u64, reason: String },
+    /// Slot 5: the snapshot this node started from carries a `base_root`
+    /// for the generation in use that the base leaves rebuilt from the
+    /// snapshot's accounts do not have. The snapshot is invalid.
+    #[error(
+        "invalid snapshot: it carries base root {snapshot} for generation {generation}, the \
+         accounts give {rebuilt}"
+    )]
+    AccountsStateSnapshotBaseMismatch {
+        generation: u64,
+        snapshot: Hash,
+        rebuilt: Hash,
+    },
 }
 
 impl CommitmentFailure {
@@ -232,6 +244,9 @@ impl CommitmentFailure {
             Self::InconsistentAccountUpdates { .. } => "inconsistent_account_updates",
             Self::AccountsStateNotTracked { .. } => "accounts_state_not_tracked",
             Self::AccountsStateBaseUnavailable { .. } => "accounts_state_base_unavailable",
+            Self::AccountsStateSnapshotBaseMismatch { .. } => {
+                "accounts_state_snapshot_base_mismatch"
+            }
         }
     }
 }
