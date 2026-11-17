@@ -45,7 +45,10 @@ use {
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     solana_runtime::{
-        bank::{Bank, BankId},
+        bank::{
+            Bank, BankId,
+            block_commitment::{CommitmentFailure, CommitmentVerificationError},
+        },
         bank_forks::BankForks,
         block_component_processor::BlockComponentProcessorError,
         commitment::VOTE_THRESHOLD_SIZE,
@@ -309,6 +312,9 @@ pub enum BlockstoreProcessorError {
 
     #[error("commitment root mismatch at slot {0}: expected {1}, got {2}")]
     CommitmentRootMismatch(Slot, Hash, Hash),
+
+    #[error("commitment failure at slot {0}: {1}")]
+    CommitmentFailure(Slot, CommitmentFailure),
 
     #[error("failed to request transaction-history purge for slot {0}: {1}")]
     FailedToRequestTransactionHistoryPurge(Slot, #[source] TransactionStatusSenderError),
@@ -2451,19 +2457,23 @@ pub fn process_single_slot(
     }
 
     // Block Commitment Root: the footer's commitment root must match the one
-    // computed at freeze. A mismatch is handled exactly like a bank hash
+    // computed at freeze, and the bank must have been able to compute one. A
+    // mismatch or a commitment failure is handled exactly like a bank hash
     // mismatch.
-    if let Err((expected_root, computed_root)) = bank.verify_commitment_root() {
-        warn!(
-            "slot {slot} commitment root mismatch expected {expected_root} computed \
-             {computed_root}"
-        );
-        mark_dead_if_primary_access(blockstore, slot);
-        return Err(BlockstoreProcessorError::CommitmentRootMismatch(
-            slot,
-            expected_root,
-            computed_root,
-        ));
+    match bank.verify_commitment_root() {
+        Ok(()) => {}
+        Err(CommitmentVerificationError::Mismatch { expected, computed }) => {
+            warn!("slot {slot} commitment root mismatch expected {expected} computed {computed}");
+            mark_dead_if_primary_access(blockstore, slot);
+            return Err(BlockstoreProcessorError::CommitmentRootMismatch(
+                slot, expected, computed,
+            ));
+        }
+        Err(CommitmentVerificationError::Failure(failure)) => {
+            warn!("slot {slot} has no commitment root, commitment failure: {failure}");
+            mark_dead_if_primary_access(blockstore, slot);
+            return Err(BlockstoreProcessorError::CommitmentFailure(slot, failure));
+        }
     }
 
     if let Some(slot_callback) = &opts.slot_callback {
@@ -3212,6 +3222,70 @@ pub mod tests {
             &[1, 0]
         );
         verify_fork_infos(&bank_forks);
+    }
+
+    /// Block Commitment Root: a bank that cannot compute its commitment root
+    /// (here, its parent has no block id) records a commitment failure at
+    /// freeze, and replay rejects the block with that reason and marks the
+    /// slot dead, as for a commitment root mismatch.
+    #[test]
+    fn test_process_single_slot_commitment_failure_marks_slot_dead() {
+        agave_logger::setup();
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_tower_genesis_config(10_000);
+        solana_runtime::genesis_utils::activate_feature(
+            &mut genesis_config,
+            agave_feature_set::block_commitment_root::id(),
+        );
+        let ticks_per_slot = genesis_config.ticks_per_slot;
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        fill_blockstore_slot_with_ticks(&blockstore, ticks_per_slot, 1, 0, blockhash);
+
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let bank0 = bank_forks.read().unwrap().get(0).unwrap();
+        bank0.fill_bank_with_ticks_for_tests();
+        bank0.freeze();
+        assert!(bank0.commitment_root().is_some());
+        assert_eq!(bank0.block_id(), None);
+        let bank1 = bank_forks.write().unwrap().insert(Bank::new_from_parent(
+            bank0.clone(),
+            SlotLeader::default(),
+            1,
+        ));
+
+        let result = process_single_slot(
+            &blockstore,
+            &bank1,
+            compute_shred_version(&genesis_config.hash(), None),
+            &ReplayVerificationWorkerPool::new(NonZeroUsize::MIN),
+            &ProcessOptions {
+                skip_inter_slot_verification: true,
+                ..ProcessOptions::default()
+            },
+            &mut ConfirmationProgress::new(blockhash),
+            None,
+            None,
+            &mut ExecuteTimings::default(),
+            &MigrationStatus::default(),
+        );
+        let expected_failure = CommitmentFailure::MissingParentBlockId { parent_slot: 0 };
+        assert_matches!(
+            result,
+            Err(BlockstoreProcessorError::CommitmentFailure(1, ref failure))
+                if *failure == expected_failure
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("parent 0 has no block id")
+        );
+        assert!(bank1.is_frozen());
+        assert_eq!(bank1.commitment_failure(), Some(expected_failure));
+        assert_eq!(bank1.commitment_root(), None);
+        assert!(blockstore.is_dead(1));
     }
 
     #[test]
