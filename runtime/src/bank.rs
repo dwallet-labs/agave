@@ -2531,7 +2531,7 @@ impl Bank {
             accounts_lt_hash: self.accounts_lt_hash.lock().unwrap().clone(),
             block_id: self.block_id().expect("block id must be set"),
             block_commitment: self.block_commitment_for_snapshot(),
-            epoch_boundary: self.epoch_boundary(),
+            epoch_boundary: self.epoch_boundary_for_snapshot(),
             accounts_state: self.accounts_state_for_snapshot(),
         }
     }
