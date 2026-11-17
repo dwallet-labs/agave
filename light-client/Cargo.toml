@@ -1,0 +1,59 @@
+[package]
+name = "solana-light-client"
+description = "Verification of light-client proofs: finality certificates, footer proofs and the block commitment root"
+documentation = "https://docs.rs/solana-light-client"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[lib]
+crate-type = ["lib"]
+name = "solana_light_client"
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+blake3 = { workspace = true }
+solana-bls-signatures = { workspace = true }
+solana-epoch-schedule = { workspace = true }
+solana-hash = { workspace = true, features = ["copy"] }
+solana-merkle-tree = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
+solana-signer-store = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+agave-bls-cert-verify = { workspace = true, features = ["dev-context-only-utils"] }
+agave-feature-set = { workspace = true }
+agave-votor-messages = { workspace = true, features = ["dev-context-only-utils"] }
+bitvec = { workspace = true }
+solana-account = { workspace = true }
+solana-accounts-db = { workspace = true }
+solana-entry = { workspace = true }
+solana-feature-gate-interface = { workspace = true }
+solana-fee-calculator = { workspace = true }
+solana-genesis-config = { workspace = true }
+solana-instruction = { workspace = true }
+solana-keypair = { workspace = true }
+solana-ledger = { workspace = true }
+solana-light-client = { path = ".", features = ["agave-unstable-api"] }
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
+solana-runtime-transaction = { workspace = true, features = ["dev-context-only-utils"] }
+solana-sdk-ids = { workspace = true }
+solana-signer = { workspace = true }
+solana-system-transaction = { workspace = true }
+solana-transaction = { workspace = true }
+
+[lints]
+workspace = true
