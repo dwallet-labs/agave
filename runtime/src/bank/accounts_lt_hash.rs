@@ -460,6 +460,16 @@ impl AccountsLtHashAsyncProgress {
         Some(merged)
     }
 
+    /// Records `prefix` as the previous version of `address` without hashing
+    /// an update, as if an update had been lost. Tests only.
+    #[cfg(test)]
+    pub(super) fn record_unmatched_prev_for_tests(&self, address: &Pubkey, prefix: Hash) {
+        self.accounts_delta.as_ref().expect("collecting")[0]
+            .lock()
+            .unwrap()
+            .record_prev(address, prefix);
+    }
+
     /// Processes `update` and mixes the result into `accum_lt_hash`.
     ///
     /// Note: Since an LtHash is large, `accum_lt_hash` is passed as an in-out parameter.

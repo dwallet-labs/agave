@@ -1057,10 +1057,11 @@ pub struct Bank {
     transaction_receipts: transaction_receipts::ReceiptAccumulator,
 
     /// Accounts Delta Root: the accounts changed in this bank, sorted, and
-    /// their root. Computed when the bank is frozen with the
-    /// `block_commitment_root` and `accounts_delta_root` features active.
-    /// None otherwise, and for banks loaded from a snapshot.
-    accounts_delta: RwLock<Option<Arc<solana_merkle_tree::accounts_delta::AccountsDelta>>>,
+    /// their root, or the commitment failure that prevents computing them.
+    /// Computed when the bank is frozen with the `block_commitment_root` and
+    /// `accounts_delta_root` features active. None otherwise, and for banks
+    /// loaded from a snapshot.
+    accounts_delta: RwLock<Option<accounts_delta::AccountsDeltaState>>,
 
     /// Epoch Boundary Commitment state: where the previous epoch ended on this
     /// bank's chain. Set when the bank is frozen with the `block_commitment_root`
