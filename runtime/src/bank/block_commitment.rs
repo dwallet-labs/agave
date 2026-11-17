@@ -164,6 +164,10 @@ pub enum CommitmentFailure {
     /// its own, so `H(B)` is unknown.
     #[error("parent {parent_slot} has a commitment failure")]
     ParentCommitmentFailure { parent_slot: Slot },
+    /// Slot 4: this bank is the first of its epoch and its parent has no
+    /// block id, so the epoch boundary cannot be computed.
+    #[error("parent {parent_slot} has no block id for the epoch boundary")]
+    EpochBoundaryMissingParentBlockId { parent_slot: Slot },
 }
 
 impl CommitmentFailure {
@@ -172,6 +176,9 @@ impl CommitmentFailure {
         match self {
             Self::MissingParentBlockId { .. } => "missing_parent_block_id",
             Self::ParentCommitmentFailure { .. } => "parent_commitment_failure",
+            Self::EpochBoundaryMissingParentBlockId { .. } => {
+                "epoch_boundary_missing_parent_block_id"
+            }
         }
     }
 }
@@ -266,13 +273,18 @@ impl Bank {
         if !self.is_block_commitment_root_active() {
             return;
         }
-        match self.compute_block_commitment() {
-            Ok(commitment) => {
-                // Same inputs as commitment slot 4 of that vector.
-                *self.epoch_boundary.write().unwrap() = self.compute_epoch_boundary(
-                    self.parent().as_deref(),
-                    commitment.block_history.leaf_count(),
-                );
+        let result = self.compute_block_commitment().and_then(|commitment| {
+            // Same inputs as commitment slot 4 of that vector, so this cannot
+            // fail once the vector was computed.
+            let epoch_boundary = self.compute_epoch_boundary(
+                self.parent().as_deref(),
+                commitment.block_history.leaf_count(),
+            )?;
+            Ok((commitment, epoch_boundary))
+        });
+        match result {
+            Ok((commitment, epoch_boundary)) => {
+                *self.epoch_boundary.write().unwrap() = epoch_boundary;
                 *self.block_commitment.write().unwrap() = Some(commitment);
             }
             Err(failure) => {
@@ -414,7 +426,7 @@ impl Bank {
         inputs: &CommitmentInputs,
     ) -> std::result::Result<Hash, CommitmentFailure> {
         Ok(self
-            .compute_epoch_boundary(inputs.parent, inputs.block_history.leaf_count())
+            .compute_epoch_boundary(inputs.parent, inputs.block_history.leaf_count())?
             .map(|epoch_boundary| epoch_boundary.hash())
             .unwrap_or(INACTIVE_COMMITMENT_SLOT))
     }
