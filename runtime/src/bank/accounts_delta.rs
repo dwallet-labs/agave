@@ -117,12 +117,13 @@ impl NetPrefixes {
         }
     }
 
-    /// `None` if the address is unchanged, the prefix of the state after the
-    /// block if it changed, or `Err` if the counts do not form a chain.
-    fn resolve(&self) -> Result<Option<Hash>, ()> {
+    /// `None` if the address is unchanged, the prefixes of the states before
+    /// and after the block if it changed, or `Err` if the counts do not form
+    /// a chain.
+    fn resolve(&self) -> Result<Option<(Hash, Hash)>, ()> {
         match self.0.as_slice() {
             [] => Ok(None),
-            [(_, 1), (after, -1)] | [(after, -1), (_, 1)] => Ok(Some(*after)),
+            [(before, 1), (after, -1)] | [(after, -1), (before, 1)] => Ok(Some((*before, *after))),
             _ => Err(()),
         }
     }
@@ -178,13 +179,25 @@ impl AccountsDeltaPrefixes {
 
     /// The changed accounts: the addresses whose state after the block differs
     /// from their state before it, with the `account_hash` of the state after.
+    #[cfg(test)]
     pub(crate) fn into_accounts_delta(self) -> Result<AccountsDelta, InconsistentAccountUpdates> {
-        let mut entries = Vec::with_capacity(self.by_address.len());
+        self.into_accounts_delta_with_prior()
+            .map(|(delta, _prior)| delta)
+    }
+
+    /// Like [`Self::into_accounts_delta`], with the `account_hash` of each
+    /// changed account before the block (the prefix of its first previous
+    /// version), in the order of the delta's entries. The accounts state
+    /// overlay takes it for addresses it inserts.
+    pub(crate) fn into_accounts_delta_with_prior(
+        self,
+    ) -> Result<(AccountsDelta, Vec<Hash>), InconsistentAccountUpdates> {
+        let mut changed = Vec::with_capacity(self.by_address.len());
         for (address, net) in &self.by_address {
             match net.resolve() {
                 Ok(None) => {}
-                Ok(Some(account_hash)) => {
-                    entries.push(DeltaEntry::new(address.to_bytes(), account_hash))
+                Ok(Some((before, after))) => {
+                    changed.push((DeltaEntry::new(address.to_bytes(), after), before))
                 }
                 Err(()) => {
                     return Err(InconsistentAccountUpdates {
@@ -195,13 +208,16 @@ impl AccountsDeltaPrefixes {
             }
         }
         drop(self);
-        Ok(
-            AccountsDelta::new(entries).unwrap_or_else(
-                |AccountsDeltaError::DuplicateAddress(_)| {
-                    unreachable!("addresses are the keys of a map")
-                },
-            ),
-        )
+        // Addresses are unique (map keys), so an unstable sort is
+        // deterministic.
+        changed.sort_unstable_by_key(|(entry, _)| entry.address);
+        let (entries, prior): (Vec<_>, Vec<_>) = changed.into_iter().unzip();
+        let delta = AccountsDelta::new(entries).unwrap_or_else(
+            |AccountsDeltaError::DuplicateAddress(_)| {
+                unreachable!("addresses are the keys of a map")
+            },
+        );
+        Ok((delta, prior))
     }
 }
 
@@ -298,14 +314,23 @@ impl Bank {
             // hash correct. A broken chain means an update was lost or
             // duplicated, and then the lattice hash, and so the bank hash, is
             // wrong too.
-            Some(prefixes) => prefixes.into_accounts_delta().map(Arc::new).map_err(|err| {
-                CommitmentFailure::InconsistentAccountUpdates {
+            Some(prefixes) => prefixes
+                .into_accounts_delta_with_prior()
+                .map(|(delta, prior)| (Arc::new(delta), prior))
+                .map_err(|err| CommitmentFailure::InconsistentAccountUpdates {
                     address: err.address,
                     num_prefixes: err.num_prefixes,
-                }
-            }),
+                }),
         };
-        *self.accounts_delta.write().unwrap() = Some(delta);
+        // The accounts state overlays (slot 5) are updated from the same
+        // changed accounts, with their hashes before and after the block.
+        self.finish_accounts_state(
+            delta
+                .as_ref()
+                .map(|(delta, prior)| (delta.as_ref(), prior.as_slice()))
+                .map_err(Clone::clone),
+        );
+        *self.accounts_delta.write().unwrap() = Some(delta.map(|(delta, _prior)| delta));
         num_addresses
     }
 }

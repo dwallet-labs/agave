@@ -248,6 +248,7 @@ use {
 
 pub mod accounts_delta;
 mod accounts_lt_hash;
+pub mod accounts_state;
 mod address_lookup_table;
 pub mod bank_hash_details;
 pub mod block_commitment;
@@ -531,6 +532,7 @@ pub enum VATHealthError {
         bank_hash_stats(pub),
         block_id(pub),
         block_commitment(pub),
+        accounts_state(pub),
     )
 )]
 pub struct BankFieldsToDeserialize {
@@ -566,6 +568,10 @@ pub struct BankFieldsToDeserialize {
     /// Block Commitment Root state of the snapshot bank, None if the feature
     /// was not active for it (or the snapshot predates the feature).
     pub(crate) block_commitment: Option<block_commitment::BlockCommitment>,
+    /// Accounts State Root state of the snapshot bank (overlays and known
+    /// base roots), None if the feature was not active for it (or the
+    /// snapshot predates the feature).
+    pub(crate) accounts_state: Option<accounts_state::SnapshotAccountsState>,
 }
 
 #[cfg(feature = "dev-context-only-utils")]
@@ -600,6 +606,7 @@ impl Default for BankFieldsToDeserialize {
             bank_hash_stats: BankHashStats::default(),
             block_id: Option::<BlockId>::default(),
             block_commitment: None,
+            accounts_state: None,
         }
     }
 }
@@ -641,6 +648,7 @@ pub struct BankFieldsToSerialize {
     pub accounts_lt_hash: AccountsLtHash,
     pub block_id: BlockId,
     pub block_commitment: Option<block_commitment::BlockCommitment>,
+    pub accounts_state: Option<accounts_state::SnapshotAccountsState>,
 }
 
 // Can't derive PartialEq because RwLock doesn't implement PartialEq
@@ -722,6 +730,11 @@ impl PartialEq for Bank {
             expected_commitment_root: _,
             // Derived from the account updates; `block_commitment` commits to it.
             accounts_delta: _,
+            // Committed to by `block_commitment`; base cells are compared by
+            // the accounts state tests.
+            accounts_state: _,
+            accounts_state_bases: _,
+            commitment_vector: _,
             commitment_failure,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
@@ -803,6 +816,7 @@ impl BankFieldsToSerialize {
             accounts_lt_hash: AccountsLtHash(LtHash([0x7E57; LtHash::NUM_ELEMENTS])),
             block_id: BlockId::default(),
             block_commitment: None,
+            accounts_state: None,
         }
     }
 }
@@ -1039,6 +1053,17 @@ pub struct Bank {
     /// `accounts_delta_root` features active. None otherwise, and for banks
     /// loaded from a snapshot.
     accounts_delta: RwLock<Option<accounts_delta::AccountsDeltaState>>,
+    /// Accounts State Root: the generations (overlays and bases) held by this
+    /// bank, or the commitment failure that prevents computing them. Computed
+    /// when the bank is frozen with the `accounts_state_root` feature and the
+    /// features it depends on active, or loaded from a snapshot.
+    accounts_state: RwLock<Option<accounts_state::AccountsStateResult>>,
+    /// Base trees of the accounts state root, shared by all banks derived
+    /// from the same root bank.
+    accounts_state_bases: Arc<accounts_state::AccountsStateBases>,
+    /// The commitment vector, set with `block_commitment` when the bank is
+    /// frozen, to open a slot against the commitment root. Not in snapshots.
+    commitment_vector: RwLock<Option<block_commitment::CommitmentVector>>,
     /// Why the bank has no commitment root although the `block_commitment_root`
     /// feature is active for it. Set when the bank is frozen, instead of
     /// `block_commitment`; see [`block_commitment::CommitmentFailure`].
@@ -1319,6 +1344,9 @@ impl Bank {
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
             accounts_delta: RwLock::new(None),
+            accounts_state: RwLock::new(None),
+            accounts_state_bases: Arc::default(),
+            commitment_vector: RwLock::new(None),
             commitment_failure: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
@@ -1440,6 +1468,10 @@ impl Bank {
 
         parent.freeze();
         assert_ne!(slot, parent.slot());
+        // A parent loaded from a snapshot rebuilds the base leaves of its
+        // accounts state generations in the background, from its own state,
+        // starting now that nothing can have been rooted past it.
+        parent.start_accounts_state_rebuild();
 
         let epoch_schedule = parent.epoch_schedule().clone();
         let epoch = epoch_schedule.get_epoch(slot);
@@ -1576,6 +1608,9 @@ impl Bank {
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
             accounts_delta: RwLock::new(None),
+            accounts_state: RwLock::new(None),
+            accounts_state_bases: parent.accounts_state_bases.clone(),
+            commitment_vector: RwLock::new(None),
             commitment_failure: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
@@ -2263,6 +2298,7 @@ impl Bank {
             .accounts_db
             .partitioned_epoch_rewards_config
             .stake_account_stores_per_block;
+        let accounts_state_bases = Arc::<accounts_state::AccountsStateBases>::default();
         let mut bank = Self {
             rc: bank_rc,
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
@@ -2340,6 +2376,12 @@ impl Bank {
             block_commitment: RwLock::new(fields.block_commitment),
             expected_commitment_root: RwLock::new(None),
             accounts_delta: RwLock::new(None),
+            accounts_state: RwLock::new(Self::accounts_state_from_snapshot(
+                fields.accounts_state,
+                &accounts_state_bases,
+            )),
+            accounts_state_bases,
+            commitment_vector: RwLock::new(None),
             commitment_failure: RwLock::new(None),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
             is_alpenglow: AtomicBool::new(false),
@@ -2435,6 +2477,7 @@ impl Bank {
             accounts_lt_hash: self.accounts_lt_hash.lock().unwrap().clone(),
             block_id: self.block_id().expect("block id must be set"),
             block_commitment: self.block_commitment(),
+            accounts_state: self.accounts_state_for_snapshot(),
         }
     }
 
