@@ -85,6 +85,7 @@ pub struct FeatureSnapshot {
     pub block_commitment_root: bool,
     pub transaction_receipt_tree: bool,
     pub accounts_delta_root: bool,
+    pub epoch_validator_set_root: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -193,6 +194,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             block_commitment_root: is_active(&block_commitment_root::ID),
             transaction_receipt_tree: is_active(&transaction_receipt_tree::ID),
             accounts_delta_root: is_active(&accounts_delta_root::ID),
+            epoch_validator_set_root: is_active(&epoch_validator_set_root::ID),
         }
     }
 }
@@ -1719,6 +1721,18 @@ pub mod accounts_delta_root {
     solana_pubkey::declare_id!("8RSGq3ZhGWtbeSpgACfMWj91qHh8BQYZQ44xwbsmSKTJ");
 }
 
+/// Epoch Validator Set Root (draft SIMD, number not yet assigned).
+///
+/// Every block of epoch `E` commits to the Alpenglow signer set of epoch
+/// `E + 1` with `validator_set_root`, slot 3 of the commitment vector of
+/// `block_commitment_root`. Has no effect unless `block_commitment_root` is
+/// also active. Must be activated at an epoch boundary (as every feature is).
+/// Placeholder key: replace with the real feature key once the SIMD is
+/// accepted.
+pub mod epoch_validator_set_root {
+    solana_pubkey::declare_id!("3c2JAGjKSiwqVSRiR2csJN7Cwk7ZDgCsxyEJYgvT8zEd");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2876,6 +2890,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             accounts_delta_root::id(),
             "SIMD-XXXX: Accounts delta root",
+        ),
+        (
+            epoch_validator_set_root::id(),
+            "SIMD-XXXX: Epoch validator set root",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/

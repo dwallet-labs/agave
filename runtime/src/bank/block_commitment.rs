@@ -289,11 +289,17 @@ impl Bank {
 
     /// Commitment slot 3: `validator_set_root` (Epoch Validator Set Root SIMD).
     ///
-    /// Extension point: not implemented yet, so the slot is inactive and
-    /// zero. The implementation must return [`INACTIVE_COMMITMENT_SLOT`]
-    /// unless its own feature is active for this bank.
+    /// `validator_set_root(E + 1)` for a bank of epoch `E`, taken from this
+    /// bank's epoch stakes for `E + 1` (see [`super::validator_set_root`]).
+    /// [`INACTIVE_COMMITMENT_SLOT`] unless the `epoch_validator_set_root`
+    /// feature is active for this bank, and while the stakes of `E + 1` are
+    /// not yet fixed (leader schedule offset shorter than an epoch).
     pub fn commitment_slot_validator_set_root(&self, _inputs: &CommitmentInputs) -> Hash {
-        INACTIVE_COMMITMENT_SLOT
+        if !self.is_epoch_validator_set_root_active() {
+            return INACTIVE_COMMITMENT_SLOT;
+        }
+        self.next_epoch_validator_set_root()
+            .unwrap_or(INACTIVE_COMMITMENT_SLOT)
     }
 
     /// Commitment slot 4: `epoch_boundary` (Epoch Boundary Commitment SIMD).
