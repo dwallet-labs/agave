@@ -194,6 +194,11 @@ pub enum CommitmentFailure {
     /// block id, so the epoch boundary cannot be computed.
     #[error("parent {parent_slot} has no block id for the epoch boundary")]
     EpochBoundaryMissingParentBlockId { parent_slot: Slot },
+    /// Slot 4: the parent is in this bank's epoch and needs an epoch boundary
+    /// but has none (a bank restored from a snapshot written without the
+    /// field), so the epoch boundary is unknown.
+    #[error("parent {parent_slot} has the feature in effect but no epoch boundary state")]
+    MissingParentEpochBoundary { parent_slot: Slot },
 }
 
 impl CommitmentFailure {
@@ -206,6 +211,7 @@ impl CommitmentFailure {
             Self::EpochBoundaryMissingParentBlockId { .. } => {
                 "epoch_boundary_missing_parent_block_id"
             }
+            Self::MissingParentEpochBoundary { .. } => "missing_parent_epoch_boundary",
         }
     }
 }

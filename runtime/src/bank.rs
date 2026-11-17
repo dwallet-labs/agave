@@ -728,6 +728,7 @@ impl PartialEq for Bank {
             block_commitment,
             expected_commitment_root: _,
             epoch_boundary,
+            epoch_boundary_unknown,
             commitment_failure,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
@@ -772,6 +773,7 @@ impl PartialEq for Bank {
             && *block_id.read().unwrap() == *other.block_id.read().unwrap()
             && *block_commitment.read().unwrap() == *other.block_commitment.read().unwrap()
             && *epoch_boundary.read().unwrap() == *other.epoch_boundary.read().unwrap()
+            && *epoch_boundary_unknown == other.epoch_boundary_unknown
             && *commitment_failure.read().unwrap() == *other.commitment_failure.read().unwrap()
             && is_alpenglow.load(Relaxed) == other.is_alpenglow()
     }
@@ -1047,6 +1049,10 @@ pub struct Bank {
     /// bank of an epoch on its fork, copied from the parent otherwise), or
     /// loaded from a snapshot. None otherwise.
     epoch_boundary: RwLock<Option<EpochBoundary>>,
+    /// Whether this bank was restored from a snapshot without epoch boundary
+    /// state although it needs one, so its children in the same epoch cannot
+    /// copy it; see [`Bank::is_epoch_boundary_unknown`].
+    epoch_boundary_unknown: bool,
     /// Why the bank has no commitment root although the `block_commitment_root`
     /// feature is active for it. Set when the bank is frozen, instead of
     /// `block_commitment`; see [`block_commitment::CommitmentFailure`].
@@ -1322,6 +1328,7 @@ impl Bank {
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
             epoch_boundary: RwLock::new(None),
+            epoch_boundary_unknown: false,
             commitment_failure: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
@@ -1575,6 +1582,7 @@ impl Bank {
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
             epoch_boundary: RwLock::new(None),
+            epoch_boundary_unknown: false,
             commitment_failure: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
@@ -2339,6 +2347,7 @@ impl Bank {
             block_commitment: RwLock::new(fields.block_commitment),
             expected_commitment_root: RwLock::new(None),
             epoch_boundary: RwLock::new(fields.epoch_boundary),
+            epoch_boundary_unknown: false,
             commitment_failure: RwLock::new(None),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
             is_alpenglow: AtomicBool::new(false),
@@ -2364,6 +2373,7 @@ impl Bank {
 
         bank.refresh_slot_params_from_snapshot(genesis_config);
         bank.initialize_after_snapshot_restore(|| rewards_calculation_thread_pool);
+        bank.epoch_boundary_unknown = bank.is_epoch_boundary_unknown_after_snapshot_restore();
 
         datapoint_info!(
             "bank-new-from-fields",
