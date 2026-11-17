@@ -11,9 +11,11 @@ mod serde_snapshot_tests {
             },
             runtime_config::RuntimeConfig,
             serde_snapshot::{
-                self, AccountsDbFields, ExtraFieldsToSerialize, SerializableAccountsDb,
-                SnapshotAccountsDbFields, SnapshotStreams, deserialize_wincode_from,
+                self, AccountsDbFields, CommitmentExtraFields, ExtraFieldsToSerialize,
+                SerializableAccountsDb, SerializableVersionedBank, SnapshotAccountsDbFields,
+                SnapshotStreams, UnusedIncrementalSnapshotPersistence, deserialize_wincode_from,
                 reconstruct_accountsdb_from_fields, remap_append_vec_file, serialize_into,
+                types::{SerdeAccountsLtHash, SerdeBlockCommitment},
             },
             snapshot_bank_utils,
             snapshot_utils::{StorageAndNextAccountsFileId, create_tmp_accounts_dir_for_tests},
@@ -40,9 +42,11 @@ mod serde_snapshot_tests {
         },
         solana_clock::Slot,
         solana_epoch_schedule::EpochSchedule,
+        solana_hash::Hash,
         solana_native_token::LAMPORTS_PER_SOL,
         solana_pubkey::Pubkey,
         std::{
+            collections::HashMap,
             fs::File,
             io::{self, BufReader, BufWriter, Cursor, Read, Write},
             mem,
@@ -52,6 +56,7 @@ mod serde_snapshot_tests {
         },
         tempfile::TempDir,
         test_case::test_case,
+        wincode::SchemaWrite,
     };
 
     fn linear_ancestors(end_slot: u64) -> Ancestors {
@@ -909,7 +914,7 @@ mod serde_snapshot_tests {
             let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
             let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
             let block_id = Some(bank_fields.block_id);
-            let block_commitment = bank_fields.block_commitment.clone().map(Into::into);
+            let commitments = CommitmentExtraFields::new(&bank_fields);
             serde_snapshot::serialize_bank_snapshot_into(
                 &mut writer,
                 bank_fields,
@@ -921,7 +926,7 @@ mod serde_snapshot_tests {
                     versioned_epoch_stakes,
                     accounts_lt_hash,
                     block_id,
-                    block_commitment,
+                    commitments,
                 },
             )
             .unwrap();
@@ -1113,8 +1118,14 @@ mod serde_snapshot_tests {
             commitment1.child_block_history(1, &block_id1.to_hash())
         );
 
-        // A snapshot written before the field existed (it ends right after
-        // `block_id`) restores without block commitment state.
+        // The snapshot is the one without the field, followed by the field.
+        let without_field = master_format(&bank1);
+        assert_eq!(buf[..without_field.len()], without_field[..]);
+        assert_eq!(buf[without_field.len()], 1);
+
+        // A snapshot without the field (written before it existed, or by a
+        // release that does not write it) restores without block commitment
+        // state.
         let mut bank_fields = bank1.get_fields_to_serialize();
         let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
         let accounts_lt_hash = Some(bank_fields.accounts_lt_hash.clone().into());
@@ -1131,12 +1142,12 @@ mod serde_snapshot_tests {
                 versioned_epoch_stakes,
                 accounts_lt_hash,
                 block_id,
-                block_commitment: None,
+                commitments: CommitmentExtraFields::default(),
             },
         )
         .unwrap();
-        // Drop the `None` tag of `block_commitment`.
-        assert_eq!(old_buf.pop(), Some(0));
+        // Nothing is written for the field.
+        assert_eq!(old_buf, without_field);
         let dbank = Arc::new(deserialize(&old_buf));
         assert_eq!(dbank.block_commitment(), None);
         assert_eq!(dbank.block_id(), Some(block_id1));
@@ -1154,6 +1165,113 @@ mod serde_snapshot_tests {
                 parent_slot: 1,
             },
         );
+    }
+
+    /// The extra fields of `master`, which end with `block_id`.
+    #[derive(SchemaWrite)]
+    struct MasterExtraFields {
+        lamports_per_signature: u64,
+        unused_incremental_snapshot_persistence: Option<UnusedIncrementalSnapshotPersistence>,
+        unused_epoch_accounts_hash: Option<Hash>,
+        versioned_epoch_stakes: HashMap<u64, VersionedEpochStakes>,
+        accounts_lt_hash: Option<SerdeAccountsLtHash>,
+        block_id: Option<BlockId>,
+    }
+
+    #[derive(SchemaWrite)]
+    struct MasterBankSnapshot {
+        bank: SerializableVersionedBank,
+        accounts_db: SerializableAccountsDb,
+        extra_fields: MasterExtraFields,
+    }
+
+    /// The bank snapshot of `bank` in the format of `master`, without the
+    /// fields of the light-client commitment features.
+    fn master_format(bank: &Bank) -> Vec<u8> {
+        let mut bank_fields = bank.get_fields_to_serialize();
+        let extra_fields = MasterExtraFields {
+            lamports_per_signature: bank_fields.fee_rate_governor.lamports_per_signature,
+            unused_incremental_snapshot_persistence: None,
+            unused_epoch_accounts_hash: None,
+            versioned_epoch_stakes: mem::take(&mut bank_fields.versioned_epoch_stakes),
+            accounts_lt_hash: Some(bank_fields.accounts_lt_hash.clone().into()),
+            block_id: Some(bank_fields.block_id),
+        };
+        let slot = bank_fields.slot;
+        let snapshot = MasterBankSnapshot {
+            bank: SerializableVersionedBank::from(bank_fields),
+            accounts_db: SerializableAccountsDb::new(slot, bank.get_bank_hash_stats()),
+            extra_fields,
+        };
+        let mut buf = vec![];
+        serialize_into(&mut buf, &snapshot).unwrap();
+        buf
+    }
+
+    fn snapshot_bytes(bank: &Bank) -> Vec<u8> {
+        let mut buf = vec![];
+        serde_snapshot::bank_to_stream(&mut BufWriter::new(Cursor::new(&mut buf)), bank).unwrap();
+        buf
+    }
+
+    /// With the Block Commitment Root feature inactive the bank snapshot is
+    /// byte for byte the one of `master`, and it reads back without block
+    /// commitment state.
+    #[test]
+    fn test_snapshot_with_feature_inactive_has_master_format() {
+        let genesis_config =
+            create_genesis_config_with_leader(500, &Pubkey::new_unique(), LAMPORTS_PER_SOL)
+                .genesis_config;
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+        bank0.set_block_id(Some(BlockId::new_unique()));
+        bank0.freeze();
+        let bank1 = Bank::new_from_parent(bank0.clone(), *bank0.leader(), 1);
+        bank_test_utils::deposit(&bank1, &Pubkey::new_unique(), LAMPORTS_PER_SOL).unwrap();
+        bank1.set_block_id(Some(BlockId::new_unique()));
+        bank1.freeze();
+        for bank in [&*bank0, &bank1] {
+            assert!(!bank.is_block_commitment_root_active());
+            assert_eq!(bank.get_fields_to_serialize().block_commitment, None);
+            let bytes = snapshot_bytes(bank);
+            assert_eq!(bytes, master_format(bank));
+            let (bank_fields, _) =
+                serde_snapshot::fields_from_stream(&mut BufReader::new(&bytes[..])).unwrap();
+            assert_eq!(bank_fields.block_commitment, None);
+            assert_eq!(bank_fields.block_id, bank.block_id());
+        }
+    }
+
+    /// The commitment extra fields on the wire: nothing when absent, `Some`
+    /// and the value when present; read back from either, and from an
+    /// explicit `None`.
+    #[test]
+    fn test_commitment_extra_fields_wire_format() {
+        let to_bytes = |fields: &CommitmentExtraFields| {
+            let mut buf = vec![];
+            serialize_into(&mut buf, fields).unwrap();
+            buf
+        };
+        let from_bytes = |bytes: &[u8]| -> CommitmentExtraFields {
+            deserialize_wincode_from(&mut BufReader::new(bytes)).unwrap()
+        };
+        let absent = CommitmentExtraFields::default();
+        assert!(to_bytes(&absent).is_empty());
+        assert_eq!(from_bytes(&[]), absent);
+        assert_eq!(from_bytes(&[0]), absent);
+
+        let block_commitment = SerdeBlockCommitment {
+            history_leaf_count: 3,
+            history_subtree_roots: vec![Hash::new_unique(), Hash::new_unique()],
+            commitment_root: Hash::new_unique(),
+        };
+        let present = CommitmentExtraFields {
+            block_commitment: Some(block_commitment.clone()),
+        };
+        let bytes = to_bytes(&present);
+        let mut value = vec![];
+        serialize_into(&mut value, &block_commitment).unwrap();
+        assert_eq!(bytes, [&[1][..], &value].concat());
+        assert_eq!(from_bytes(&bytes), present);
     }
 
     #[test]
