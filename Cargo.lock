@@ -10195,6 +10195,7 @@ dependencies = [
  "arrayref",
  "base64 0.23.1",
  "bitvec",
+ "blake3",
  "bytemuck",
  "bytes",
  "criterion",

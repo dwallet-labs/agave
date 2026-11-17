@@ -273,11 +273,18 @@ impl Bank {
 
     /// Commitment slot 2: `accounts_delta_root` (Accounts Delta Root SIMD).
     ///
-    /// Extension point: not implemented yet, so the slot is inactive and
-    /// zero. The implementation must return [`INACTIVE_COMMITMENT_SLOT`]
-    /// unless its own feature is active for this bank.
+    /// [`INACTIVE_COMMITMENT_SLOT`] unless the `accounts_delta_root` feature
+    /// is active for this bank. The root is built in `freeze()` from the
+    /// account hashes collected by the lattice hash, after the last account
+    /// update of the bank (see [`super::accounts_delta`]).
     pub fn commitment_slot_accounts_delta_root(&self, _inputs: &CommitmentInputs) -> Hash {
-        INACTIVE_COMMITMENT_SLOT
+        if !self.is_accounts_delta_root_active() {
+            return INACTIVE_COMMITMENT_SLOT;
+        }
+        // Unset only if the bank did not collect from its first account
+        // update, which `finish_accounts_delta()` reports.
+        self.accounts_delta_root()
+            .unwrap_or(INACTIVE_COMMITMENT_SLOT)
     }
 
     /// Commitment slot 3: `validator_set_root` (Epoch Validator Set Root SIMD).
