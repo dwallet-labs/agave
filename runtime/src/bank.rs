@@ -728,6 +728,7 @@ impl PartialEq for Bank {
             block_commitment,
             expected_commitment_root: _,
             epoch_boundary,
+            commitment_failure,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
             block_component_processor: _,
@@ -771,6 +772,7 @@ impl PartialEq for Bank {
             && *block_id.read().unwrap() == *other.block_id.read().unwrap()
             && *block_commitment.read().unwrap() == *other.block_commitment.read().unwrap()
             && *epoch_boundary.read().unwrap() == *other.epoch_boundary.read().unwrap()
+            && *commitment_failure.read().unwrap() == *other.commitment_failure.read().unwrap()
             && is_alpenglow.load(Relaxed) == other.is_alpenglow()
     }
 }
@@ -1045,6 +1047,10 @@ pub struct Bank {
     /// bank of an epoch on its fork, copied from the parent otherwise), or
     /// loaded from a snapshot. None otherwise.
     epoch_boundary: RwLock<Option<EpochBoundary>>,
+    /// Why the bank has no commitment root although the `block_commitment_root`
+    /// feature is active for it. Set when the bank is frozen, instead of
+    /// `block_commitment`; see [`block_commitment::CommitmentFailure`].
+    commitment_failure: RwLock<Option<block_commitment::CommitmentFailure>>,
 
     /// Accounts stats for computing the bank hash
     bank_hash_stats: AtomicBankHashStats,
@@ -1316,6 +1322,7 @@ impl Bank {
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
             epoch_boundary: RwLock::new(None),
+            commitment_failure: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -1568,6 +1575,7 @@ impl Bank {
             block_commitment: RwLock::new(None),
             expected_commitment_root: RwLock::new(None),
             epoch_boundary: RwLock::new(None),
+            commitment_failure: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
@@ -2331,6 +2339,7 @@ impl Bank {
             block_commitment: RwLock::new(fields.block_commitment),
             expected_commitment_root: RwLock::new(None),
             epoch_boundary: RwLock::new(fields.epoch_boundary),
+            commitment_failure: RwLock::new(None),
             block_component_processor: RwLock::new(BlockComponentProcessor::default()),
             is_alpenglow: AtomicBool::new(false),
             transaction_execution_gate: CachePadded::new(TransactionExecutionGate::default()),
@@ -3334,17 +3343,9 @@ impl Bank {
             *hash = self.hash_internal_state();
             // The commitment vector is computed at the same point as the bank
             // hash, after the lattice hash is finished, and while the hash
-            // lock is held so that a frozen bank always has it.
-            let block_commitment = self.compute_block_commitment();
-            // Same inputs as commitment slot 4 of that vector.
-            *self.epoch_boundary.write().unwrap() =
-                block_commitment.as_ref().and_then(|block_commitment| {
-                    self.compute_epoch_boundary(
-                        self.parent().as_deref(),
-                        block_commitment.block_history.leaf_count(),
-                    )
-                });
-            *self.block_commitment.write().unwrap() = block_commitment;
+            // lock is held so that a frozen bank always has it, or the
+            // commitment failure that prevents it.
+            self.freeze_block_commitment();
             self.rc
                 .accounts
                 .accounts_db

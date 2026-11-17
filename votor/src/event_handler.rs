@@ -32,7 +32,7 @@ use {
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     solana_runtime::{
-        bank::{Bank, bank_hash_details},
+        bank::{Bank, bank_hash_details, block_commitment::CommitmentVerificationError},
         leader_schedule_utils::{
             first_of_consecutive_leader_slots, last_of_consecutive_leader_slots, leader_slot_index,
         },
@@ -993,17 +993,28 @@ impl EventHandler {
                 }
 
                 // Same for the block commitment root, which replay handles
-                // exactly like a bank hash mismatch.
+                // exactly like a bank hash mismatch, including a bank that
+                // could not compute its commitment root (commitment failure).
                 if bank.is_frozen()
                     && bank.block_id() == Some(block.block_id)
-                    && let Err((expected_root, computed_root)) = bank.verify_commitment_root()
+                    && let Err(err) = bank.verify_commitment_root()
                 {
+                    let problem = match err {
+                        CommitmentVerificationError::Mismatch { expected, computed } => format!(
+                            "a commitment root mismatch. The cluster commitment root is \
+                             {expected} however we computed {computed}"
+                        ),
+                        CommitmentVerificationError::Failure(failure) => format!(
+                            "no commitment root: we could not compute it (commitment failure \
+                             {}: {failure})",
+                            failure.name()
+                        ),
+                    };
                     panic!(
-                        "{my_pubkey}: Block {block:?} has been finalized, however we have a \
-                         commitment root mismatch. The cluster commitment root is {expected_root} \
-                         however we computed {computed_root}. At this point we will be unable to \
-                         recover. Ensure that you are running a supported Agave version for this \
-                         cluster, and restart from a snapshot > {}.",
+                        "{my_pubkey}: Block {block:?} has been finalized, however we have \
+                         {problem}. At this point we will be unable to recover. Ensure that you \
+                         are running a supported Agave version for this cluster, and restart \
+                         from a snapshot > {}.",
                         block.slot
                     );
                 }
