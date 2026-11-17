@@ -196,8 +196,15 @@ impl Bank {
     /// - mix in its current state
     ///
     /// This function waits for any queued or in-flight jobs on the accounts hasher threads,
-    /// computes their combined delta lt hash, then mixes it into the bank.
-    pub fn finish_accounts_lt_hash_updates(&self) {
+    /// computes their combined delta lt hash, then mixes it into the bank. It also builds the
+    /// bank's accounts delta from the account hashes collected by the same jobs.
+    ///
+    /// Must be called exactly once per bank, and only by `freeze()`, which calls it under the
+    /// hash lock while the bank hash is still unset, after which no account of the bank can be
+    /// updated. It is not public, because a second call is not harmless: the per-thread
+    /// accumulators are not reset, so they would be mixed into the lattice hash a second time
+    /// (the accounts delta itself is protected, see `finish_accounts_delta`).
+    pub(super) fn finish_accounts_lt_hash_updates(&self) {
         let timer = Instant::now();
         let num_updates = {
             let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
