@@ -48,7 +48,7 @@ use {
         slot_status_notifier::SlotStatusNotifier,
     },
     solana_runtime::{
-        bank::{Bank, MAX_ALPENGLOW_VOTE_ACCOUNTS},
+        bank::{Bank, MAX_ALPENGLOW_VOTE_ACCOUNTS, block_commitment::CommitmentVerificationError},
         bank_forks::BankForks,
         bank_forks_controller::{BankForksCommand, BankForksCommandReceiver, SetRootCommand},
         block_component_processor::BlockComponentProcessorError,
@@ -1560,25 +1560,45 @@ impl ReplayStage {
 
                 // Block Commitment Root: a commitment root in the footer that
                 // differs from ours makes the block dead, as a bank hash
-                // mismatch does. Leader blocks carry no expected value.
-                if let Err((expected_root, computed_root)) = bank.verify_commitment_root() {
-                    warn!(
-                        "For slot {bank_slot} the leader said the commitment root should be: \
-                         {expected_root} however we computed: {computed_root}",
-                    );
-                    datapoint_warn!(
-                        "commitment_root_mismatch",
-                        ("slot", bank_slot, i64),
-                        ("expected", expected_root.to_string(), String),
-                        ("computed", computed_root.to_string(), String),
-                    );
+                // mismatch does, and so does a bank that could not compute its
+                // commitment root (a commitment failure, recorded at freeze).
+                // Leader blocks carry no expected value, but a leader bank
+                // with a commitment failure is marked dead as well; its footer
+                // is not published (see `PohRecorder`).
+                if let Err(err) = bank.verify_commitment_root() {
+                    let replay_err = match err {
+                        CommitmentVerificationError::Mismatch { expected, computed } => {
+                            warn!(
+                                "For slot {bank_slot} the leader said the commitment root should \
+                                 be: {expected} however we computed: {computed}",
+                            );
+                            datapoint_warn!(
+                                "commitment_root_mismatch",
+                                ("slot", bank_slot, i64),
+                                ("expected", expected.to_string(), String),
+                                ("computed", computed.to_string(), String),
+                            );
+                            BlockstoreProcessorError::CommitmentRootMismatch(
+                                bank_slot, expected, computed,
+                            )
+                        }
+                        CommitmentVerificationError::Failure(failure) => {
+                            warn!(
+                                "For slot {bank_slot} we could not compute the commitment root: \
+                                 {failure}",
+                            );
+                            datapoint_warn!(
+                                "commitment_root_failure",
+                                ("slot", bank_slot, i64),
+                                ("failure", failure.name(), String),
+                                ("error", failure.to_string(), String),
+                            );
+                            BlockstoreProcessorError::CommitmentFailure(bank_slot, failure)
+                        }
+                    };
                     mark_replay_dead_slot(
                         bank,
-                        &BlockstoreProcessorError::CommitmentRootMismatch(
-                            bank_slot,
-                            expected_root,
-                            computed_root,
-                        ),
+                        &replay_err,
                         progress,
                         &process_active_banks_context.dead_slot_context(),
                     );
