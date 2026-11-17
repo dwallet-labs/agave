@@ -380,7 +380,7 @@ fn test_all_light_client_commitments_across_epoch_boundary() {
     // 32-slot epochs are too short for an accounts state generation: slot 5
     // is zero in every block of this chain, while the bank keeps an accounts
     // state without generations.
-    assert!(SLOTS_PER_EPOCH < MIN_SLOTS_PER_EPOCH_FOR_GENERATION);
+    const { assert!(SLOTS_PER_EPOCH < MIN_SLOTS_PER_EPOCH_FOR_GENERATION) };
     assert!(!epoch_has_generation(bank0.epoch_schedule(), 0));
     assert!(!epoch_has_generation(bank0.epoch_schedule(), 1));
     freeze_with_block_id(&bank0);
