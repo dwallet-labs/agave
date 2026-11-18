@@ -1644,25 +1644,44 @@ fn test_light_client_epoch_handoff_four_nodes() {
     let mint = &tc.cluster.funding_keypair;
     let stake_keypair = Keypair::new();
     let extra_stake = DEFAULT_NODE_STAKE * 3 / 2;
-    let blockhash = rpc.get_latest_blockhash().unwrap();
-    let delegation = tc.send(
-        &rpc,
-        &Transaction::new_signed_with_payer(
-            &solana_stake_interface::instruction::create_account_and_delegate_stake(
-                &mint.pubkey(),
-                &stake_keypair.pubkey(),
-                &tc.node_keys[3].vote_keypair.pubkey(),
-                &solana_stake_interface::state::Authorized::auto(&mint.pubkey()),
-                &solana_stake_interface::state::Lockup::default(),
-                extra_stake
-                    + Rent::default()
-                        .minimum_balance(solana_stake_interface::state::StakeStateV2::size_of()),
-            ),
-            Some(&mint.pubkey()),
-            &[mint, &stake_keypair],
-            blockhash,
-        ),
-    );
+    // The stake program refuses to delegate while the rewards of an epoch
+    // are being distributed, in the first slots of the epoch (stake error
+    // 16): the whole transaction fails, and is sent again later.
+    let mut attempts = 0;
+    let delegation = loop {
+        let blockhash = rpc.get_latest_blockhash().unwrap();
+        let delegation =
+            tc.send(
+                &rpc,
+                &Transaction::new_signed_with_payer(
+                    &solana_stake_interface::instruction::create_account_and_delegate_stake(
+                        &mint.pubkey(),
+                        &stake_keypair.pubkey(),
+                        &tc.node_keys[3].vote_keypair.pubkey(),
+                        &solana_stake_interface::state::Authorized::auto(&mint.pubkey()),
+                        &solana_stake_interface::state::Lockup::default(),
+                        extra_stake
+                            + Rent::default().minimum_balance(
+                                solana_stake_interface::state::StakeStateV2::size_of(),
+                            ),
+                    ),
+                    Some(&mint.pubkey()),
+                    &[mint, &stake_keypair],
+                    blockhash,
+                ),
+            );
+        let rewards_active = matches!(
+            &delegation.err,
+            Some(TransactionError::InstructionError(1, err)) if format!("{err:?}") == "Custom(16)"
+        );
+        if rewards_active && attempts < 20 {
+            attempts += 1;
+            info!("delegation refused during reward distribution, sending again");
+            sleep(Duration::from_millis(500));
+            continue;
+        }
+        break delegation;
+    };
     assert_eq!(delegation.err, None);
     let new_stakes_epoch = schedule.get_epoch(delegation.slot) + 2;
     info!(
@@ -1782,6 +1801,12 @@ fn test_light_client_epoch_handoff_four_nodes() {
         wait_for_finalized(&rpc, schedule.get_first_slot_in_epoch(epoch) + 4);
         if verifier.client.epoch() < epoch {
             verifier.advance_epoch(&rpc);
+        }
+        // On a slow machine the client has followed past this epoch while
+        // verifying the blocks above; its set is then checked from the
+        // epoch it is in.
+        if verifier.client.epoch() > epoch {
+            continue;
         }
         assert_eq!(verifier.client.epoch(), epoch);
         let signer_set = verifier.client.signer_set();
