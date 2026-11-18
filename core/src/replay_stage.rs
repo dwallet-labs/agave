@@ -181,6 +181,11 @@ enum SchedulerReplayOutcome {
     SchedulerReplayCompleted(Result<(), BlockstoreProcessorError>),
 }
 
+/// How long replay holds back freezing a complete bank whose parent has no
+/// block id yet, in slot durations. Block production gives up on a leader
+/// bank that is not frozen one slot after its last tick.
+const MAX_PARENT_BLOCK_ID_WAIT_SLOTS: u64 = 2;
+
 struct CompletedBankReplay {
     // Metrics around replaying this bank.
     replay_stats: Arc<RwLock<ReplaySlotStats>>,
@@ -1475,6 +1480,35 @@ impl ReplayStage {
             }
 
             assert_eq!(bank_slot, bank.slot());
+            if bank.is_complete() && bank.is_waiting_for_parent_block_id() {
+                // The commitment root, computed when the bank is frozen,
+                // needs the parent's block id. For a parent this validator
+                // produced, broadcast sets it once the last shred is made,
+                // which can be after this bank is complete. Hold the freeze
+                // back until it is set, for a bounded time; after that the
+                // bank is frozen into a commitment failure as before.
+                let wait_start = progress
+                    .get_mut(&bank_slot)
+                    .expect("Bank fork progress entry missing for completed bank")
+                    .parent_block_id_wait_start
+                    .get_or_insert_with(Instant::now);
+                let max_wait = Duration::from_nanos(
+                    u64::try_from(bank.ns_per_slot)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(MAX_PARENT_BLOCK_ID_WAIT_SLOTS),
+                );
+                if wait_start.elapsed() < max_wait {
+                    trace!(
+                        "bank {bank_slot} is complete; waiting for the block id of its parent {}",
+                        bank.parent_slot()
+                    );
+                    continue;
+                }
+                warn!(
+                    "bank {bank_slot}: parent {} still has no block id after {max_wait:?}",
+                    bank.parent_slot()
+                );
+            }
             if bank.is_complete() {
                 let mut bank_complete_time = Measure::start("bank_complete_time");
                 let bank_progress = progress
