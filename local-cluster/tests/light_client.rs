@@ -2052,8 +2052,8 @@ fn test_light_client_epoch_handoff_four_nodes() {
         .signer_set()
         .signers()
         .iter()
-        .position(|signer| signer.stake == stakes[1])
-        .unwrap();
+        .position(|signer| signer.vote_pubkey == tc.node_keys[1].vote_keypair.pubkey().to_bytes())
+        .expect("the offline validator is in the signer set");
     let tamper_ranks = |f: &dyn Fn(&mut BitVec<u8, Lsb0>)| {
         let mut tampered = slow.clone();
         let Finality::Certificates(proof) = &mut tampered.finality else {
