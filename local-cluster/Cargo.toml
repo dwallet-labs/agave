@@ -84,12 +84,19 @@ wincode = { workspace = true }
 
 [dev-dependencies]
 agave-shred-wire-format = { path = "../shred/wire-format", features = ["agave-unstable-api"] }
+bitvec = { workspace = true }
 serial_test = { workspace = true }
 solana-core = { path = "../core", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-download-utils = { path = "../download-utils", features = ["agave-unstable-api"] }
+solana-hash = { workspace = true }
+solana-instruction = { workspace = true }
 solana-ledger = { path = "../ledger", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-light-client = { workspace = true, features = ["agave-unstable-api", "rpc"] }
 solana-local-cluster = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-runtime = { path = "../runtime", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-signature = { workspace = true }
+solana-signer-store = { workspace = true }
+solana-transaction-status-client-types = { workspace = true }
 
 [lints]
 workspace = true
