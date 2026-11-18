@@ -840,6 +840,76 @@ fn test_light_client_proofs_over_rpc() {
     assert_eq!(state.proof.verify(&v160, &chain.fresh, &hash), Ok(2));
 }
 
+/// When the caller names no block, `getValidatorSet` and `getEpochBoundary`
+/// open the latest block of the epoch that has certificates of its own. A
+/// later block of the epoch may be final only through a block of the next
+/// epoch, which a client holding this epoch's signer set cannot verify.
+#[test]
+fn test_default_committing_block_has_own_certificates() {
+    let chain = build_chain();
+    let store = chain.store(1000);
+    let rpc = chain.rpc(&store);
+    let bank = |slot| chain.bank(slot);
+    let committing = |rpc: &Rpc| {
+        let response: RpcValidatorSet = rpc.call("getValidatorSet", json!([2])).unwrap();
+        ValidatorSetResponse::try_from(&response)
+            .unwrap()
+            .committed_by
+            .unwrap()
+            .slot
+    };
+    let boundary = |rpc: &Rpc| {
+        let response: RpcEpochBoundary = rpc.call("getEpochBoundary", json!([1])).unwrap();
+        EpochBoundaryResponse::try_from(&response).unwrap().slot
+    };
+
+    // No certificates at all: the latest block of epoch 1.
+    assert_eq!(committing(&rpc), 100);
+    assert_eq!(boundary(&rpc), 100);
+
+    // Epoch 1 has certificates for 96 only, and epoch 2 for 160: block 100
+    // is final only through 160, so the block opened is 96.
+    let set1 = SignerSet::new(1, bank(65).validator_set_signers(1).unwrap()).unwrap();
+    let keys1 = keypairs_by_rank(&chain.validators, &set1);
+    let set2 = SignerSet::new(2, bank(100).validator_set_signers(2).unwrap()).unwrap();
+    let keys2 = keypairs_by_rank(&chain.validators, &set2);
+    store.on_certificate(&fast_certificate(bank(96), &keys1));
+    store.on_certificate(&fast_certificate(bank(160), &keys2));
+    assert_eq!(committing(&rpc), 96);
+    assert_eq!(boundary(&rpc), 96);
+
+    // A client holding the signer set of epoch 1 cannot verify block 100,
+    // and advances through the node's choice.
+    let schedule = chain.genesis_config.epoch_schedule.clone();
+    let mut client = LightClient::new(schedule.clone(), SHRED_VERSION, set1);
+    assert!(matches!(
+        rpc.finality(100).verify(&client, 100),
+        Err(VerifyError::EpochMismatch { .. })
+    ));
+    let response: RpcValidatorSet = rpc.call("getValidatorSet", json!([2])).unwrap();
+    let validator_set = ValidatorSetResponse::try_from(&response).unwrap();
+    let committed_by = validator_set.committed_by.clone().unwrap();
+    let v96 = rpc.finality(96).verify(&client, 96).unwrap();
+    let next = validator_set.verify(&v96, &schedule).unwrap().clone();
+    client
+        .advance_epoch(&v96, &committed_by.opening, next)
+        .unwrap();
+    assert_eq!(client.epoch(), 2);
+
+    // A named block is still honored.
+    let response: RpcValidatorSet = rpc
+        .call("getValidatorSet", json!([2, {"atSlot": 100}]))
+        .unwrap();
+    assert_eq!(response.committed_by.unwrap().slot, 100);
+
+    // Once 100 has its own certificates it is the choice again.
+    for certificate in slow_certificates(bank(100), &keys1) {
+        store.on_certificate(&certificate);
+    }
+    assert_eq!(committing(&rpc), 100);
+    assert_eq!(boundary(&rpc), 100);
+}
+
 #[test]
 fn test_light_client_proof_errors() {
     let chain = build_chain();
