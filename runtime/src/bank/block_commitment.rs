@@ -253,6 +253,22 @@ impl Bank {
             .is_active(&feature_set::block_commitment_root::id())
     }
 
+    /// Whether freezing this bank now would fail only because its parent has
+    /// no block id yet.
+    ///
+    /// The history leaf of the parent needs the parent's block id. A block
+    /// this validator produced gets its block id from broadcast, once its
+    /// last shred is made, which can be after a child of it is complete. A
+    /// caller that can wait freezes the bank once this is false, instead of
+    /// freezing it into [`CommitmentFailure::MissingParentBlockId`].
+    pub fn is_waiting_for_parent_block_id(&self) -> bool {
+        !self.is_frozen()
+            && self.is_block_commitment_root_active()
+            && self.parent().is_some_and(|parent| {
+                parent.block_id().is_none() && parent.commitment_failure().is_none()
+            })
+    }
+
     /// Block commitment state, set when the bank is frozen with the feature
     /// active, or loaded from a snapshot. `None` for a bank with a
     /// [`Self::commitment_failure`].
@@ -404,11 +420,13 @@ impl Bank {
         } else {
             None
         };
-        // Every frozen bank that a child is built on has a block id in a
-        // running validator: replayed banks get it from the blockstore before
+        // Every frozen bank that a child is built on gets a block id in a
+        // running validator: replayed banks from the blockstore before
         // freezing, leader banks from broadcast once the last shred is made,
-        // snapshot banks from the snapshot. Without it the history leaf (or
-        // the anchor leaf), and so this bank's commitment root, cannot be
+        // snapshot banks from the snapshot. A leader bank can get it after a
+        // child is complete, so replay waits for it before freezing the child
+        // (see `is_waiting_for_parent_block_id`). Without it the history leaf
+        // (or the anchor leaf), and so this bank's commitment root, cannot be
         // computed.
         let parent_block_id = parent
             .block_id()
