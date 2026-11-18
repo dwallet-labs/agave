@@ -849,14 +849,26 @@ impl LightClientProofStore {
             .ok_or_else(|| data_not_available(at.slot, "the block has no block history"))?;
         let (index, (_, block_id, commitment_root)) =
             inner.history.find(slot).ok_or_else(|| {
-                data_not_available(
-                    slot,
-                    format!(
-                        "no kept history leaf for this block (history proofs reach back to slot \
-                         {:?})",
-                        inner.history.entries.first().map(|(slot, ..)| *slot)
+                let first_kept = inner.history.entries.first().map(|(slot, ..)| *slot);
+                match first_kept {
+                    // The kept leaves are every rooted block from the first
+                    // one on: a slot in that range without a leaf is not a
+                    // finalized block (skipped, or on another fork), as for
+                    // the other methods.
+                    Some(first_kept) if slot >= first_kept && !self.blockstore.is_root(slot) => {
+                        LightClientProofError::BlockNotFinal {
+                            slot,
+                            finalized_slot: inner.highest_root.unwrap_or_default(),
+                        }
+                    }
+                    _ => data_not_available(
+                        slot,
+                        format!(
+                            "no kept history leaf for this block (history proofs reach back to \
+                             slot {first_kept:?})"
+                        ),
                     ),
-                )
+                }
             })?;
         if index >= leaf_count {
             return Err(LightClientProofError::NotFound {

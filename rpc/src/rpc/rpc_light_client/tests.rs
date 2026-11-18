@@ -60,6 +60,7 @@ use {
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_CERTIFICATES_NOT_AVAILABLE,
+        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_FEATURE_INACTIVE,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_NOT_FOUND,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_PROOFS_DISABLED,
@@ -881,6 +882,47 @@ fn test_light_client_proof_errors() {
             "{method}"
         );
     }
+    // A transaction processed by the node in a block it has not finalized:
+    // not final yet (from the node's status cache), rather than not found.
+    let pending_bank =
+        Bank::new_from_parent(chain.bank(160).clone(), *chain.bank(160).leader(), 161);
+    let pending = transfer(&pending_bank, &chain.mint, &Pubkey::new_unique(), 1_000_000);
+    let pending_rpc = Rpc::new(
+        pending_bank,
+        true,
+        Some(store.clone()),
+        Some(chain.blockstore.clone()),
+    );
+    let (code, data) = pending_rpc.error(
+        "getTransactionProof",
+        json!([pending.signatures[0].to_string()]),
+    );
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL);
+    assert_eq!(
+        data,
+        json!({"kind": "blockNotFinal", "slot": 161, "finalizedSlot": 160})
+    );
+    // A transaction of a finalized block is still found through it.
+    pending_rpc
+        .call::<RpcTransactionProof>(
+            "getTransactionProof",
+            json!([chain.transfer_tx.signatures[0].to_string()]),
+        )
+        .unwrap();
+
+    // The history of a skipped slot after the first kept history leaf: the
+    // slot is not a finalized block, as for the other methods. Before the
+    // first kept leaf: no leaf to prove.
+    let (code, data) = rpc.error("getBlockHistoryProof", json!([64, 100]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL);
+    assert_eq!(
+        data,
+        json!({"kind": "blockNotFinal", "slot": 64, "finalizedSlot": 160})
+    );
+    let (code, data) = rpc.error("getBlockHistoryProof", json!([1, 100]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+    assert_eq!(data["slot"], json!(1));
+
     // A root from before the store's first block.
     let (code, data) = rpc.error("getFinalityProof", json!([1]));
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);

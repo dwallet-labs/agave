@@ -23,6 +23,7 @@ use {
     jsonrpc_core::{Error, Result},
     jsonrpc_derive::rpc,
     solana_clock::{Epoch, Slot},
+    solana_commitment_config::CommitmentConfig,
     solana_rpc_client_api::{
         custom_error::{LightClientProofError, RpcCustomError},
         light_client::*,
@@ -135,13 +136,34 @@ impl LightClient for LightClientImpl {
         debug!("get_transaction_proof rpc request received: {signature_str}");
         let signature = verify_signature(&signature_str)?;
         let config = config.unwrap_or_default();
-        let response = meta
-            .light_client_proof_store()?
+        let store = meta.light_client_proof_store()?;
+        let response = store
             .transaction_proof(
                 &signature,
                 config.instructions.as_ref(),
                 config.events.as_ref(),
             )
+            .map_err(|err| match err {
+                // The store knows the transactions of finalized blocks only:
+                // a transaction this node processed in a block it has not
+                // finalized yet is not final, rather than not found.
+                LightClientProofError::NotFound { .. } => {
+                    let finalized_slot = store.highest_root().unwrap_or_default();
+                    match meta
+                        .bank(Some(CommitmentConfig::processed()))
+                        .get_signature_status_slot(&signature)
+                    {
+                        Some((slot, _)) if slot > finalized_slot => {
+                            LightClientProofError::BlockNotFinal {
+                                slot,
+                                finalized_slot,
+                            }
+                        }
+                        _ => err,
+                    }
+                }
+                err => err,
+            })
             .map_err(proof_error)?;
         Ok(RpcTransactionProof::from(&response))
     }
