@@ -834,6 +834,43 @@ impl LightClientProofStore {
             .and_then(|certificates| certificates.finality(block_id))
     }
 
+    /// The block of `epoch` to open a commitment in when the caller names
+    /// none: the latest kept block that passes `usable` and has certificates
+    /// of its own.
+    ///
+    /// Certificates of a block are signed by the validators of the block's
+    /// epoch. A block without its own is final through a later block, and
+    /// the nearest one with certificates may be in the next epoch, signed by
+    /// a set that a client still holding the signer set of `epoch` cannot
+    /// check. Every block before one with certificates is final through it,
+    /// so the latest block with certificates is the latest one such a client
+    /// can verify. Without any, the latest usable block is returned: its
+    /// proof still verifies for a client that holds the later set.
+    fn latest_block_of_epoch(
+        &self,
+        inner: &Inner,
+        epoch: Epoch,
+        usable: impl Fn(&RetainedBlock) -> bool,
+    ) -> Option<Arc<RetainedBlock>> {
+        let mut candidates = inner
+            .blocks
+            .values()
+            .rev()
+            .skip_while(|block| block.epoch > epoch)
+            .take_while(|block| block.epoch == epoch)
+            .filter(|block| block.block_id.is_some() && usable(block));
+        let latest = candidates.next()?;
+        std::iter::once(latest)
+            .chain(candidates)
+            .find(|block| {
+                block
+                    .block_id
+                    .is_some_and(|block_id| self.certificates_of(block.slot, &block_id).is_some())
+            })
+            .or(Some(latest))
+            .cloned()
+    }
+
     /// What the history proof of the kept leaf of the block at `slot`, from
     /// the block `at`, is built from.
     fn history_input(
@@ -1232,17 +1269,11 @@ impl LightClientProofStore {
                     )?;
                     Some(block)
                 }
-                None => inner
-                    .blocks
-                    .values()
-                    .rev()
-                    .find(|block| {
-                        Some(block.epoch) == epoch.checked_sub(1)
-                            && block.features.epoch_validator_set_root
-                            && block.commitment.is_ok()
-                            && block.block_id.is_some()
+                None => epoch.checked_sub(1).and_then(|previous| {
+                    self.latest_block_of_epoch(&inner, previous, |block| {
+                        block.features.epoch_validator_set_root && block.commitment.is_ok()
                     })
-                    .cloned(),
+                }),
             };
             (signers, committing)
         };
@@ -1293,12 +1324,8 @@ impl LightClientProofStore {
                 }
                 block
             }
-            None => inner
-                .blocks
-                .values()
-                .rev()
-                .find(|block| block.epoch == epoch)
-                .cloned()
+            None => self
+                .latest_block_of_epoch(&inner, epoch, |_| true)
                 .ok_or_else(|| LightClientProofError::NotFound {
                     what: format!("a kept finalized block of epoch {epoch}"),
                 })?,
