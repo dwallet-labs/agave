@@ -8,6 +8,7 @@ use {
     std::{
         collections::HashMap,
         sync::{Arc, RwLock},
+        time::Instant,
     },
 };
 
@@ -31,6 +32,9 @@ pub struct ForkProgress {
     // These counters cover only blocks replayed since the latest restart.
     pub num_blocks_on_fork: u64,
     pub num_dropped_blocks_on_fork: u64,
+    /// When replay first held back freezing this bank because its parent
+    /// had no block id yet.
+    pub parent_block_id_wait_start: Option<Instant>,
 }
 
 impl ForkProgress {
@@ -49,6 +53,7 @@ impl ForkProgress {
             )),
             num_blocks_on_fork,
             num_dropped_blocks_on_fork,
+            parent_block_id_wait_start: None,
         }
     }
 
