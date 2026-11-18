@@ -71,9 +71,15 @@ pub struct RetainedReceipt {
 pub enum ReceiptOrder<'a> {
     /// `positions[i]` is the position in the block of transaction `i` of
     /// the batch. Entries of transactions that are not committed are
-    /// ignored. Used by replay and block production. A committed transaction
-    /// without an entry is a commitment failure.
+    /// ignored. Used by replay. A committed transaction without an entry is
+    /// a commitment failure.
     BlockPositions(&'a [usize]),
+    /// As [`Self::BlockPositions`], for a caller that has a position only
+    /// for some transactions of the batch: `None` for a transaction that is
+    /// not in the block. Used by block production, where the transactions
+    /// that are not recorded have no position. A committed transaction whose
+    /// entry is `None` is a commitment failure.
+    RecordedPositions(&'a [Option<usize>]),
     /// Receipts are appended in commit order. Only sound when a single caller
     /// commits all transactions of the bank sequentially (tests, tools that
     /// execute transactions directly against a bank). Mixing it with
@@ -144,6 +150,13 @@ impl ReceiptAccumulator {
                         continue;
                     }
                 },
+                ReceiptOrder::RecordedPositions(positions) => match positions.get(index_in_batch) {
+                    Some(Some(position)) => *position as u64,
+                    Some(None) | None => {
+                        state.fail(CommitmentFailure::MissingBlockPosition { index_in_batch });
+                        continue;
+                    }
+                },
                 ReceiptOrder::CommitOrder => state.entries.len() as u64,
                 ReceiptOrder::Unknown => continue,
             };
@@ -156,7 +169,9 @@ impl ReceiptAccumulator {
             return;
         }
         match order {
-            ReceiptOrder::BlockPositions(_) => state.uses_block_positions = true,
+            ReceiptOrder::BlockPositions(_) | ReceiptOrder::RecordedPositions(_) => {
+                state.uses_block_positions = true
+            }
             ReceiptOrder::CommitOrder => state.uses_commit_order = true,
             ReceiptOrder::Unknown => {
                 state.fail(CommitmentFailure::UnknownReceiptOrder { num_receipts });
@@ -1078,6 +1093,51 @@ mod tests {
             transfers(&setup, &bank, 1),
             ReceiptOrder::BlockPositions(&[7]),
         );
+        assert_receipt_failure(&bank, CommitmentFailure::MixedReceiptOrder);
+    }
+
+    /// Block production gives `None` to a transaction it did not record. If
+    /// the bank commits such a transaction anyway, its receipt has no place
+    /// in the block: a commitment failure, not a made-up position.
+    #[test]
+    fn test_recorded_positions() {
+        let setup = setup(true, true);
+        let bank = new_child(&setup.bank0);
+        // The first batch is recorded second in the block.
+        let mut txs = transfers(&setup, &bank, 2);
+        commit_batch(
+            &bank,
+            vec![txs.remove(0)],
+            ReceiptOrder::RecordedPositions(&[Some(1)]),
+        );
+        let first = bank.transaction_receipt_leaf_hashes().unwrap();
+        assert_eq!(first.len(), 1);
+        commit_batch(&bank, txs, ReceiptOrder::RecordedPositions(&[Some(0)]));
+        let both = bank.transaction_receipt_leaf_hashes().unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[1], first[0]);
+        assert_ne!(both[0], first[0]);
+
+        let bank = new_child(&setup.bank0);
+        commit_batch(
+            &bank,
+            transfers(&setup, &bank, 2),
+            ReceiptOrder::RecordedPositions(&[Some(0), None]),
+        );
+        assert_receipt_failure(
+            &bank,
+            CommitmentFailure::MissingBlockPosition { index_in_batch: 1 },
+        );
+
+        // Mixing with commit order is a failure, as for block positions.
+        let bank = new_child(&setup.bank0);
+        let mut txs = transfers(&setup, &bank, 2);
+        commit_batch(
+            &bank,
+            vec![txs.remove(0)],
+            ReceiptOrder::RecordedPositions(&[Some(0)]),
+        );
+        commit_batch(&bank, txs, ReceiptOrder::CommitOrder);
         assert_receipt_failure(&bank, CommitmentFailure::MixedReceiptOrder);
     }
 
