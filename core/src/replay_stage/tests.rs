@@ -1987,6 +1987,91 @@ fn test_latest_parent_coalesces() {
 /// dead slot removes the bank and its progress entry and keeps the dead mark,
 /// and a late replay result for the cleared slot is ignored. The block creation
 /// side is covered by `test_leader_commitment_failure_aborts_slot`.
+/// A leader bank that is complete before broadcast has set the block id of
+/// its parent is not frozen into a commitment failure: replay holds the
+/// freeze back, and freezes the bank once the parent has its block id.
+#[test]
+fn test_leader_bank_waits_for_parent_block_id() {
+    let AlpenglowReplayComponents {
+        blockstore,
+        bank_forks,
+        mut progress,
+        my_pubkey,
+        leader_schedule_cache,
+        ..
+    } = alpenglow_replay_components(tr(0));
+    let bank0 = bank_forks.read().unwrap().root_bank();
+    let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
+    bank1.fill_bank_with_ticks_for_tests();
+    bank1.freeze();
+    let bank1 = bank_forks
+        .write()
+        .unwrap()
+        .insert(bank1)
+        .clone_without_scheduler();
+    progress.insert(1, ForkProgress::new(bank1.last_blockhash(), 0, 0, None));
+    assert_eq!(bank1.block_id(), None);
+    let slot = 2;
+    let leader = leader_schedule_cache
+        .slot_leader_at(slot, Some(&bank1))
+        .unwrap();
+    assert_eq!(leader.id, my_pubkey);
+    let mut leader_bank = Bank::new_from_parent(bank1.clone(), leader, slot);
+    leader_bank.activate_feature(&agave_feature_set::block_commitment_root::id());
+    let leader_bank = leader_bank.mark_leader_bank();
+    blockstore_processor::set_alpenglow_ticks(
+        &leader_bank,
+        &bank_forks.read().unwrap().migration_status(),
+    );
+    let bank = bank_forks.write().unwrap().insert(leader_bank);
+    progress.insert(slot, ForkProgress::new(bank.last_blockhash(), 0, 0, None));
+    bank.fill_bank_with_ticks_for_tests();
+    assert!(bank.is_complete());
+
+    let context = ProcessActiveBanksContext::new_for_tests(bank_forks.clone(), blockstore.clone());
+    let process = |progress: &mut ProgressMap| {
+        ReplayStage::process_replay_results(
+            &context,
+            progress,
+            &mut Vec::new(),
+            &[ReplaySlotFromBlockstore {
+                is_slot_dead: false,
+                bank_slot: slot,
+                replay_result: None,
+            }],
+            &my_pubkey,
+        )
+        .unwrap()
+    };
+
+    // The parent has no block id yet: nothing is frozen, nothing is dead.
+    for _ in 0..3 {
+        assert!(process(&mut progress).is_empty());
+        assert!(!bank.is_frozen());
+        assert_eq!(bank.commitment_failure(), None);
+        assert_eq!(progress.get(&slot).unwrap().dead_reason, None);
+        assert!(!blockstore.is_dead(slot));
+    }
+    assert!(
+        progress
+            .get(&slot)
+            .unwrap()
+            .parent_block_id_wait_start
+            .is_some()
+    );
+
+    // Broadcast sets the parent's block id: the bank is frozen with a
+    // commitment root.
+    bank1.set_block_id(Some(BlockId::new_unique()));
+    assert!(!bank.is_waiting_for_parent_block_id());
+    assert_eq!(process(&mut progress), vec![slot]);
+    assert!(bank.is_frozen());
+    assert_eq!(bank.commitment_failure(), None);
+    assert!(bank.commitment_root().is_some());
+    assert_eq!(progress.get(&slot).unwrap().dead_reason, None);
+    assert!(!blockstore.is_dead(slot));
+}
+
 #[test]
 fn test_leader_commitment_failure_marked_dead_then_cleared() {
     let AlpenglowReplayComponents {
@@ -2035,6 +2120,29 @@ fn test_leader_commitment_failure_marked_dead_then_cleared() {
         bank_slot: slot,
         replay_result: None,
     };
+    // Replay first holds the freeze back, waiting for the parent's block id.
+    assert!(bank.is_waiting_for_parent_block_id());
+    let new_frozen_slots = ReplayStage::process_replay_results(
+        &context,
+        &mut progress,
+        &mut Vec::new(),
+        &[leader_replay_result()],
+        &my_pubkey,
+    )
+    .unwrap();
+    assert!(new_frozen_slots.is_empty());
+    assert!(!bank.is_frozen());
+    assert_eq!(progress.get(&slot).unwrap().dead_reason, None);
+    let wait_start = progress
+        .get(&slot)
+        .unwrap()
+        .parent_block_id_wait_start
+        .expect("replay is waiting for the parent's block id");
+
+    // The block id never comes: after the wait the bank is frozen into a
+    // commitment failure.
+    progress.get_mut(&slot).unwrap().parent_block_id_wait_start =
+        Some(wait_start.checked_sub(Duration::from_secs(60)).unwrap());
     let new_frozen_slots = ReplayStage::process_replay_results(
         &context,
         &mut progress,
