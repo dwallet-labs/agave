@@ -68,7 +68,7 @@ impl Committer {
             Self::block_positions(&processing_results, starting_transaction_index)
         });
         let receipt_order = match block_positions.as_deref() {
-            Some(positions) => ReceiptOrder::BlockPositions(positions),
+            Some(positions) => ReceiptOrder::RecordedPositions(positions),
             // Only when the record channel does not track transaction
             // indexes, which the validator always enables (see
             // `record_channels`). The receipts cannot be placed in the block
@@ -113,12 +113,14 @@ impl Committer {
     ///
     /// The record channel gives the batch's processed transactions, the only
     /// ones recorded, consecutive positions from `starting_transaction_index`,
-    /// in batch order. Unprocessed transactions are not committed and their
-    /// entry is unused.
+    /// in batch order. Unprocessed transactions are not recorded and have no
+    /// position: `None`. They are not committed either; if the bank ever
+    /// committed one, its receipt could not be placed in the block, which
+    /// the bank records as a commitment failure.
     fn block_positions(
         processing_results: &[TransactionProcessingResult],
         starting_transaction_index: usize,
-    ) -> Vec<usize> {
+    ) -> Vec<Option<usize>> {
         let mut next_position = starting_transaction_index;
         processing_results
             .iter()
@@ -126,9 +128,9 @@ impl Committer {
                 if processing_result.was_processed() {
                     let position = next_position;
                     next_position = next_position.saturating_add(1);
-                    position
+                    Some(position)
                 } else {
-                    usize::MAX
+                    None
                 }
             })
             .collect()
