@@ -517,6 +517,15 @@ impl Verifier {
                         *transient.entry(code).or_default() += 1;
                         None
                     }
+                    // Seen once right after a block was rooted: the footer
+                    // proof is read from blockstore, which did not have the
+                    // complete block yet. Retried until the timeout, so a
+                    // block that never becomes available still fails.
+                    Some((code @ JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE, _)) => {
+                        info!("getFinalityProof({slot}), retrying: {err}");
+                        *transient.entry(code).or_default() += 1;
+                        None
+                    }
                     _ => panic!("getFinalityProof({slot}): {err}"),
                 },
             },
@@ -555,65 +564,45 @@ impl Verifier {
         let epoch = self.client.epoch();
         let next = epoch + 1;
         let schedule = self.epoch_schedule().clone();
-        // The committing block must be final with certificates of epoch `E`:
-        // a block finalized only through a descendant in `E + 1` cannot be
-        // verified with the signer set of `E`. Start from the node's choice
-        // and go back.
-        let mut at_slot = None;
-        let mut tried = 0;
-        loop {
-            let response = when_final(format!("getValidatorSet({next})"), || {
-                rpc.get_validator_set(next, RpcCommittingBlockConfig { at_slot })
-            });
-            let response = ValidatorSetResponse::try_from(&response).unwrap();
-            assert_eq!(response.signer_set.epoch(), next);
-            let committed_by = response
-                .committed_by
-                .clone()
-                .expect("a block of the previous epoch commits to the signer set");
-            assert_eq!(schedule.get_epoch(committed_by.slot), epoch);
-            let finality = self.finality(rpc, committed_by.slot);
-            let usable = match &finality.finality {
-                Finality::Certificates(_) => true,
-                Finality::Descendant(descendant) => schedule.get_epoch(descendant.slot) == epoch,
-            };
-            if !usable {
-                info!(
-                    "block {} of epoch {epoch} is final only through a block of a later epoch; \
-                     trying an earlier block",
-                    committed_by.slot
-                );
-                tried += 1;
-                let first = schedule.get_first_slot_in_epoch(epoch);
-                at_slot = (tried < 16 && committed_by.slot > first)
-                    .then(|| {
-                        rooted_slots(rpc, first, committed_by.slot - 1)
-                            .last()
-                            .copied()
-                    })
-                    .flatten();
-                assert!(
-                    at_slot.is_some(),
-                    "no block of epoch {epoch} to verify the signer set of epoch {next} with"
-                );
-                continue;
-            }
-            let block = self.verify_response(&finality, committed_by.slot);
-            assert_eq!(*block.block_id(), committed_by.block_id);
-            let signer_set = response.verify(&block, &schedule).unwrap().clone();
-            self.past.insert(epoch, self.client.clone());
-            self.client
-                .advance_epoch(&block, &committed_by.opening, signer_set)
-                .unwrap();
-            assert_eq!(self.client.epoch(), next);
-            self.committing.insert(next, block);
-            info!(
-                "light client advanced to epoch {next} through block {} ({} signers)",
+        // The node opens a block that is final with certificates of epoch
+        // `E`: a block finalized only through a descendant in `E + 1` could
+        // not be verified with the signer set of `E`.
+        let response = when_final(format!("getValidatorSet({next})"), || {
+            rpc.get_validator_set(next, RpcCommittingBlockConfig::default())
+        });
+        let response = ValidatorSetResponse::try_from(&response).unwrap();
+        assert_eq!(response.signer_set.epoch(), next);
+        let committed_by = response
+            .committed_by
+            .clone()
+            .expect("a block of the previous epoch commits to the signer set");
+        assert_eq!(schedule.get_epoch(committed_by.slot), epoch);
+        let finality = self.finality(rpc, committed_by.slot);
+        match &finality.finality {
+            Finality::Certificates(_) => (),
+            Finality::Descendant(descendant) => assert_eq!(
+                schedule.get_epoch(descendant.slot),
+                epoch,
+                "block {} of epoch {epoch} is final only through block {} of a later epoch",
                 committed_by.slot,
-                self.client.signer_set().len()
-            );
-            return block;
+                descendant.slot
+            ),
         }
+        let block = self.verify_response(&finality, committed_by.slot);
+        assert_eq!(*block.block_id(), committed_by.block_id);
+        let signer_set = response.verify(&block, &schedule).unwrap().clone();
+        self.past.insert(epoch, self.client.clone());
+        self.client
+            .advance_epoch(&block, &committed_by.opening, signer_set)
+            .unwrap();
+        assert_eq!(self.client.epoch(), next);
+        self.committing.insert(next, block);
+        info!(
+            "light client advanced to epoch {next} through block {} ({} signers)",
+            committed_by.slot,
+            self.client.signer_set().len()
+        );
+        block
     }
 }
 
