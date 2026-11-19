@@ -2115,9 +2115,10 @@ fn test_light_client_epoch_handoff_four_nodes() {
 /// fast-finalized while it is down) takes snapshots and is restarted from
 /// its latest snapshot. After the restart it serves proofs of new blocks
 /// (finality, transactions, account deltas and states from the accounts
-/// state rebuilt from the snapshot), and refuses those of blocks rooted
-/// before: `BlockNotRetained` for the blocks, `DataNotAvailable` for their
-/// history leaves.
+/// state rebuilt from the snapshot). It also still serves the blocks it
+/// rooted before, from the proof data it kept on disk (finality,
+/// transactions, account deltas, and their history from a block after the
+/// restart), except their account states.
 #[test]
 #[serial]
 fn test_light_client_restart_from_snapshot() {
@@ -2221,79 +2222,57 @@ fn test_light_client_restart_from_snapshot() {
         .verify(&block_new, &tc.program, &program_hash)
         .unwrap();
 
-    // Blocks the node rooted before its restart, or while starting from the
-    // snapshot: not retained.
-    for slot in [t0.slot, snapshot.slot()] {
-        let message = expect_proof_error(
-            rpc_restarted.get_finality_proof(slot),
-            JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
-        );
-        info!("finality proof of slot {slot} after the restart: {message}");
-        expect_proof_error(
-            rpc_restarted.get_account_delta_proof(&recipient, slot),
-            JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
-        );
-    }
-    // Blocks the cluster rooted while the node was down or catching up:
-    // retained if the node rooted them itself after its start (with the
-    // certificates it received since), then they verify; otherwise not
-    // retained.
-    let mut served = vec![];
-    let mut not_retained = vec![];
-    for slot in rooted_slots(&rpc_restarted, snapshot.slot() + 1, first_new) {
-        match rpc_restarted.get_finality_proof(slot) {
-            Ok(response) => {
-                let response = FinalityResponse::try_from(&response).unwrap();
-                verifier.verify_response(&response, slot);
-                served.push(slot);
-            }
-            Err(err) => {
-                assert_eq!(
-                    rpc_error(&err).map(|(code, _)| code),
-                    Some(JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED),
-                    "slot {slot}: {err}"
-                );
-                not_retained.push(slot);
-            }
-        }
-    }
-    // A prefix is not retained, the rest is.
-    assert!(
-        not_retained
-            .iter()
-            .all(|slot| served.first().is_none_or(|first| slot < first)),
-        "not retained {not_retained:?}, served {served:?}"
+    // Blocks the node rooted before its restart: served again from the
+    // proof data it kept on disk, with the same result as before.
+    let (block_t0_again, _, _) = verify_transaction(&mut verifier, &rpc_restarted, &t0);
+    assert_eq!(block_t0_again.block_id(), block_t0.block_id());
+    assert_eq!(block_t0_again.commitment_root(), block_t0.commitment_root());
+    let (_, account) = finalized_account(&rpc, &recipient);
+    let recipient_hash = hash_of(&recipient, &account.unwrap());
+    verify_delta(
+        &rpc_restarted,
+        &block_t0_again,
+        &recipient,
+        Some(&recipient_hash),
     );
-    info!(
-        "after the restart: blocks {:?} to {:?} not retained, {:?} to {:?} served (the cluster \
-         had finalized {finalized_before} before the restart)",
-        not_retained.first(),
-        not_retained.last(),
-        served.first(),
-        served.last()
-    );
+    verifier.verify_block(&rpc_restarted, snapshot.slot());
+    // Not the accounts state, which is not written to disk.
     let message = expect_proof_error(
-        rpc_restarted.get_transaction_proof(&t0.signature, RpcTransactionProofConfig::default()),
-        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
-    );
-    info!(
-        "transaction proof of {} after the restart: {message}",
-        t0.signature
-    );
-    // Their history leaves are folded into the frontier the node restarted
-    // from: no history proof, from the restarted node; the other nodes
-    // still have them.
-    let message = expect_proof_error(
-        rpc_restarted.get_block_history_proof(t0.slot, first_new),
+        rpc_restarted.get_account_state_proof(
+            &recipient,
+            RpcAccountStateProofConfig {
+                slot: Some(t0.slot),
+            },
+        ),
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
     );
+    assert!(message.contains("restarted"), "{message}");
     info!(
-        "history proof of slot {} after the restart: {message}",
+        "account state of slot {} after the restart: {message}",
         t0.slot
     );
-    let response =
-        BlockHistoryResponse::try_from(&rpc.get_block_history_proof(t0.slot, first_new).unwrap())
-            .unwrap();
+
+    // Every block from the snapshot to the first new one: kept from before
+    // the restart, or rooted by the node since.
+    let slots = rooted_slots(&rpc_restarted, snapshot.slot() + 1, first_new);
+    for slot in &slots {
+        verifier.verify_block(&rpc_restarted, *slot);
+    }
+    info!(
+        "after the restart: {} blocks from {:?} to {:?} served (the cluster had finalized \
+         {finalized_before} before the restart)",
+        slots.len(),
+        slots.first(),
+        slots.last()
+    );
+    // The history goes on across the restart: a block from before it is
+    // proven from a block after it, by the restarted node.
+    let response = BlockHistoryResponse::try_from(
+        &rpc_restarted
+            .get_block_history_proof(t0.slot, first_new)
+            .unwrap(),
+    )
+    .unwrap();
     let ancestor = verifier
         .client
         .verify_ancestor(&block_new, &response.history)
