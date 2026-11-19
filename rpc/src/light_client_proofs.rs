@@ -901,6 +901,15 @@ impl LightClientProofStore {
         })
     }
 
+    /// Replaces the accounts state kept for the block at `slot`.
+    #[cfg(test)]
+    pub(crate) fn set_accounts_state_for_tests(&self, slot: Slot, state: Arc<AccountsState>) {
+        let mut inner = self.inner.write().unwrap();
+        let block = Arc::get_mut(inner.blocks.get_mut(&slot).unwrap()).unwrap();
+        let (kept, _) = block.accounts_state.as_mut().unwrap();
+        *kept = state;
+    }
+
     /// The latest finalized slot this store has ingested.
     pub fn highest_root(&self) -> Option<Slot> {
         self.inner.read().unwrap().highest_root

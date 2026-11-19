@@ -57,6 +57,7 @@ use {
     solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_rpc_client_api::custom_error::{
+        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BASE_TREE_NOT_READY,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
         JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_CERTIFICATES_NOT_AVAILABLE,
@@ -1304,4 +1305,35 @@ fn test_proof_store_survives_restart() {
     let empty = LightClientProofStore::new(config.clone(), other);
     assert_eq!(empty.highest_root(), None);
     assert!(!block_file(160).exists());
+}
+
+/// While the base tree of a new generation is being computed in the
+/// background, `getAccountStateProof` answers "base tree not ready" instead
+/// of waiting, and serves the proof once it is.
+#[test]
+fn test_account_state_proof_base_tree_not_ready() {
+    let chain = build_chain();
+    let store = chain.store(1000);
+    let rpc = chain.rpc(&store);
+    let mint = chain.mint.pubkey().to_string();
+    let ready = chain.bank(160).accounts_state().unwrap();
+    let served: Value = rpc
+        .call("getAccountStateProof", json!([mint, {"slot": 160}]))
+        .unwrap();
+
+    store.set_accounts_state_for_tests(160, Arc::new(ready.with_pending_bases_for_tests()));
+    for address in [mint.clone(), Pubkey::new_unique().to_string()] {
+        let (code, data) = rpc.error("getAccountStateProof", json!([address, {"slot": 160}]));
+        assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BASE_TREE_NOT_READY);
+        assert_eq!(data, json!({"kind": "baseTreeNotReady", "slot": 160}));
+    }
+    // Other proofs of the block do not need the base.
+    rpc.call::<Value>("getAccountDeltaProof", json!([mint, 160]))
+        .unwrap();
+
+    store.set_accounts_state_for_tests(160, ready);
+    let again: Value = rpc
+        .call("getAccountStateProof", json!([mint, {"slot": 160}]))
+        .unwrap();
+    assert_eq!(again, served);
 }
