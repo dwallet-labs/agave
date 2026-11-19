@@ -39,7 +39,8 @@
 //!
 //! # Retention
 //!
-//! In memory only:
+//! In memory, and on disk when [`LightClientProofConfig::persist_dir`] is
+//! set (see [`persist`]):
 //!
 //! - the last [`LightClientProofConfig::retained_blocks`] rooted blocks with
 //!   their data (receipts, accounts delta, accounts state, commitment
@@ -52,13 +53,28 @@
 //!   the node starts from);
 //! - the signer sets of the last [`RETAINED_SIGNER_SET_EPOCHS`] epochs.
 //!
-//! Nothing survives a restart. A durable version would store, per rooted
-//! block: the history leaf (72 bytes), the commitment vector (256 bytes),
-//! the certificates (a few hundred bytes), and the receipts with their
-//! leaves (proportional to the block), plus the accounts delta; the accounts
-//! state cannot be kept per block and would be served for recent blocks
-//! only, as here. It would also cache the roots of complete history
-//! subtrees, so that a history proof does not rehash every kept leaf.
+//! # Restart
+//!
+//! With a directory, every retained block is written when it is rooted
+//! (commitment vector, history frontier, receipts with their leaves,
+//! accounts delta, epoch boundary), certificates are written at the next
+//! root after they complete, and signer sets when first seen. A store
+//! opened on the directory takes the blocks back in order, as if they were
+//! rooted again, dropping any that blockstore does not have as a root. It
+//! then serves the same proofs for them as before, with two limits:
+//!
+//! - the accounts state is not written (it cannot be kept per block), so
+//!   account state proofs are served for blocks rooted since the start
+//!   only;
+//! - the history leaves come back from the retained blocks, so history
+//!   proofs reach back to the oldest retained block, not
+//!   `retained_history` leaves. If the node resumes after a gap (it starts
+//!   from a snapshot later than its last retained block), the history
+//!   restarts at the first new block: older blocks are then served with
+//!   their own certificates only.
+//!
+//! A durable store would also cache the roots of complete history subtrees,
+//! so that a history proof does not rehash every kept leaf.
 //!
 //! # Cost
 //!
@@ -109,12 +125,17 @@ use {
     solana_signature::Signature,
     std::{
         collections::{BTreeMap, BTreeSet, HashMap},
+        path::PathBuf,
         sync::{
             Arc, Mutex, RwLock,
             atomic::{AtomicU64, Ordering},
         },
     },
 };
+
+mod persist;
+
+use persist::{BlockRecord, Persistence};
 
 /// Default number of rooted blocks whose proof data is kept.
 pub const DEFAULT_RETAINED_BLOCKS: usize = 1024;
@@ -125,10 +146,13 @@ pub const RETAINED_SIGNER_SET_EPOCHS: usize = 4;
 
 type ProofResult<T> = Result<T, LightClientProofError>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LightClientProofConfig {
     pub retained_blocks: usize,
     pub retained_history: usize,
+    /// Directory to keep the proof data in across restarts. `None`: in
+    /// memory only.
+    pub persist_dir: Option<PathBuf>,
 }
 
 impl Default for LightClientProofConfig {
@@ -136,6 +160,7 @@ impl Default for LightClientProofConfig {
         Self {
             retained_blocks: DEFAULT_RETAINED_BLOCKS,
             retained_history: DEFAULT_RETAINED_HISTORY,
+            persist_dir: None,
         }
     }
 }
@@ -178,6 +203,9 @@ struct RetainedBlock {
     receipts: Option<Result<Arc<Vec<RetainedReceipt>>, String>>,
     accounts_delta: Option<Arc<AccountsDelta>>,
     accounts_state: Option<(Arc<AccountsState>, Option<Epoch>)>,
+    /// The block was read back from disk, where the accounts state is not
+    /// kept.
+    accounts_state_not_kept: bool,
     epoch_boundary: Option<EpochBoundary>,
 }
 
@@ -214,6 +242,7 @@ impl RetainedBlock {
             accounts_state: bank
                 .accounts_state()
                 .map(|state| (state, bank.accounts_state_generation_in_use())),
+            accounts_state_not_kept: false,
             epoch_boundary: bank.epoch_boundary(),
         }
     }
@@ -260,7 +289,7 @@ fn data_not_available(slot: Slot, reason: impl Into<String>) -> LightClientProof
 }
 
 /// The certificates the store holds for one slot.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SlotCertificates {
     notarize: Vec<(Hash, Certificate)>,
     finalize: Option<Certificate>,
@@ -560,18 +589,73 @@ pub struct LightClientProofStore {
     /// Certificates by slot, under their own lock: the consensus pool never
     /// waits for a query.
     certificates: Mutex<BTreeMap<Slot, SlotCertificates>>,
+    /// Slots whose certificates changed since they were last written to
+    /// disk. Written at the next root, not by the consensus pool.
+    unwritten_certificates: Mutex<BTreeSet<Slot>>,
     /// Slot of the oldest kept block (0: none yet).
     oldest_retained: AtomicU64,
+    persistence: Option<Persistence>,
 }
 
 impl LightClientProofStore {
     pub fn new(config: LightClientProofConfig, blockstore: Arc<Blockstore>) -> Self {
-        Self {
+        let persistence = config.persist_dir.as_deref().and_then(Persistence::open);
+        let store = Self {
             config,
             blockstore,
             inner: RwLock::default(),
             certificates: Mutex::default(),
+            unwritten_certificates: Mutex::default(),
             oldest_retained: AtomicU64::new(0),
+            persistence,
+        };
+        store.load();
+        store
+    }
+
+    /// Takes back what a store wrote to the directory before: the blocks in
+    /// order, as if they were rooted again. A block that blockstore does
+    /// not have as a root (another ledger) is dropped.
+    fn load(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let mut inner = self.inner.write().unwrap();
+        inner.signer_sets.extend(
+            persistence
+                .load_signer_sets()
+                .into_iter()
+                .map(|(epoch, signers)| (epoch, Arc::new(signers))),
+        );
+        self.certificates
+            .lock()
+            .unwrap()
+            .extend(persistence.load_certificates());
+        let mut loaded = 0usize;
+        for record in persistence.load_blocks() {
+            let slot = record.block.slot;
+            if !self.blockstore.is_root(slot) {
+                warn!(
+                    "light-client proofs: kept block {slot} is not a root in blockstore, \
+                     dropping it"
+                );
+                persistence.remove_block(slot);
+                continue;
+            }
+            let BlockRecord {
+                block,
+                history,
+                parent_slot,
+            } = record;
+            self.ingest(&mut inner, block, history, parent_slot);
+            loaded += 1;
+        }
+        self.prune(&mut inner);
+        if loaded > 0 {
+            info!(
+                "light-client proofs: took back {loaded} kept blocks, up to slot {:?}",
+                inner.highest_root
+            );
         }
     }
 
@@ -608,19 +692,44 @@ impl LightClientProofStore {
                     .filter_map(|epoch| Some((epoch, Arc::new(bank.validator_set_signers(epoch)?))))
                     .collect();
                 (
-                    RetainedBlock::from_bank(bank),
-                    bank.block_commitment()
-                        .map(|commitment| commitment.block_history),
-                    bank.parent_slot(),
+                    BlockRecord {
+                        block: RetainedBlock::from_bank(bank),
+                        history: bank
+                            .block_commitment()
+                            .map(|commitment| commitment.block_history),
+                        parent_slot: bank.parent_slot(),
+                    },
                     signer_sets,
                 )
             })
             .collect();
+        // Files are written before the lock is taken: a query never waits
+        // for the disk.
+        if let Some(persistence) = &self.persistence {
+            for (record, signer_sets) in &new_blocks {
+                persistence.write_block(record);
+                for (epoch, signers) in signer_sets {
+                    persistence.write_signer_set(*epoch, signers);
+                }
+            }
+            let unwritten = std::mem::take(&mut *self.unwritten_certificates.lock().unwrap());
+            for slot in unwritten {
+                let certificates = self.certificates.lock().unwrap().get(&slot).cloned();
+                if let Some(certificates) = certificates {
+                    persistence.write_certificates(slot, &certificates);
+                }
+            }
+        }
         if new_blocks.is_empty() {
             return;
         }
         let mut inner = self.inner.write().unwrap();
-        for (block, history, parent_slot, signer_sets) in new_blocks {
+        for (record, signer_sets) in new_blocks {
+            let BlockRecord {
+                block,
+                history,
+                parent_slot,
+            } = record;
             if inner.highest_root.is_some_and(|root| block.slot <= root) {
                 continue;
             }
@@ -677,21 +786,34 @@ impl LightClientProofStore {
 
     fn prune(&self, inner: &mut Inner) {
         while inner.blocks.len() > self.config.retained_blocks.max(1) {
-            let (_, block) = inner.blocks.pop_first().expect("not empty");
+            let (slot, block) = inner.blocks.pop_first().expect("not empty");
             if let Some(Ok(receipts)) = &block.receipts {
                 for retained in receipts.iter() {
                     inner.signatures.remove(&retained.receipt.signature);
                 }
             }
+            if let Some(persistence) = &self.persistence {
+                persistence.remove_block(slot);
+            }
         }
         if let Some(oldest) = inner.blocks.keys().next().copied() {
             self.oldest_retained.store(oldest, Ordering::Relaxed);
-            let mut certificates = self.certificates.lock().unwrap();
-            *certificates = certificates.split_off(&oldest);
+            let dropped = {
+                let mut certificates = self.certificates.lock().unwrap();
+                let kept = certificates.split_off(&oldest);
+                !std::mem::replace(&mut *certificates, kept).is_empty()
+            };
+            if let Some(persistence) = self.persistence.as_ref().filter(|_| dropped) {
+                persistence.remove_certificates_before(oldest);
+            }
         }
         inner.history.prune(self.config.retained_history.max(1));
         while inner.signer_sets.len() > RETAINED_SIGNER_SET_EPOCHS {
-            inner.signer_sets.pop_first();
+            if let (Some((epoch, _)), Some(persistence)) =
+                (inner.signer_sets.pop_first(), &self.persistence)
+            {
+                persistence.remove_signer_set(epoch);
+            }
         }
     }
 
@@ -723,6 +845,9 @@ impl LightClientProofStore {
         // Blocks older than the oldest kept block are never served.
         if slot < self.oldest_retained.load(Ordering::Relaxed) {
             return;
+        }
+        if self.persistence.is_some() {
+            self.unwritten_certificates.lock().unwrap().insert(slot);
         }
         let mut certificates = self.certificates.lock().unwrap();
         let certificates = certificates.entry(slot).or_default();
@@ -1243,10 +1368,17 @@ impl LightClientProofStore {
         // Building a proof from the base tree rehashes it: not under the lock.
         let slot = block.slot;
         block.require(block.features.accounts_state_root, "accounts_state_root")?;
-        let (state, generation_in_use) = block
-            .accounts_state
-            .as_ref()
-            .ok_or_else(|| data_not_available(slot, "the block has no accounts state"))?;
+        let (state, generation_in_use) = block.accounts_state.as_ref().ok_or_else(|| {
+            data_not_available(
+                slot,
+                if block.accounts_state_not_kept {
+                    "the accounts state of a block rooted before this node restarted is not \
+                         kept"
+                } else {
+                    "the block has no accounts state"
+                },
+            )
+        })?;
         let (_, vector) = block.commitment()?;
         let proof = state
             .account_proof(*generation_in_use, vector, pubkey, BaseWait::NoWait)
