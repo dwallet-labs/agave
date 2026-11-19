@@ -84,7 +84,8 @@
 //! their own lock. Queries copy what they need under the read lock and
 //! build proofs after releasing it: a history proof hashes every kept leaf
 //! after the base (`O(retained_history)`), an account state proof from the
-//! base tree rehashes the base leaves, as `Bank::accounts_state_proof` does.
+//! base tree hashes one chunk of base leaves and the inner nodes the tree
+//! keeps (a few thousand hashes), as `Bank::accounts_state_proof` does.
 
 use {
     agave_votor_messages::certificate::{
@@ -1374,7 +1375,8 @@ impl LightClientProofStore {
                     };
                 self.final_block(&inner, slot)?
             };
-        // Building a proof from the base tree rehashes it: not under the lock.
+        // A proof from the base tree hashes a few thousand nodes: not under
+        // the lock.
         let slot = block.slot;
         block.require(block.features.accounts_state_root, "accounts_state_root")?;
         let (state, generation_in_use) = block.accounts_state.as_ref().ok_or_else(|| {
