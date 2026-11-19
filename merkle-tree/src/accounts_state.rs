@@ -26,8 +26,8 @@ use {
     crate::{
         accounts_delta::{ADDRESS_LEN, Address},
         commitment_tree::{
-            ACCOUNTS_STATE_ROOT_PREFIX, InclusionProof, TreeId, compute_root_from_leaf_hashes,
-            hash_leaf, make_inclusion_proof_from_leaf_hashes,
+            ACCOUNTS_STATE_ROOT_PREFIX, InclusionProof, TreeId, hash_leaf, hash_root,
+            make_inclusion_proof_from_leaf_hashes, tree_hash_from_leaf_hashes,
         },
         keyed_tree::{KeyedTree, MembershipProof, NonMembershipProof},
     },
@@ -173,12 +173,105 @@ pub enum BaseTreeError {
 /// The base tree of one generation: the accounts with lamports of the base
 /// state, sorted by address, and their root.
 ///
-/// All leaves are held in memory (64 bytes per account). Proofs rehash every
-/// leaf; see [`Self::inclusion_proof`].
+/// All leaves are held in memory (64 bytes per account), with the hashes
+/// of some inner nodes ([`ChunkLevels`]: about 32 bytes per
+/// [`CHUNK_LEN`] accounts), so that a proof hashes a few thousand nodes
+/// whatever the size of the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseTree {
     leaves: Vec<BaseLeaf>,
+    chunks: ChunkLevels,
     root: Hash,
+}
+
+/// Number of leaves, or of nodes of a level, under one stored node.
+pub const CHUNK_LEN: usize = 1 << CHUNK_BITS;
+const CHUNK_BITS: u32 = 10;
+
+/// Inner nodes of a commitment tree kept to build proofs without hashing
+/// every leaf.
+///
+/// The tree splits `n > 1` leaves at the largest power of two below `n`.
+/// So every run of [`CHUNK_LEN`] leaves that starts at a multiple of
+/// `CHUNK_LEN` is the subtree of one node, and so is the shorter run at
+/// the end; and the tree above those nodes is the same tree over them as
+/// leaves. Level 0 holds those nodes, level 1 the same for level 0, and so
+/// on until a level has at most `CHUNK_LEN` nodes.
+///
+/// A path from a leaf to the tree hash is then the path inside its chunk
+/// of leaves, the path inside the chunk of each level, and the path over
+/// the last level: at most `CHUNK_LEN` hashes per level.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChunkLevels(Vec<Vec<Hash>>);
+
+impl ChunkLevels {
+    /// The levels over the `leaf_count` leaves whose hashes
+    /// `leaf_hashes(range)` gives.
+    fn new(leaf_count: usize, leaf_hashes: impl Fn(std::ops::Range<usize>) -> Vec<Hash>) -> Self {
+        if leaf_count == 0 {
+            return Self::default();
+        }
+        let chunk_hashes = |count: usize, hashes: &dyn Fn(std::ops::Range<usize>) -> Vec<Hash>| {
+            (0..count)
+                .step_by(CHUNK_LEN)
+                .map(|start| {
+                    let end = start.saturating_add(CHUNK_LEN).min(count);
+                    tree_hash_from_leaf_hashes(&hashes(start..end))
+                })
+                .collect::<Vec<Hash>>()
+        };
+        let mut levels = vec![chunk_hashes(leaf_count, &leaf_hashes)];
+        while let Some(last) = levels.last().filter(|last| last.len() > CHUNK_LEN) {
+            let next = chunk_hashes(last.len(), &|range| last[range].to_vec());
+            levels.push(next);
+        }
+        Self(levels)
+    }
+
+    /// `MTH` of the leaves.
+    fn tree_hash(&self) -> Hash {
+        tree_hash_from_leaf_hashes(self.0.last().map(Vec::as_slice).unwrap_or_default())
+    }
+
+    /// The siblings of leaf `index`, from the leaf towards the tree hash.
+    /// `index` must be less than `leaf_count`, and `leaf_hashes` as for
+    /// [`Self::new`].
+    fn siblings(
+        &self,
+        leaf_count: usize,
+        index: usize,
+        leaf_hashes: impl Fn(std::ops::Range<usize>) -> Vec<Hash>,
+    ) -> Vec<Hash> {
+        // The path of node `position` inside its chunk of a level with
+        // `count` nodes.
+        let path_in_chunk =
+            |count: usize,
+             position: usize,
+             hashes: &dyn Fn(std::ops::Range<usize>) -> Vec<Hash>| {
+                let start = position & !(CHUNK_LEN - 1);
+                let end = start.saturating_add(CHUNK_LEN).min(count);
+                make_inclusion_proof_from_leaf_hashes(&hashes(start..end), position - start)
+                    .expect("the position is in its chunk")
+                    .siblings
+            };
+        let mut siblings = path_in_chunk(leaf_count, index, &leaf_hashes);
+        let mut position = index >> CHUNK_BITS;
+        let Some((last, levels)) = self.0.split_last() else {
+            return siblings;
+        };
+        for level in levels {
+            siblings.extend(path_in_chunk(level.len(), position, &|range| {
+                level[range].to_vec()
+            }));
+            position >>= CHUNK_BITS;
+        }
+        siblings.extend(
+            make_inclusion_proof_from_leaf_hashes(last, position)
+                .expect("the position is in the last level")
+                .siblings,
+        );
+        siblings
+    }
 }
 
 impl BaseTree {
@@ -204,8 +297,13 @@ impl BaseTree {
                 address: leaf.address,
             });
         }
-        let root = compute_root_from_leaf_hashes(TreeId::BASE_STATE, &leaf_hashes(&leaves));
-        Ok(Self { leaves, root })
+        let chunks = ChunkLevels::new(leaves.len(), |range| leaf_hashes(&leaves[range]));
+        let root = hash_root(TreeId::BASE_STATE, leaves.len() as u64, &chunks.tree_hash());
+        Ok(Self {
+            leaves,
+            chunks,
+            root,
+        })
     }
 
     /// `base_root`.
@@ -237,44 +335,47 @@ impl BaseTree {
             .map(|index| self.leaves[index].account_hash)
     }
 
-    fn leaf_proof(&self, leaf_hashes: &[Hash], index: usize) -> BaseLeafProof {
+    /// Proof of leaf `index` (in range), from the stored inner nodes.
+    fn leaf_proof(&self, index: usize) -> BaseLeafProof {
         BaseLeafProof {
             leaf: self.leaves[index],
-            proof: make_inclusion_proof_from_leaf_hashes(leaf_hashes, index)
-                .expect("index is in range"),
+            proof: InclusionProof {
+                leaf_index: index as u64,
+                leaf_count: self.leaves.len() as u64,
+                siblings: self.chunks.siblings(self.leaves.len(), index, |range| {
+                    leaf_hashes(&self.leaves[range])
+                }),
+            },
         }
     }
 
     /// Inclusion proof of the base leaf of `address`. `None` if it had no
     /// account in the base state.
-    ///
-    /// Rehashes every leaf (`O(n)`): the tree does not keep its inner nodes.
     pub fn inclusion_proof(&self, address: &Address) -> Option<BaseLeafProof> {
         let index = self.search(address).ok()?;
-        Some(self.leaf_proof(&leaf_hashes(&self.leaves), index))
+        Some(self.leaf_proof(index))
     }
 
     /// Proof that `address` had no account in the base state: two adjacent
     /// leaves around it, the first or last leaf, or an empty tree. `None` if
-    /// it had one. Rehashes every leaf, like [`Self::inclusion_proof`].
+    /// it had one.
     pub fn absence_proof(&self, address: &Address) -> Option<BaseAbsenceProof> {
         let index = self.search(address).err()?;
         if self.leaves.is_empty() {
             return Some(BaseAbsenceProof::EmptyTree);
         }
-        let leaf_hashes = leaf_hashes(&self.leaves);
         Some(if index == 0 {
             BaseAbsenceProof::BeforeFirst {
-                first: self.leaf_proof(&leaf_hashes, 0),
+                first: self.leaf_proof(0),
             }
         } else if index == self.leaves.len() {
             BaseAbsenceProof::AfterLast {
-                last: self.leaf_proof(&leaf_hashes, index - 1),
+                last: self.leaf_proof(index - 1),
             }
         } else {
             BaseAbsenceProof::Between {
-                left: self.leaf_proof(&leaf_hashes, index - 1),
-                right: self.leaf_proof(&leaf_hashes, index),
+                left: self.leaf_proof(index - 1),
+                right: self.leaf_proof(index),
             }
         })
     }
@@ -674,6 +775,75 @@ mod tests {
         );
         assert_eq!(tree.get(&addr(3)), Some(h(30)));
         assert_eq!(tree.get(&addr(4)), None);
+    }
+
+    /// The stored inner nodes give the root and the proofs that hashing
+    /// every leaf gives, for trees of one chunk, of chunks that are not
+    /// full, and of one, two and three levels.
+    #[test]
+    fn test_base_tree_chunks_match_full_tree() {
+        use crate::commitment_tree::compute_root_from_leaf_hashes;
+        let two_levels = CHUNK_LEN * CHUNK_LEN;
+        for len in [
+            0,
+            1,
+            2,
+            3,
+            CHUNK_LEN - 1,
+            CHUNK_LEN,
+            CHUNK_LEN + 1,
+            2 * CHUNK_LEN - 1,
+            2 * CHUNK_LEN,
+            2 * CHUNK_LEN + 1,
+            5 * CHUNK_LEN + 77,
+            two_levels + 3 * CHUNK_LEN + 5,
+        ] {
+            let leaves: Vec<BaseLeaf> = (0..len as u64)
+                .map(|i| {
+                    let mut address = [0u8; ADDRESS_LEN];
+                    address[..8].copy_from_slice(&i.to_be_bytes());
+                    BaseLeaf::new(address, hash(&i.to_le_bytes()))
+                })
+                .collect();
+            let tree = BaseTree::new(leaves.clone()).unwrap();
+            let hashes = leaf_hashes(&leaves);
+            assert_eq!(
+                tree.root(),
+                compute_root_from_leaf_hashes(TreeId::BASE_STATE, &hashes),
+                "{len} leaves"
+            );
+            let last = len.saturating_sub(1);
+            let mut indexes = vec![
+                0,
+                1,
+                CHUNK_LEN - 1,
+                CHUNK_LEN,
+                len / 2,
+                two_levels.saturating_sub(1),
+                two_levels,
+                last.saturating_sub(CHUNK_LEN),
+                last.saturating_sub(1),
+                last,
+            ];
+            indexes.retain(|index| *index < len);
+            indexes.sort_unstable();
+            indexes.dedup();
+            for index in indexes {
+                let proof = tree.inclusion_proof(&leaves[index].address).unwrap();
+                // The full-tree proof hashes every leaf, so for the large
+                // tree the proof is only verified against the root, which
+                // was compared above.
+                if len <= two_levels {
+                    assert_eq!(
+                        proof.proof,
+                        make_inclusion_proof_from_leaf_hashes(&hashes, index).unwrap(),
+                        "leaf {index} of {len}"
+                    );
+                }
+                assert_eq!(proof.proof.leaf_index, index as u64);
+                assert!(proof.verify(&tree.root()));
+            }
+        }
     }
 
     #[test]
