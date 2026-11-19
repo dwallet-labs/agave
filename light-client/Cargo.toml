@@ -24,6 +24,11 @@ agave-unstable-api = []
 # Conversions to and from the JSON forms of the proofs served over RPC
 # (`solana-rpc-client-types::light_client`).
 rpc = ["dep:base64", "dep:bs58", "dep:solana-rpc-client-types"]
+# A client that fetches the proofs it needs from a node and verifies them,
+# over any transport that implements `fetch::ProofSource`.
+fetch = ["rpc"]
+# `fetch::ProofSource` for `solana_rpc_client::rpc_client::RpcClient`.
+rpc-client = ["fetch", "dep:solana-rpc-client", "dep:solana-signature"]
 
 [dependencies]
 base64 = { workspace = true, optional = true }
@@ -34,8 +39,10 @@ solana-epoch-schedule = { workspace = true }
 solana-hash = { workspace = true, features = ["copy"] }
 solana-merkle-tree = { workspace = true }
 solana-pubkey = { workspace = true }
+solana-rpc-client = { workspace = true, optional = true }
 solana-rpc-client-types = { workspace = true, optional = true }
 solana-sha256-hasher = { workspace = true, features = ["sha2"] }
+solana-signature = { workspace = true, optional = true }
 solana-signer-store = { workspace = true }
 thiserror = { workspace = true }
 
