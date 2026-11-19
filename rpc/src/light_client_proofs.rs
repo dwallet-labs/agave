@@ -781,16 +781,42 @@ impl LightClientProofStore {
         self.inner.read().unwrap().highest_root
     }
 
-    /// The footer proof of `(slot, block_id)`, from blockstore.
-    fn footer_proof(&self, block: &RetainedBlock, block_id: &Hash) -> ProofResult<FooterProof> {
+    /// The footer proof of `(slot, block_id)`, from blockstore, to answer a
+    /// query about the block at `asked` (the block itself, or one that is
+    /// final through it).
+    ///
+    /// The node that produced a block votes on it, and can root it, before
+    /// its broadcast has written the last shreds of the block to blockstore.
+    /// Until then the block cannot be proven final from this node: the
+    /// answer is "block not final", which callers retry, as for a block
+    /// that is not rooted yet.
+    fn footer_proof(
+        &self,
+        block: &RetainedBlock,
+        block_id: &Hash,
+        asked: Slot,
+    ) -> ProofResult<FooterProof> {
         let slot = block.slot;
-        let (meta, slot_meta) = self
+        let Some((meta, slot_meta)) = self
             .blockstore
             .get_parent_repair_metadata(slot, *block_id)
             .map_err(|err| data_not_available(slot, format!("blockstore: {err}")))?
-            .ok_or_else(|| {
-                data_not_available(slot, "blockstore has no complete block with this block id")
-            })?;
+        else {
+            return Err(match self.blockstore.meta(slot) {
+                // Still being written. Every block before `asked` was
+                // rooted earlier, so `asked - 1` is a lower bound of the
+                // latest slot that is final here.
+                Ok(Some(slot_meta)) if !slot_meta.is_full() => {
+                    LightClientProofError::BlockNotFinal {
+                        slot: asked,
+                        finalized_slot: asked.saturating_sub(1),
+                    }
+                }
+                _ => {
+                    data_not_available(slot, "blockstore has no complete block with this block id")
+                }
+            });
+        };
         let binding = meta.footer_binding().ok_or_else(|| {
             data_not_available(
                 slot,
@@ -966,7 +992,7 @@ impl LightClientProofStore {
             };
             (block, block_id, source)
         };
-        let footer = self.footer_proof(&block, &block_id)?;
+        let footer = self.footer_proof(&block, &block_id, slot)?;
         let finality = match source {
             FinalitySource::Own(finality) => Finality::Certificates(finality),
             FinalitySource::Descendant {
@@ -978,7 +1004,7 @@ impl LightClientProofStore {
                 slot: descendant.slot,
                 block_id: descendant_id,
                 finality,
-                footer: self.footer_proof(&descendant, &descendant_id)?,
+                footer: self.footer_proof(&descendant, &descendant_id, slot)?,
                 history: history.prove()?,
             })),
         };
