@@ -4,7 +4,10 @@
 //! Accounts Delta Root, Epoch Validator Set Root, Epoch Boundary Commitment,
 //! Accounts State Root).
 //!
-//! This crate only verifies. It does no networking and fetches no proof.
+//! The core of this crate only verifies: it does no networking and fetches
+//! no proof. With the `fetch` feature, [`fetch::ProofFetcher`] fetches the
+//! proofs it needs through a transport the caller provides and verifies
+//! them; the `rpc-client` feature provides that transport over JSON-RPC.
 //!
 //! # From a certificate to an item
 //!
@@ -49,6 +52,8 @@ mod certificate;
 mod client;
 mod commitment;
 mod error;
+#[cfg(feature = "fetch")]
+pub mod fetch;
 mod proofs;
 #[cfg(feature = "rpc")]
 pub mod rpc;

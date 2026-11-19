@@ -128,6 +128,7 @@ solana-fee-structure = { workspace = true }
 solana-gossip = { path = "../gossip", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-instruction = { workspace = true }
 solana-instruction-error = { workspace = true }
+solana-light-client = { workspace = true, features = ["agave-unstable-api", "fetch", "rpc"] }
 solana-nonce = { workspace = true, features = ["wincode"] }
 solana-nonce-account = { workspace = true, features = ["wincode"] }
 solana-program-option = { workspace = true }

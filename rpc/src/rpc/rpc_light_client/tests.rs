@@ -1337,3 +1337,288 @@ fn test_account_state_proof_base_tree_not_ready() {
         .unwrap();
     assert_eq!(again, served);
 }
+
+/// The node's proof methods as a `ProofSource`, over the test RPC handler.
+/// It can fail its first requests as "not ready", and answer
+/// `getFinalityProof` for another slot than the one asked.
+struct TestSource<'a> {
+    rpc: &'a Rpc,
+    not_ready: std::cell::Cell<u32>,
+    finality_of: Option<u64>,
+}
+
+impl<'a> TestSource<'a> {
+    fn new(rpc: &'a Rpc) -> Self {
+        Self {
+            rpc,
+            not_ready: std::cell::Cell::new(0),
+            finality_of: None,
+        }
+    }
+
+    fn call<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<T, solana_light_client::fetch::SourceError> {
+        use solana_light_client::fetch::SourceError;
+        if self.not_ready.get() > 0 {
+            self.not_ready.set(self.not_ready.get() - 1);
+            return Err(SourceError::NotReady("test".to_string()));
+        }
+        self.rpc
+            .call(method, params)
+            .map_err(|(code, data)| SourceError::from_rpc_error(code, data.to_string()))
+    }
+}
+
+impl solana_light_client::fetch::ProofSource for TestSource<'_> {
+    fn finality_proof(
+        &self,
+        slot: u64,
+    ) -> std::result::Result<RpcFinalityProof, solana_light_client::fetch::SourceError> {
+        self.call(
+            "getFinalityProof",
+            json!([self.finality_of.unwrap_or(slot)]),
+        )
+    }
+
+    fn block_history_proof(
+        &self,
+        slot: u64,
+        at_slot: u64,
+    ) -> std::result::Result<RpcBlockHistoryProof, solana_light_client::fetch::SourceError> {
+        self.call("getBlockHistoryProof", json!([slot, at_slot]))
+    }
+
+    fn transaction_proof(
+        &self,
+        signature: &[u8; 64],
+        instructions: Option<RpcProofSelection>,
+        events: Option<RpcProofSelection>,
+    ) -> std::result::Result<RpcTransactionProof, solana_light_client::fetch::SourceError> {
+        self.call(
+            "getTransactionProof",
+            json!([
+                solana_signature::Signature::from(*signature).to_string(),
+                {"instructions": instructions, "events": events}
+            ]),
+        )
+    }
+
+    fn account_delta_proof(
+        &self,
+        address: &Pubkey,
+        slot: u64,
+    ) -> std::result::Result<RpcAccountDeltaProof, solana_light_client::fetch::SourceError> {
+        self.call("getAccountDeltaProof", json!([address.to_string(), slot]))
+    }
+
+    fn account_state_proof(
+        &self,
+        address: &Pubkey,
+        slot: Option<u64>,
+    ) -> std::result::Result<RpcAccountStateProof, solana_light_client::fetch::SourceError> {
+        self.call(
+            "getAccountStateProof",
+            json!([address.to_string(), {"slot": slot}]),
+        )
+    }
+
+    fn validator_set(
+        &self,
+        epoch: u64,
+        at_slot: Option<u64>,
+    ) -> std::result::Result<RpcValidatorSet, solana_light_client::fetch::SourceError> {
+        self.call("getValidatorSet", json!([epoch, {"atSlot": at_slot}]))
+    }
+
+    fn epoch_boundary(
+        &self,
+        epoch: u64,
+        at_slot: Option<u64>,
+    ) -> std::result::Result<RpcEpochBoundary, solana_light_client::fetch::SourceError> {
+        self.call("getEpochBoundary", json!([epoch, {"atSlot": at_slot}]))
+    }
+}
+
+/// `ProofFetcher`: a client that trusts the signer set of epoch 1 fetches
+/// and verifies each kind of fact from the node, follows the validator set
+/// into epoch 2 by itself, and rejects answers that are not ready, not for
+/// the block asked, or from before the epoch it started in.
+#[test]
+fn test_proof_fetcher() {
+    use solana_light_client::fetch::{
+        AccountChange, FetchError, FetchedAncestor, ProofFetcher, Retry, SourceError,
+    };
+    let chain = build_chain();
+    let store = chain.store(1000);
+    let rpc = chain.rpc(&store);
+    let bank = |slot| chain.bank(slot).as_ref();
+    let set1 = SignerSet::new(1, bank(65).validator_set_signers(1).unwrap()).unwrap();
+    let keys1 = keypairs_by_rank(&chain.validators, &set1);
+    let set2 = SignerSet::new(2, bank(100).validator_set_signers(2).unwrap()).unwrap();
+    let keys2 = keypairs_by_rank(&chain.validators, &set2);
+    let schedule = chain.genesis_config.epoch_schedule.clone();
+    let client1 = LightClient::new(schedule.clone(), SHRED_VERSION, set1);
+    let client2 = LightClient::new(schedule, SHRED_VERSION, set2);
+
+    // Before any certificate the node is not ready, and the fetcher says so.
+    let mut fetcher = ProofFetcher::new(client1.clone(), TestSource::new(&rpc));
+    assert!(matches!(
+        fetcher.block(100),
+        Err(FetchError::Source(SourceError::NotReady(_)))
+    ));
+    for certificate in slow_certificates(bank(100), &keys1) {
+        store.on_certificate(&certificate);
+    }
+    store.on_certificate(&fast_certificate(bank(96), &keys1));
+    store.on_certificate(&fast_certificate(bank(160), &keys2));
+
+    // Blocks of the trusted epoch: with their own certificates, and through
+    // a descendant.
+    let block100 = fetcher.block(100).unwrap();
+    assert!(matches!(block100, VerifiedFinal::Block(_)));
+    assert_eq!(
+        *block100.commitment_root(),
+        bank(100).commitment_root().unwrap()
+    );
+    let block65 = fetcher.block(65).unwrap();
+    assert!(matches!(block65, VerifiedFinal::Ancestor(_)));
+    assert_eq!(*block65.block_id(), block_id(bank(65)));
+
+    // Transactions: a receipt alone, and with every instruction and event.
+    let transfer: [u8; 64] = chain.transfer_tx.signatures[0].into();
+    let fetched = fetcher.transaction(&transfer, None, None).unwrap();
+    assert!(fetched.transaction.is_success());
+    assert!(fetched.instructions.is_empty() && fetched.events.is_empty());
+    let program: [u8; 64] = chain.program_tx.signatures[0].into();
+    let fetched = fetcher
+        .transaction(
+            &program,
+            Some(RpcProofSelection::All),
+            Some(RpcProofSelection::All),
+        )
+        .unwrap();
+    assert!(fetched.transaction.is_success());
+    assert!(!fetched.instructions.is_empty() && !fetched.events.is_empty());
+    let unknown = [7u8; 64];
+    assert!(matches!(
+        fetcher.transaction(&unknown, None, None),
+        Err(FetchError::Source(SourceError::NotAvailable(_)))
+    ));
+
+    // What a block did to an account.
+    let recipient_hash = hash_of(
+        &bank(65).get_account(&chain.recipient).unwrap(),
+        &chain.recipient,
+    );
+    let (block, change) = fetcher.account_change(&chain.recipient, 65).unwrap();
+    assert_eq!(block, block65);
+    assert_eq!(
+        change,
+        AccountChange::Changed {
+            account_hash: recipient_hash
+        }
+    );
+    let (_, change) = fetcher.account_change(&chain.quiet, 65).unwrap();
+    assert_eq!(change, AccountChange::Unchanged);
+
+    // A block of epoch 2: the fetcher first follows the validator set,
+    // through the block of epoch 1 that commits to the next one.
+    assert_eq!(fetcher.epoch(), 1);
+    let block160 = fetcher.block(160).unwrap();
+    assert_eq!(fetcher.epoch(), 2);
+    assert_eq!(
+        *block160.commitment_root(),
+        bank(160).commitment_root().unwrap()
+    );
+    // Blocks of epoch 1 still verify.
+    assert_eq!(fetcher.block(96).unwrap().slot(), 96);
+
+    // The current state of an account, and that an address has none.
+    let fresh_hash = hash_of(&bank(160).get_account(&chain.fresh).unwrap(), &chain.fresh);
+    let block = fetcher
+        .account_state(&chain.fresh, None, Some(&fresh_hash))
+        .unwrap();
+    assert_eq!(block, block160);
+    fetcher
+        .account_state(&Pubkey::new_unique(), Some(160), None)
+        .unwrap();
+    // A wrong account hash, or claiming absence of an account that exists.
+    assert!(matches!(
+        fetcher.account_state(&chain.fresh, None, Some(&recipient_hash)),
+        Err(FetchError::Verify(_))
+    ));
+    assert!(matches!(
+        fetcher.account_state(&chain.fresh, None, None),
+        Err(FetchError::Verify(_))
+    ));
+
+    // Ancestors through the history of block 160: a block with a
+    // commitment root, and the anchor (the last block before activation).
+    let (at, ancestor) = fetcher.ancestor(65, 160).unwrap();
+    assert_eq!(at, block160);
+    let FetchedAncestor::Block(ancestor) = ancestor else {
+        panic!("{ancestor:?}");
+    };
+    assert_eq!(ancestor.commitment_root(), block65.commitment_root());
+    let (_, anchor) = fetcher.ancestor(62, 160).unwrap();
+    assert!(
+        matches!(anchor, FetchedAncestor::Anchor(anchor) if anchor.slot == 62),
+        "{anchor:?}"
+    );
+
+    // Where epoch 1 ended.
+    let (block, boundary) = fetcher.epoch_boundary(2).unwrap();
+    assert_eq!(block.slot(), 160);
+    assert_eq!(boundary.boundary.parent_slot, 100);
+    assert_eq!(boundary.boundary.first_slot, 130);
+
+    // Forgetting epoch 1: its blocks no longer verify.
+    fetcher.forget_epochs_before(2);
+    assert_eq!(
+        fetcher.block(100),
+        Err(FetchError::EpochBeforeTrusted {
+            epoch: 1,
+            first_trusted: 2
+        })
+    );
+    // As for a client that starts in epoch 2.
+    let mut late = ProofFetcher::new(client2, TestSource::new(&rpc));
+    assert_eq!(late.block(160).unwrap(), block160);
+    assert!(matches!(
+        late.block(96),
+        Err(FetchError::EpochBeforeTrusted { .. })
+    ));
+
+    // A source that is not ready twice: an error without retries, an
+    // answer with them.
+    let source = TestSource::new(&rpc);
+    source.not_ready.set(2);
+    let mut patient = ProofFetcher::new(client1.clone(), &source);
+    assert!(matches!(
+        patient.block(100),
+        Err(FetchError::Source(SourceError::NotReady(_)))
+    ));
+    let mut patient = patient.with_retry(Retry {
+        attempts: 2,
+        delay: std::time::Duration::from_millis(1),
+    });
+    source.not_ready.set(2);
+    assert_eq!(patient.block(100).unwrap(), block100);
+
+    // A source that answers for another block: nothing is returned.
+    let mut source = TestSource::new(&rpc);
+    source.finality_of = Some(96);
+    let mut cheated = ProofFetcher::new(client1, source);
+    assert!(matches!(cheated.block(100), Err(FetchError::Verify(_))));
+    assert!(matches!(
+        cheated.transaction(&transfer, None, None),
+        Err(FetchError::Verify(_))
+    ));
+    assert!(matches!(
+        cheated.account_change(&chain.recipient, 65),
+        Err(FetchError::Verify(_))
+    ));
+}
