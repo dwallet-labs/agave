@@ -2638,3 +2638,109 @@ fn test_light_client_features_activated_on_running_cluster() {
         started.elapsed()
     );
 }
+
+/// The fetching client against a real node, over JSON-RPC: it starts from
+/// the genesis signer set, fetches and verifies a transaction, what its
+/// block did to an account, and the account's state, and follows the
+/// validator set into the next epoch by itself when asked about a block
+/// there.
+#[test]
+#[serial]
+fn test_light_client_fetcher_over_rpc() {
+    use solana_light_client::fetch::{AccountChange, FetchedAncestor, ProofFetcher, Retry};
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
+    let tc = start_cluster(&[DEFAULT_NODE_STAKE]);
+    let rpc = tc.rpc(0);
+    let schedule = tc.epoch_schedule().clone();
+    let genesis_config = tc.genesis_config();
+    let client = LightClient::new(
+        schedule.clone(),
+        solana_shred_version::compute_shred_version(&genesis_config.hash(), None),
+        genesis_signer_set(genesis_config),
+    );
+    // The node answers "not final yet" for a moment after it roots a block.
+    let mut fetcher = ProofFetcher::new(client, tc.rpc(0)).with_retry(Retry {
+        attempts: 100,
+        delay: Duration::from_millis(50),
+    });
+    let mint = tc.cluster.funding_keypair.insecure_clone();
+    let recipient = Keypair::new().pubkey();
+    let transfer = |lamports| {
+        let blockhash = rpc.get_latest_blockhash().unwrap();
+        let sent = tc.send(
+            &rpc,
+            &system_transaction::transfer(&mint, &recipient, lamports, blockhash),
+        );
+        wait_for_finalized(&rpc, sent.slot);
+        sent
+    };
+
+    // Epoch 0.
+    let t0 = transfer(1_000_000);
+    assert_eq!(schedule.get_epoch(t0.slot), 0);
+    let signature: [u8; 64] = t0.signature.into();
+    let fetched0 = fetcher
+        .transaction(
+            &signature,
+            Some(RpcProofSelection::All),
+            Some(RpcProofSelection::All),
+        )
+        .unwrap();
+    assert_eq!(fetched0.block.slot(), t0.slot);
+    assert!(fetched0.transaction.is_success());
+    assert_eq!(fetched0.instructions.len(), 1);
+    let (_, account) = finalized_account(&rpc, &recipient);
+    let hash0 = hash_of(&recipient, &account.unwrap());
+    let (block, change) = fetcher.account_change(&recipient, t0.slot).unwrap();
+    assert_eq!(block, fetched0.block);
+    assert_eq!(
+        change,
+        AccountChange::Changed {
+            account_hash: hash0
+        }
+    );
+    assert_eq!(fetcher.epoch(), 0);
+
+    // Epoch 1: asked about a transaction there, the fetcher first follows
+    // the validator set.
+    wait_for_finalized(&rpc, schedule.get_first_slot_in_epoch(1) + 4);
+    let t1 = transfer(2_000_000);
+    assert_eq!(schedule.get_epoch(t1.slot), 1);
+    let signature: [u8; 64] = t1.signature.into();
+    let fetched1 = fetcher.transaction(&signature, None, None).unwrap();
+    assert_eq!(fetcher.epoch(), 1);
+    assert_eq!(fetched1.block.slot(), t1.slot);
+    assert!(fetched1.transaction.is_success());
+
+    // The account's state at the end of that block, and an address with no
+    // account.
+    let (_, account) = finalized_account(&rpc, &recipient);
+    let account = account.unwrap();
+    assert_eq!(account.lamports, 3_000_000);
+    let hash1 = hash_of(&recipient, &account);
+    let block = fetcher
+        .account_state(&recipient, Some(t1.slot), Some(&hash1))
+        .unwrap();
+    assert_eq!(block, fetched1.block);
+    fetcher
+        .account_state(&Keypair::new().pubkey(), Some(t1.slot), None)
+        .unwrap();
+    // The state it had after the first transfer is no longer its state.
+    assert!(
+        fetcher
+            .account_state(&recipient, Some(t1.slot), Some(&hash0))
+            .is_err()
+    );
+
+    // The first block as an ancestor of the second, and where epoch 0
+    // ended.
+    let (_, ancestor) = fetcher.ancestor(t0.slot, t1.slot).unwrap();
+    let FetchedAncestor::Block(ancestor) = ancestor else {
+        panic!("{ancestor:?}");
+    };
+    assert_eq!(ancestor.commitment_root(), fetched0.block.commitment_root());
+    let (_, boundary) = fetcher.epoch_boundary(1).unwrap();
+    assert!(boundary.boundary.parent_slot < schedule.get_first_slot_in_epoch(1));
+    // A block of epoch 0 still verifies.
+    assert_eq!(fetcher.block(t0.slot).unwrap(), fetched0.block);
+}
