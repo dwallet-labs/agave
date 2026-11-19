@@ -173,6 +173,20 @@ fn component_shreds(
 /// commitment root, if the bank has a commitment root) and the final tick.
 /// The bank's block id is the double Merkle root blockstore computes.
 fn freeze_and_store(blockstore: &Blockstore, bank: &Arc<Bank>) {
+    let shreds = freeze_and_shred(bank);
+    let slot = bank.slot();
+    blockstore.insert_shreds(shreds, true).unwrap();
+    assert!(blockstore.is_full(slot));
+    let block_id = blockstore
+        .get_double_merkle_root(slot, BlockLocation::Original)
+        .unwrap()
+        .unwrap();
+    bank.set_block_id(Some(BlockId::from(block_id)));
+}
+
+/// Freezes `bank` and returns the data shreds of its block (see
+/// [`freeze_and_store`]).
+fn freeze_and_shred(bank: &Arc<Bank>) -> Vec<Shred> {
     goto_end_of_slot(bank.clone());
     bank.freeze();
     let slot = bank.slot();
@@ -222,13 +236,7 @@ fn freeze_and_store(blockstore: &Blockstore, bank: &Arc<Bank>) {
         next(&shreds),
         true,
     ));
-    blockstore.insert_shreds(shreds, true).unwrap();
-    assert!(blockstore.is_full(slot));
-    let block_id = blockstore
-        .get_double_merkle_root(slot, BlockLocation::Original)
-        .unwrap()
-        .unwrap();
-    bank.set_block_id(Some(BlockId::from(block_id)));
+    shreds
 }
 
 fn block_id(bank: &Bank) -> Hash {
@@ -1063,4 +1071,66 @@ fn test_light_client_proof_errors() {
         json!([chain.program_tx.signatures[0].to_string(), {"instruction": "all"}]),
     );
     assert_eq!(code, jsonrpc_core::ErrorCode::InvalidParams.code());
+}
+
+/// The node that produced a block can root it before broadcast has written
+/// the whole block to its blockstore. Until then `getFinalityProof` answers
+/// "block not final", and serves the proof once the block is complete.
+#[test]
+fn test_finality_proof_before_block_is_in_blockstore() {
+    let chain = build_chain();
+    let bank161 = new_child(chain.bank(160), 161);
+    let shreds = freeze_and_shred(&bank161);
+
+    // The block id, as broadcast computes it without blockstore.
+    let scratch_path = solana_ledger::get_tmp_ledger_path!();
+    let block_id = {
+        let scratch = Blockstore::open(&scratch_path).unwrap();
+        scratch.insert_shreds(shreds.clone(), true).unwrap();
+        scratch
+            .get_double_merkle_root(161, BlockLocation::Original)
+            .unwrap()
+            .unwrap()
+    };
+    bank161.set_block_id(Some(BlockId::from(block_id)));
+
+    // Blockstore has all but the last shred when the block is rooted.
+    let (last, written) = shreds.split_last().unwrap();
+    chain
+        .blockstore
+        .insert_shreds(written.to_vec(), true)
+        .unwrap();
+    assert!(!chain.blockstore.is_full(161));
+    chain.blockstore.set_roots([161].iter()).unwrap();
+
+    let store = chain.store(1000);
+    store.on_rooted_banks(std::slice::from_ref(&bank161));
+    let set2 = SignerSet::new(2, chain.bank(100).validator_set_signers(2).unwrap()).unwrap();
+    let keys2 = keypairs_by_rank(&chain.validators, &set2);
+    store.on_certificate(&fast_certificate(&bank161, &keys2));
+    let rpc = chain.rpc(&store);
+
+    let (code, data) = rpc.error("getFinalityProof", json!([161]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL);
+    assert_eq!(
+        data,
+        json!({"kind": "blockNotFinal", "slot": 161, "finalizedSlot": 160})
+    );
+    // A block that is final through it is not served either, and the error
+    // names the block asked for.
+    let (code, data) = rpc.error("getFinalityProof", json!([160]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL);
+    assert_eq!(
+        data,
+        json!({"kind": "blockNotFinal", "slot": 160, "finalizedSlot": 159})
+    );
+
+    chain
+        .blockstore
+        .insert_shreds(vec![last.clone()], true)
+        .unwrap();
+    assert!(chain.blockstore.is_full(161));
+    let response = rpc.finality(161);
+    assert_eq!(response.block_id, block_id);
+    assert_eq!(rpc.finality(160).slot, 160);
 }
