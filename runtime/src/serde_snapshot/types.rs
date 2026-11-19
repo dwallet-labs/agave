@@ -107,6 +107,22 @@ pub struct SerdeAccountsState {
     pub generations: Vec<SerdeAccountsStateGeneration>,
 }
 
+/// Snapshot serde-safe epoch boundary state, as the Epoch Boundary
+/// Commitment SIMD writes it. That feature is not part of this build: the
+/// type only keeps its place in [`super::CommitmentExtraFields`], so that
+/// snapshots have one field order with or without it. This build never
+/// writes the value and ignores it when read.
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct SerdeEpochBoundary {
+    pub epoch: u64,
+    pub first_slot: u64,
+    pub parent_slot: u64,
+    pub parent_block_id: Hash,
+    pub parent_commitment_root: Hash,
+    pub history_len: u64,
+}
+
 /// One generation of [`SerdeAccountsState`].
 #[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
 #[derive(Debug, Clone, PartialEq, Eq, SchemaRead, SchemaWrite)]

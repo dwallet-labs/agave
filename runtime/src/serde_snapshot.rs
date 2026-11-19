@@ -47,8 +47,8 @@ use {
         time::Instant,
     },
     types::{
-        SerdeAccountsLtHash, SerdeAccountsState, SerdeBlockCommitment, UnusedRentCollector,
-        UnusedStakes,
+        SerdeAccountsLtHash, SerdeAccountsState, SerdeBlockCommitment, SerdeEpochBoundary,
+        UnusedRentCollector, UnusedStakes,
     },
     wincode::{
         ReadResult, SchemaRead, SchemaReadOwned, SchemaWrite, WriteResult,
@@ -479,7 +479,7 @@ struct ExtraFieldsToDeserialize {
     // Write-only type (its deserialize counterpart is `ExtraFieldsToDeserialize`), so the abi digest
     // only verifies the serialized wire format; there is no roundtrip.
     frozen_abi(
-        abi_digest = "4gik11Fb9ZCABkpJgcB2ZHCfmttK6tgW7Y9EXtuvFCev",
+        abi_digest = "9Z3L2TgeHZxhsQD2xfThJ1rAj6oudvqkpZ39cPmGtE1P",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )
@@ -515,6 +515,12 @@ pub struct CommitmentExtraFields {
     /// the snapshot bank.
     #[wincode(with = "DefaultOnEmptyRead<Option<SerdeBlockCommitment>>")]
     pub block_commitment: Option<SerdeBlockCommitment>,
+    /// Place of the Epoch Boundary Commitment state, which this build does
+    /// not have: always written as `None` (when a later field is present),
+    /// and ignored when read. It keeps `accounts_state` at the position it
+    /// has in a build with all the commitment features.
+    #[wincode(with = "DefaultOnEmptyRead<Option<SerdeEpochBoundary>>")]
+    pub epoch_boundary: Option<SerdeEpochBoundary>,
     /// Accounts State Root state of the snapshot bank (overlays and known
     /// base roots). None unless the feature is in effect for the snapshot
     /// bank.
@@ -527,6 +533,7 @@ impl CommitmentExtraFields {
     pub fn new(bank_fields: &BankFieldsToSerialize) -> Self {
         Self {
             block_commitment: bank_fields.block_commitment.clone().map(Into::into),
+            epoch_boundary: None,
             accounts_state: bank_fields.accounts_state.clone().map(Into::into),
         }
     }
@@ -535,12 +542,17 @@ impl CommitmentExtraFields {
     fn num_written(&self) -> usize {
         let Self {
             block_commitment,
+            epoch_boundary,
             accounts_state,
         } = self;
-        [block_commitment.is_some(), accounts_state.is_some()]
-            .iter()
-            .rposition(|present| *present)
-            .map_or(0, |last| last + 1)
+        [
+            block_commitment.is_some(),
+            epoch_boundary.is_some(),
+            accounts_state.is_some(),
+        ]
+        .iter()
+        .rposition(|present| *present)
+        .map_or(0, |last| last + 1)
     }
 }
 
@@ -552,6 +564,7 @@ unsafe impl<C: Config> SchemaWrite<C> for CommitmentExtraFields {
     fn size_of(src: &Self) -> WriteResult<usize> {
         let Self {
             block_commitment,
+            epoch_boundary,
             accounts_state,
         } = src;
         let num_written = src.num_written();
@@ -560,6 +573,9 @@ unsafe impl<C: Config> SchemaWrite<C> for CommitmentExtraFields {
             size += <Option<SerdeBlockCommitment> as SchemaWrite<C>>::size_of(block_commitment)?;
         }
         if num_written > 1 {
+            size += <Option<SerdeEpochBoundary> as SchemaWrite<C>>::size_of(epoch_boundary)?;
+        }
+        if num_written > 2 {
             size += <Option<SerdeAccountsState> as SchemaWrite<C>>::size_of(accounts_state)?;
         }
         Ok(size)
@@ -568,6 +584,7 @@ unsafe impl<C: Config> SchemaWrite<C> for CommitmentExtraFields {
     fn write(mut writer: impl Writer, src: &Self) -> WriteResult<()> {
         let Self {
             block_commitment,
+            epoch_boundary,
             accounts_state,
         } = src;
         let num_written = src.num_written();
@@ -578,6 +595,9 @@ unsafe impl<C: Config> SchemaWrite<C> for CommitmentExtraFields {
             )?;
         }
         if num_written > 1 {
+            <Option<SerdeEpochBoundary> as SchemaWrite<C>>::write(writer.by_ref(), epoch_boundary)?;
+        }
+        if num_written > 2 {
             <Option<SerdeAccountsState> as SchemaWrite<C>>::write(writer.by_ref(), accounts_state)?;
         }
         Ok(())
@@ -593,7 +613,7 @@ unsafe impl<C: Config> SchemaWrite<C> for CommitmentExtraFields {
     feature = "stable-abi",
     derive(SchemaWrite, StableAbi, StableAbiSample),
     frozen_abi(
-        abi_digest = "9aFwpHFowomJkSYHKXRZ4htDNu1wce2EQBR1UkUbyXiK",
+        abi_digest = "JBAfbxio5k5J71hg2d2Bo54dXuLE9WFEFHYkLBNNauE9",
         abi_serializer = "wincode",
         test_roundtrip = "wire_only"
     )
@@ -629,6 +649,8 @@ impl DeserializableBankSnapshot {
             commitments:
                 CommitmentExtraFields {
                     block_commitment,
+                    // Not part of this build.
+                    epoch_boundary: _,
                     accounts_state,
                 },
         } = extra_fields;
@@ -772,7 +794,7 @@ where
     // Write-only type (its deserialize counterparts are `DeserializableVersionedBank`,
     // `AccountsDbFields` and `ExtraFieldsToDeserialize`), so there is no roundtrip.
     frozen_abi(
-        abi_digest = "9aFwpHFowomJkSYHKXRZ4htDNu1wce2EQBR1UkUbyXiK",
+        abi_digest = "JBAfbxio5k5J71hg2d2Bo54dXuLE9WFEFHYkLBNNauE9",
         abi_serializer = "wincode",
         test_roundtrip = "no"
     )

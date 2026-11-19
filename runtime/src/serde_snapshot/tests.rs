@@ -1409,10 +1409,14 @@ mod serde_snapshot_tests {
     /// The accounts state field on the wire, with and without the block
     /// commitment before it: written only up to the last present field, an
     /// absent block commitment before a present accounts state as `None`.
+    /// Between the two is the place of the epoch boundary field of a build
+    /// with all the commitment features: `None` here, so that such a build
+    /// reads these snapshots, and ignored when a snapshot from such a build
+    /// has it.
     #[test]
     fn test_commitment_extra_fields_accounts_state_wire_format() {
         use crate::serde_snapshot::types::{
-            SerdeAccountsState, SerdeAccountsStateGeneration, SerdeOverlayEntry,
+            SerdeAccountsState, SerdeAccountsStateGeneration, SerdeEpochBoundary, SerdeOverlayEntry,
         };
         let to_bytes = |fields: &CommitmentExtraFields| {
             let mut buf = vec![];
@@ -1443,6 +1447,7 @@ mod serde_snapshot_tests {
             for accounts_state in [None, Some(accounts_state.clone())] {
                 let fields = CommitmentExtraFields {
                     block_commitment: block_commitment.clone(),
+                    epoch_boundary: None,
                     accounts_state: accounts_state.clone(),
                 };
                 let mut expected = vec![];
@@ -1450,10 +1455,33 @@ mod serde_snapshot_tests {
                     serialize_into(&mut expected, &block_commitment).unwrap();
                 }
                 if accounts_state.is_some() {
+                    // The place of the epoch boundary field.
+                    expected.push(0);
                     serialize_into(&mut expected, &accounts_state).unwrap();
                 }
                 assert_eq!(to_bytes(&fields), expected);
                 assert_eq!(from_bytes(&expected), fields);
+
+                // A snapshot from a build with the epoch boundary feature:
+                // the value is read past, and the accounts state after it is
+                // the same.
+                let epoch_boundary = Some(SerdeEpochBoundary {
+                    epoch: 2,
+                    first_slot: 130,
+                    parent_slot: 100,
+                    parent_block_id: Hash::new_unique(),
+                    parent_commitment_root: Hash::new_unique(),
+                    history_len: 5,
+                });
+                let mut with_boundary = vec![];
+                serialize_into(&mut with_boundary, &block_commitment).unwrap();
+                serialize_into(&mut with_boundary, &epoch_boundary).unwrap();
+                if accounts_state.is_some() {
+                    serialize_into(&mut with_boundary, &accounts_state).unwrap();
+                }
+                let read = from_bytes(&with_boundary);
+                assert_eq!(read.block_commitment, block_commitment);
+                assert_eq!(read.accounts_state, accounts_state);
             }
         }
     }
@@ -1543,6 +1571,7 @@ mod serde_snapshot_tests {
                 block_id,
                 commitments: CommitmentExtraFields {
                     block_commitment,
+                    epoch_boundary: None,
                     accounts_state: None,
                 },
             },
