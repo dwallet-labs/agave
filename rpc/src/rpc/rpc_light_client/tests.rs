@@ -1164,3 +1164,144 @@ fn test_finality_proof_before_block_is_in_blockstore() {
     assert_eq!(response.block_id, block_id);
     assert_eq!(rpc.finality(160).slot, 160);
 }
+
+/// A store that writes to a directory, and a second store opened on it (a
+/// restarted node): the second serves the same proofs without having seen
+/// a bank or a certificate, except account state proofs, and goes on from
+/// the next rooted block.
+#[test]
+fn test_proof_store_survives_restart() {
+    let chain = build_chain();
+    let bank = |slot| chain.bank(slot).as_ref();
+    let directory = solana_ledger::get_tmp_ledger_path!();
+    let config = LightClientProofConfig {
+        persist_dir: Some(directory.clone()),
+        ..LightClientProofConfig::default()
+    };
+    let open = || {
+        Arc::new(LightClientProofStore::new(
+            config.clone(),
+            chain.blockstore.clone(),
+        ))
+    };
+
+    let store = open();
+    let rooted: Vec<_> = chain
+        .banks
+        .range(62..)
+        .map(|(_, bank)| bank.clone())
+        .collect();
+    store.on_rooted_banks(&rooted);
+    let set1 = SignerSet::new(1, bank(65).validator_set_signers(1).unwrap()).unwrap();
+    let keys1 = keypairs_by_rank(&chain.validators, &set1);
+    let set2 = SignerSet::new(2, bank(100).validator_set_signers(2).unwrap()).unwrap();
+    let keys2 = keypairs_by_rank(&chain.validators, &set2);
+    for certificate in slow_certificates(bank(100), &keys1) {
+        store.on_certificate(&certificate);
+    }
+    store.on_certificate(&fast_certificate(bank(96), &keys1));
+    store.on_certificate(&fast_certificate(bank(160), &keys2));
+    // Certificates are written at the next root.
+    store.on_rooted_banks(&[]);
+
+    let mint = chain.mint.pubkey().to_string();
+    let transfer = chain.transfer_tx.signatures[0].to_string();
+    let program = chain.program_tx.signatures[0].to_string();
+    let queries = [
+        ("getFinalityProof", json!([100])),
+        ("getFinalityProof", json!([96])),
+        ("getFinalityProof", json!([160])),
+        // Through a descendant: needs the history leaves.
+        ("getFinalityProof", json!([65])),
+        ("getFinalityProof", json!([130])),
+        ("getBlockHistoryProof", json!([65, 160])),
+        ("getTransactionProof", json!([transfer])),
+        (
+            "getTransactionProof",
+            json!([program, {"instructions": "all", "events": "all"}]),
+        ),
+        ("getAccountDeltaProof", json!([mint, 100])),
+        (
+            "getAccountDeltaProof",
+            json!([chain.quiet.to_string(), 100]),
+        ),
+        ("getValidatorSet", json!([1])),
+        ("getValidatorSet", json!([2])),
+        ("getEpochBoundary", json!([1])),
+        ("getEpochBoundary", json!([2])),
+    ];
+    let answers = |store: &Arc<LightClientProofStore>| -> Vec<Value> {
+        let rpc = chain.rpc(store);
+        queries
+            .iter()
+            .map(|(method, params)| {
+                rpc.call::<Value>(method, params.clone())
+                    .unwrap_or_else(|err| panic!("{method} {params}: {err:?}"))
+            })
+            .collect()
+    };
+    let before = answers(&store);
+    chain
+        .rpc(&store)
+        .call::<Value>("getAccountStateProof", json!([mint, {"slot": 160}]))
+        .unwrap();
+    drop(store);
+
+    // The restarted store: the same answers.
+    let restarted = open();
+    assert_eq!(restarted.highest_root(), Some(160));
+    assert_eq!(answers(&restarted), before);
+    // The accounts state is not written.
+    let rpc = chain.rpc(&restarted);
+    let (code, data) = rpc.error("getAccountStateProof", json!([mint, {"slot": 160}]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+    assert!(
+        data["reason"].as_str().unwrap().contains("restarted"),
+        "{data}"
+    );
+
+    // It goes on from the next rooted block: the history continues, so
+    // block 160 is also final through 161, and 161 has an accounts state.
+    let bank161 = new_child(chain.bank(160), 161);
+    freeze_and_store(&chain.blockstore, &bank161);
+    chain.blockstore.set_roots([161].iter()).unwrap();
+    restarted.on_rooted_banks(std::slice::from_ref(&bank161));
+    restarted.on_certificate(&fast_certificate(&bank161, &keys2));
+    let response: RpcBlockHistoryProof =
+        rpc.call("getBlockHistoryProof", json!([65, 161])).unwrap();
+    assert_eq!(response.history.slot, 65);
+    assert_eq!(rpc.finality(161).slot, 161);
+    rpc.call::<Value>("getAccountStateProof", json!([mint, {"slot": 161}]))
+        .unwrap();
+    restarted.on_rooted_banks(&[]);
+    drop(restarted);
+
+    // A second restart, keeping two blocks: the older files are removed,
+    // and a file cut short is skipped.
+    let block_file = |slot: u64| directory.join("blocks").join(slot.to_string());
+    assert!(block_file(96).exists());
+    let whole = std::fs::read(block_file(161)).unwrap();
+    std::fs::write(block_file(161), &whole[..whole.len() / 2]).unwrap();
+    let small = Arc::new(LightClientProofStore::new(
+        LightClientProofConfig {
+            retained_blocks: 2,
+            ..config.clone()
+        },
+        chain.blockstore.clone(),
+    ));
+    assert_eq!(small.highest_root(), Some(160));
+    assert!(!block_file(96).exists());
+    assert!(block_file(130).exists());
+    let small_rpc = chain.rpc(&small);
+    assert_eq!(small_rpc.finality(160).slot, 160);
+    let (code, _) = small_rpc.error("getFinalityProof", json!([96]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
+    drop(small);
+
+    // A kept block that blockstore does not have as a root is dropped.
+    let other_ledger = solana_ledger::get_tmp_ledger_path!();
+    let other = Arc::new(Blockstore::open(&other_ledger).unwrap());
+    let empty = LightClientProofStore::new(config.clone(), other);
+    assert_eq!(empty.highest_root(), None);
+    assert!(!block_file(160).exists());
+}
