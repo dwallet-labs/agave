@@ -517,15 +517,6 @@ impl Verifier {
                         *transient.entry(code).or_default() += 1;
                         None
                     }
-                    // Seen once right after a block was rooted: the footer
-                    // proof is read from blockstore, which did not have the
-                    // complete block yet. Retried until the timeout, so a
-                    // block that never becomes available still fails.
-                    Some((code @ JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE, _)) => {
-                        info!("getFinalityProof({slot}), retrying: {err}");
-                        *transient.entry(code).or_default() += 1;
-                        None
-                    }
                     _ => panic!("getFinalityProof({slot}): {err}"),
                 },
             },
@@ -2360,4 +2351,56 @@ fn test_light_client_restart_from_snapshot() {
         verifier.through_descendant
     );
     info!("test took {:?}", started.elapsed());
+}
+
+/// A single node produces every block, and can root a block before its
+/// broadcast has written the whole block to blockstore. Asked for each
+/// block as soon as it is rooted, the node answers "block not final" until
+/// then, never another error, and then serves a proof that verifies.
+#[test]
+#[serial]
+fn test_light_client_finality_right_after_root() {
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
+    let tc = start_cluster(&[DEFAULT_NODE_STAKE]);
+    let rpc = tc.rpc(0);
+    let mut verifier = Verifier::from_genesis(tc.genesis_config());
+    let mut next = wait_for_finalized(&rpc, 4);
+    // Stays within epoch 0, which the genesis signer set verifies.
+    let end = SLOTS_PER_EPOCH - 8;
+    let (mut served, mut not_final_first) = (0u64, 0u64);
+    while next < end {
+        let finalized = finalized_slot(&rpc).min(end - 1);
+        if finalized < next {
+            continue;
+        }
+        for slot in rooted_slots(&rpc, next, finalized) {
+            let asked = Instant::now();
+            let mut first = true;
+            let response = loop {
+                match rpc.get_finality_proof(slot) {
+                    Ok(response) => break FinalityResponse::try_from(&response).unwrap(),
+                    Err(err) => match rpc_error(&err) {
+                        Some((
+                            JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL
+                            | JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_CERTIFICATES_NOT_AVAILABLE,
+                            _,
+                        )) => {
+                            not_final_first += u64::from(first);
+                            first = false;
+                            assert!(
+                                asked.elapsed() < TIMEOUT,
+                                "getFinalityProof({slot}) never served: {err}"
+                            );
+                        }
+                        _ => panic!("getFinalityProof({slot}): {err}"),
+                    },
+                }
+            };
+            verifier.verify_response(&response, slot);
+            served += 1;
+        }
+        next = finalized + 1;
+    }
+    info!("{served} blocks served, {not_final_first} after a first \"not final\" answer");
+    assert!(served > 0);
 }
