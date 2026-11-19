@@ -1233,6 +1233,7 @@ impl Validator {
                 Arc::new(LightClientProofStore::new(
                     LightClientProofConfig {
                         retained_blocks: config.rpc_config.light_client_proof_retained_blocks,
+                        persist_dir: Some(blockstore.ledger_path().join("light-client-proofs")),
                         ..LightClientProofConfig::default()
                     },
                     blockstore.clone(),
