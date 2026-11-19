@@ -762,7 +762,7 @@ impl LightClientProofStore {
         if let Some(block) = inner.blocks.get(&slot) {
             return Ok(block.clone());
         }
-        let finalized_slot = inner.highest_root.unwrap_or_default();
+        let finalized_slot = inner.highest_root;
         if inner.highest_root.is_none_or(|root| slot > root) || !self.blockstore.is_root(slot) {
             return Err(LightClientProofError::BlockNotFinal {
                 slot,
@@ -809,7 +809,7 @@ impl LightClientProofStore {
                 Ok(Some(slot_meta)) if !slot_meta.is_full() => {
                     LightClientProofError::BlockNotFinal {
                         slot: asked,
-                        finalized_slot: asked.saturating_sub(1),
+                        finalized_slot: Some(asked.saturating_sub(1)),
                     }
                 }
                 _ => {
@@ -921,7 +921,7 @@ impl LightClientProofStore {
                     Some(first_kept) if slot >= first_kept && !self.blockstore.is_root(slot) => {
                         LightClientProofError::BlockNotFinal {
                             slot,
-                            finalized_slot: inner.highest_root.unwrap_or_default(),
+                            finalized_slot: inner.highest_root,
                         }
                     }
                     _ => data_not_available(
