@@ -91,7 +91,7 @@ solana-download-utils = { path = "../download-utils", features = ["agave-unstabl
 solana-hash = { workspace = true }
 solana-instruction = { workspace = true }
 solana-ledger = { path = "../ledger", features = ["agave-unstable-api", "dev-context-only-utils"] }
-solana-light-client = { workspace = true, features = ["agave-unstable-api", "rpc"] }
+solana-light-client = { workspace = true, features = ["agave-unstable-api", "rpc", "rpc-client"] }
 solana-local-cluster = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-runtime = { path = "../runtime", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-signature = { workspace = true }
