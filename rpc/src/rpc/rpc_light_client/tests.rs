@@ -81,6 +81,8 @@ use {
     std::sync::Arc,
 };
 
+mod bench;
+
 const SLOTS_PER_EPOCH: u64 = 64;
 const SHRED_VERSION: u16 = 4242;
 const LAMPORTS_PER_SIGNATURE: u64 = 5000;
@@ -175,6 +177,16 @@ fn component_shreds(
 /// The bank's block id is the double Merkle root blockstore computes.
 fn freeze_and_store(blockstore: &Blockstore, bank: &Arc<Bank>) {
     let shreds = freeze_and_shred(bank);
+    store_shreds(blockstore, bank, shreds);
+}
+
+/// Writes the block of a frozen bank to blockstore (see
+/// [`freeze_and_store`]).
+fn store_frozen(blockstore: &Blockstore, bank: &Arc<Bank>) {
+    store_shreds(blockstore, bank, shreds_of_frozen(bank));
+}
+
+fn store_shreds(blockstore: &Blockstore, bank: &Arc<Bank>, shreds: Vec<Shred>) {
     let slot = bank.slot();
     blockstore.insert_shreds(shreds, true).unwrap();
     assert!(blockstore.is_full(slot));
@@ -190,6 +202,12 @@ fn freeze_and_store(blockstore: &Blockstore, bank: &Arc<Bank>) {
 fn freeze_and_shred(bank: &Arc<Bank>) -> Vec<Shred> {
     goto_end_of_slot(bank.clone());
     bank.freeze();
+    shreds_of_frozen(bank)
+}
+
+/// The data shreds of the block of a frozen bank.
+fn shreds_of_frozen(bank: &Arc<Bank>) -> Vec<Shred> {
+    assert!(bank.is_frozen());
     let slot = bank.slot();
     let parent = bank.parent().unwrap();
     let parent_slot = parent.slot();
