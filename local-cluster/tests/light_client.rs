@@ -64,9 +64,9 @@ use {
         custom_error::{
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BASE_TREE_NOT_READY,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL,
-            JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_CERTIFICATES_NOT_AVAILABLE,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
+            JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_FEATURE_INACTIVE,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_NOT_FOUND,
         },
         light_client::{
@@ -153,6 +153,16 @@ fn start_cluster(stakes: &[u64]) -> TestCluster {
 }
 
 fn start_cluster_with(stakes: &[u64], validator_configs: Vec<ValidatorConfig>) -> TestCluster {
+    start_cluster_with_accounts(stakes, validator_configs, vec![])
+}
+
+/// As [`start_cluster_with`], with more genesis accounts. They replace the
+/// accounts genesis would otherwise have at the same addresses.
+fn start_cluster_with_accounts(
+    stakes: &[u64],
+    validator_configs: Vec<ValidatorConfig>,
+    genesis_accounts: Vec<(Pubkey, AccountSharedData)>,
+) -> TestCluster {
     let num_nodes = stakes.len();
     let node_keys: Vec<_> = (0..num_nodes)
         .map(|i| ValidatorKeys {
@@ -181,6 +191,7 @@ fn start_cluster_with(stakes: &[u64], validator_configs: Vec<ValidatorConfig>) -
         )
         .into_iter()
         .map(|(address, account)| (address, AccountSharedData::from(account)))
+        .chain(genesis_accounts)
         .collect(),
         ..ClusterConfig::default()
     };
@@ -474,10 +485,15 @@ fn finality_kind(response: &FinalityResponse) -> &'static str {
 
 impl Verifier {
     fn from_genesis(genesis_config: &GenesisConfig) -> Self {
+        Self::from_signer_set(genesis_config, genesis_signer_set(genesis_config))
+    }
+
+    /// A client that trusts `signer_set` (of any epoch) to start from.
+    fn from_signer_set(genesis_config: &GenesisConfig, signer_set: SignerSet) -> Self {
         let client = LightClient::new(
             genesis_config.epoch_schedule.clone(),
             solana_shred_version::compute_shred_version(&genesis_config.hash(), None),
-            genesis_signer_set(genesis_config),
+            signer_set,
         );
         Self {
             client,
@@ -2382,4 +2398,243 @@ fn test_light_client_finality_right_after_root() {
     }
     info!("{served} blocks served, {not_final_first} after a first \"not final\" answer");
     assert!(served > 0);
+}
+
+/// The six feature gates of the commitments.
+fn commitment_features() -> [Pubkey; 6] {
+    [
+        agave_feature_set::block_commitment_root::id(),
+        agave_feature_set::transaction_receipt_tree::id(),
+        agave_feature_set::accounts_delta_root::id(),
+        agave_feature_set::epoch_validator_set_root::id(),
+        agave_feature_set::epoch_boundary_commitment::id(),
+        agave_feature_set::accounts_state_root::id(),
+    ]
+}
+
+fn feature_activated_at(rpc: &RpcClient, feature: &Pubkey) -> Option<Slot> {
+    let account = rpc.get_account(feature).unwrap();
+    solana_feature_gate_interface::from_account(&account)
+        .unwrap()
+        .activated_at
+}
+
+/// The six features are not active in genesis: their feature accounts are
+/// pending, as after the activation transaction on a live cluster, and the
+/// running node activates them at the first epoch boundary. Before it no
+/// proof is served; from the first block of epoch 1 a client that trusts
+/// the signer set of epoch 1 verifies blocks, transactions, account deltas
+/// and states, follows the validator set into epoch 2 and checks the epoch
+/// boundary.
+#[test]
+#[serial]
+fn test_light_client_features_activated_on_running_cluster() {
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
+    let started = Instant::now();
+    let pending = commitment_features()
+        .into_iter()
+        .map(|feature| {
+            (
+                feature,
+                solana_feature_gate_interface::create_account(
+                    &solana_feature_gate_interface::Feature { activated_at: None },
+                    Rent::default()
+                        .minimum_balance(solana_feature_gate_interface::Feature::size_of()),
+                ),
+            )
+        })
+        .collect();
+    let tc = start_cluster_with_accounts(
+        &[DEFAULT_NODE_STAKE],
+        make_identical_validator_configs(&light_client_validator_config(), 1),
+        pending,
+    );
+    let rpc = tc.rpc(0);
+    let schedule = tc.epoch_schedule().clone();
+    let first_slot_1 = schedule.get_first_slot_in_epoch(1);
+    let first_slot_2 = schedule.get_first_slot_in_epoch(2);
+    let mint = tc.cluster.funding_keypair.insecure_clone();
+    let recipient = Keypair::new().pubkey();
+    info!("cluster started in {:?}", started.elapsed());
+
+    // Epoch 0: the features are pending, and no proof is served.
+    let finalized = wait_for_finalized(&rpc, 8);
+    assert!(finalized < first_slot_1);
+    for feature in commitment_features() {
+        assert_eq!(feature_activated_at(&rpc, &feature), None);
+    }
+    let in_epoch_0 = *rooted_slots(&rpc, 4, finalized).last().unwrap();
+    let message = expect_proof_error(
+        rpc.get_finality_proof(in_epoch_0),
+        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_FEATURE_INACTIVE,
+    );
+    info!("finality proof of slot {in_epoch_0}, before activation: {message}");
+    let blockhash = rpc.get_latest_blockhash().unwrap();
+    let t0 = tc.send(
+        &rpc,
+        &system_transaction::transfer(&mint, &recipient, 1_000_000, blockhash),
+    );
+    assert!(t0.slot < first_slot_1);
+    let err = rpc
+        .get_transaction_proof(&t0.signature, RpcTransactionProofConfig::default())
+        .unwrap_err();
+    info!("transaction proof before activation: {err}");
+
+    // The epoch boundary activates them, on the running node.
+    wait_for_finalized(&rpc, first_slot_1 + 4);
+    for feature in commitment_features() {
+        assert_eq!(feature_activated_at(&rpc, &feature), Some(first_slot_1));
+    }
+    let rooted = rooted_slots(&rpc, 0, first_slot_1 + 4);
+    let last_of_epoch_0 = *rooted
+        .iter()
+        .filter(|slot| **slot < first_slot_1)
+        .last()
+        .unwrap();
+    let first_of_epoch_1 = *rooted.iter().find(|slot| **slot >= first_slot_1).unwrap();
+    expect_proof_error(
+        rpc.get_finality_proof(last_of_epoch_0),
+        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_FEATURE_INACTIVE,
+    );
+
+    // A client starts at the activation epoch: it trusts the signer set of
+    // epoch 1, here computed from genesis. No block of epoch 0 commits to
+    // it, and the node says so.
+    let signers = Bank::new_for_tests(tc.genesis_config())
+        .validator_set_signers(1)
+        .expect("genesis has the stakes of epoch 1");
+    let set_1 = SignerSet::new(1, signers).unwrap();
+    let response = ValidatorSetResponse::try_from(
+        &rpc.get_validator_set(1, RpcCommittingBlockConfig::default())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response.signer_set.epoch(), 1);
+    assert_eq!(
+        response.signer_set.validator_set_root(),
+        set_1.validator_set_root()
+    );
+    assert!(response.committed_by.is_none());
+    let mut verifier = Verifier::from_signer_set(tc.genesis_config(), set_1);
+
+    // The first block of epoch 1 is the first with a commitment root.
+    let block_f = verifier.verify_block(&rpc, first_of_epoch_1);
+    info!("first block with the features: slot {first_of_epoch_1}");
+
+    // A transfer in epoch 1: receipt and account delta.
+    let blockhash = rpc.get_latest_blockhash().unwrap();
+    let t1 = tc.send(
+        &rpc,
+        &system_transaction::transfer(&mint, &recipient, 1_000_000, blockhash),
+    );
+    assert_eq!(schedule.get_epoch(t1.slot), 1);
+    let (block_t1, _, _) = verify_transaction(&mut verifier, &rpc, &t1);
+    let (_, account) = finalized_account(&rpc, &recipient);
+    let recipient_hash = hash_of(&recipient, &account.unwrap());
+    verify_delta(&rpc, &block_t1, &recipient, Some(&recipient_hash));
+
+    // The history starts at activation: the first block is an ancestor of
+    // the transfer's block. The block before it is the anchor leaf: proven
+    // as an ancestor, without a commitment root.
+    let response = BlockHistoryResponse::try_from(&when_final(
+        format!("getBlockHistoryProof({first_of_epoch_1}, {})", t1.slot),
+        || rpc.get_block_history_proof(first_of_epoch_1, t1.slot),
+    ))
+    .unwrap();
+    let ancestor = verifier
+        .client
+        .verify_ancestor(&block_t1, &response.history)
+        .unwrap();
+    assert_eq!(ancestor.commitment_root(), block_f.commitment_root());
+    let response = BlockHistoryResponse::try_from(
+        &rpc.get_block_history_proof(last_of_epoch_0, t1.slot)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        verifier
+            .client
+            .verify_ancestor(&block_t1, &response.history)
+            .is_err()
+    );
+    let anchor = response.history.verify_anchor(&block_t1).unwrap();
+    assert_eq!(anchor.slot, last_of_epoch_0);
+    info!(
+        "the anchor (slot {last_of_epoch_0}) is proven from slot {}",
+        t1.slot
+    );
+    // The epoch boundary of the activation epoch: the anchor is the last
+    // block before it.
+    let response = EpochBoundaryResponse::try_from(
+        &rpc.get_epoch_boundary(1, RpcCommittingBlockConfig::default())
+            .unwrap(),
+    )
+    .unwrap();
+    let block = verifier.verify_block(&rpc, response.slot);
+    let boundary = response.proof.verify(&block, &schedule).unwrap();
+    assert_eq!(boundary.boundary.parent_slot, last_of_epoch_0);
+    assert_eq!(boundary.boundary.first_slot, first_of_epoch_1);
+
+    // The account state. In the first half of the activation epoch the
+    // generation of the epoch before would be used, which does not exist:
+    // slot 5 is zero. From the switch slot on, generation 1.
+    let message = expect_proof_error(
+        rpc.get_account_state_proof(
+            &recipient,
+            RpcAccountStateProofConfig {
+                slot: Some(t1.slot),
+            },
+        ),
+        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
+    );
+    info!("account state at slot {}: {message}", t1.slot);
+    let switch_slot = first_slot_1 + SLOTS_PER_EPOCH / 2;
+    assert!(t1.slot < switch_slot);
+    wait_for_finalized(&rpc, switch_slot + 2);
+    let after_switch = *rooted_slots(&rpc, switch_slot, switch_slot + 8)
+        .first()
+        .unwrap();
+    let block = verifier.verify_block(&rpc, after_switch);
+    let generation = verify_state(&rpc, &schedule, &block, &recipient, Some(&recipient_hash));
+    assert_eq!(generation, 1);
+
+    // Epoch 2: the validator set handoff from a block of epoch 1, the epoch
+    // boundary and the account state.
+    wait_for_finalized(&rpc, first_slot_2 + 4);
+    let committing = verifier.advance_epoch(&rpc);
+    assert_eq!(schedule.get_epoch(committing.slot()), 1);
+    assert_eq!(verifier.client.epoch(), 2);
+    let rooted = rooted_slots(&rpc, first_slot_1, first_slot_2 + 4);
+    let last_of_epoch_1 = *rooted
+        .iter()
+        .filter(|slot| **slot < first_slot_2)
+        .last()
+        .unwrap();
+    let first_of_epoch_2 = *rooted.iter().find(|slot| **slot >= first_slot_2).unwrap();
+    let block_e2 = verifier.verify_block(&rpc, first_of_epoch_2);
+    let response = EpochBoundaryResponse::try_from(&when_final("getEpochBoundary(2)", || {
+        rpc.get_epoch_boundary(
+            2,
+            RpcCommittingBlockConfig {
+                at_slot: Some(first_of_epoch_2),
+            },
+        )
+    }))
+    .unwrap();
+    let boundary = response.proof.verify(&block_e2, &schedule).unwrap();
+    assert_eq!(boundary.boundary.parent_slot, last_of_epoch_1);
+    assert_eq!(boundary.boundary.first_slot, first_of_epoch_2);
+    let generation = verify_state(
+        &rpc,
+        &schedule,
+        &block_e2,
+        &recipient,
+        Some(&recipient_hash),
+    );
+    assert_eq!(generation, 1);
+    info!(
+        "finality kinds: {:?}; test took {:?}",
+        verifier.kinds,
+        started.elapsed()
+    );
 }
