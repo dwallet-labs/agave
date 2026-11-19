@@ -1001,6 +1001,36 @@ fn test_light_client_proof_errors() {
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
     assert_eq!(data["slot"], json!(1));
 
+    // A store that has taken no rooted block yet (a node that just
+    // started): there is no latest finalized slot to report.
+    let empty = Arc::new(LightClientProofStore::new(
+        LightClientProofConfig::default(),
+        chain.blockstore.clone(),
+    ));
+    let empty_rpc = chain.rpc(&empty);
+    let (code, data) = empty_rpc.error("getFinalityProof", json!([100]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL);
+    assert_eq!(
+        data,
+        json!({"kind": "blockNotFinal", "slot": 100, "finalizedSlot": null})
+    );
+    assert_eq!(
+        LightClientProofError::BlockNotFinal {
+            slot: 100,
+            finalized_slot: None
+        }
+        .to_string(),
+        "block 100 is not final on this node (no block finalized since it started)"
+    );
+    assert_eq!(
+        LightClientProofError::BlockNotFinal {
+            slot: 161,
+            finalized_slot: Some(160)
+        }
+        .to_string(),
+        "block 161 is not final on this node (latest finalized slot 160)"
+    );
+
     // A root from before the store's first block.
     let (code, data) = rpc.error("getFinalityProof", json!([1]));
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);

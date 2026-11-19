@@ -103,6 +103,13 @@ pub enum RpcCustomError {
     LightClientProof(LightClientProofError),
 }
 
+fn latest_finalized(finalized_slot: &Option<Slot>) -> String {
+    match finalized_slot {
+        Some(slot) => format!("latest finalized slot {slot}"),
+        None => "no block finalized since it started".to_string(),
+    }
+}
+
 /// Why a light-client proof cannot be served. Each kind has its own error
 /// code; the error's `data` is this value as JSON (`{"kind": .., ..}`).
 #[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
@@ -117,10 +124,18 @@ pub enum LightClientProofError {
     #[serde(rename_all = "camelCase")]
     FeatureInactive { slot: Slot, feature: String },
     /// The block is not finalized on this node yet, or is not on the
-    /// finalized chain.
-    #[error("block {slot} is not final on this node (latest finalized slot {finalized_slot})")]
+    /// finalized chain. `finalized_slot` is the latest slot the node serves
+    /// proofs for as final; `None` (`null`) if it has finalized no block
+    /// since it started.
+    #[error(
+        "block {slot} is not final on this node ({})",
+        latest_finalized(.finalized_slot)
+    )]
     #[serde(rename_all = "camelCase")]
-    BlockNotFinal { slot: Slot, finalized_slot: Slot },
+    BlockNotFinal {
+        slot: Slot,
+        finalized_slot: Option<Slot>,
+    },
     /// The block is final but this node does not keep its proof data (it is
     /// older than the retention window, or older than the node's start).
     #[error(
