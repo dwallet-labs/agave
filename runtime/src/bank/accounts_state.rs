@@ -863,8 +863,8 @@ impl Bank {
     /// no account. Verify with [`AccountProof::verify_current_state`] or
     /// [`AccountProof::verify_nonexistence`].
     ///
-    /// Waits for the base tree if the proof needs it. Building a base proof
-    /// rehashes every base leaf (`O(n)`).
+    /// Waits for the base tree if the proof needs it. A base proof is built
+    /// from the inner nodes the base tree keeps (a few thousand hashes).
     pub fn accounts_state_proof(
         &self,
         address: &Pubkey,
