@@ -473,6 +473,23 @@ impl AccountsState {
         &self.generations
     }
 
+    /// A copy of this state whose base trees and roots are not computed
+    /// yet, as while the background job of a new generation is running.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn with_pending_bases_for_tests(&self) -> Self {
+        Self {
+            generations: self
+                .generations
+                .iter()
+                .map(|generation| Generation {
+                    epoch: generation.epoch,
+                    overlay: generation.overlay.clone(),
+                    base: Arc::new(BaseCell::new(generation.base.id, None, false)),
+                })
+                .collect(),
+        }
+    }
+
     pub fn generation(&self, epoch: Epoch) -> Option<&Generation> {
         self.generations.iter().find(|g| g.epoch == epoch)
     }
