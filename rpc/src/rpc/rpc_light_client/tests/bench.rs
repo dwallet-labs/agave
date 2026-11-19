@@ -42,6 +42,9 @@ struct Scenario {
     extra_accounts: usize,
     transfers: usize,
     mode: Mode,
+    /// With a mode other than `Off`: the features that are active, or all
+    /// six.
+    only: Option<Vec<Pubkey>>,
 }
 
 #[derive(Default)]
@@ -83,6 +86,7 @@ fn run(scenario: &Scenario) -> Measured {
         extra_accounts,
         transfers,
         mode,
+        ref only,
     } = *scenario;
     let mut measured = Measured::default();
 
@@ -96,7 +100,8 @@ fn run(scenario: &Scenario) -> Measured {
     genesis_config.epoch_schedule = EpochSchedule::custom(SLOTS_PER_EPOCH, SLOTS_PER_EPOCH, false);
     genesis_config.fee_rate_governor = FeeRateGovernor::new(LAMPORTS_PER_SIGNATURE, 0);
     for feature_id in all_features() {
-        if mode == Mode::Off {
+        let active = only.as_ref().is_none_or(|only| only.contains(&feature_id));
+        if mode == Mode::Off || !active {
             genesis_config.accounts.remove(&feature_id);
         } else {
             solana_runtime::genesis_utils::activate_feature(&mut genesis_config, feature_id);
@@ -433,6 +438,7 @@ fn bench_light_client_block_cost() {
                         extra_accounts: 0,
                         transfers,
                         mode,
+                        only: None,
                     })
                 })
                 .collect();
@@ -457,6 +463,7 @@ fn bench_light_client_proofs_by_block_size() {
             extra_accounts: 0,
             transfers,
             mode: Mode::Retain,
+            only: None,
         });
         print_proofs(
             &format!(
@@ -480,6 +487,7 @@ fn bench_light_client_accounts() {
             extra_accounts,
             transfers: 100,
             mode: Mode::Retain,
+            only: None,
         });
         print_proofs(
             &format!(
@@ -502,7 +510,72 @@ fn bench_light_client_validators() {
             extra_accounts: 0,
             transfers: 100,
             mode: Mode::Retain,
+            only: None,
         });
         print_proofs(&format!("{validators} validators"), &measured);
+    }
+}
+
+/// The cost of a block of 5,000 transfers with each feature added to the
+/// base feature alone, to split the total between the proposals.
+#[test]
+#[ignore = "measurement; run in release mode"]
+fn bench_light_client_cost_by_feature() {
+    use feature_set::{
+        accounts_delta_root, accounts_state_root, block_commitment_root, epoch_boundary_commitment,
+        epoch_validator_set_root, transaction_receipt_tree,
+    };
+    let base = block_commitment_root::id();
+    let cases: [(&str, Mode, Vec<Pubkey>); 8] = [
+        ("none", Mode::Off, vec![]),
+        ("1 block commitment root", Mode::On, vec![base]),
+        (
+            "1 + 2 receipts",
+            Mode::On,
+            vec![base, transaction_receipt_tree::id()],
+        ),
+        (
+            "1 + 3 accounts delta",
+            Mode::On,
+            vec![base, accounts_delta_root::id()],
+        ),
+        (
+            "1 + 4 validator set",
+            Mode::On,
+            vec![base, epoch_validator_set_root::id()],
+        ),
+        (
+            "1 + 5 epoch boundary",
+            Mode::On,
+            vec![base, epoch_boundary_commitment::id()],
+        ),
+        (
+            "1 + 3 + 6 accounts state",
+            Mode::On,
+            vec![base, accounts_delta_root::id(), accounts_state_root::id()],
+        ),
+        ("all six", Mode::On, all_features().to_vec()),
+    ];
+    println!("\n| features | execute ms | end of slot + freeze ms | same, empty block ms |");
+    println!("|---|---|---|---|");
+    for (name, mode, only) in cases {
+        let runs: Vec<Measured> = (0..7)
+            .map(|_| {
+                run(&Scenario {
+                    validators: 3,
+                    extra_accounts: 0,
+                    transfers: 5_000,
+                    mode,
+                    only: Some(only.clone()),
+                })
+            })
+            .collect();
+        let pick = |f: fn(&Measured) -> Duration| median(runs.iter().map(f).collect());
+        println!(
+            "| {name} | {} | {} | {} |",
+            ms(pick(|m| m.execute)),
+            ms(pick(|m| m.freeze)),
+            ms(pick(|m| m.empty_freeze)),
+        );
     }
 }
