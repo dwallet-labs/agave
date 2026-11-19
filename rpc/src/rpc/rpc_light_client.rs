@@ -148,12 +148,12 @@ impl LightClient for LightClientImpl {
                 // a transaction this node processed in a block it has not
                 // finalized yet is not final, rather than not found.
                 LightClientProofError::NotFound { .. } => {
-                    let finalized_slot = store.highest_root().unwrap_or_default();
+                    let finalized_slot = store.highest_root();
                     match meta
                         .bank(Some(CommitmentConfig::processed()))
                         .get_signature_status_slot(&signature)
                     {
-                        Some((slot, _)) if slot > finalized_slot => {
+                        Some((slot, _)) if finalized_slot.is_none_or(|root| slot > root) => {
                             LightClientProofError::BlockNotFinal {
                                 slot,
                                 finalized_slot,
