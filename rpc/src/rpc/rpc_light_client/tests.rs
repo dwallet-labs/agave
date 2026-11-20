@@ -1075,6 +1075,63 @@ fn test_light_client_proof_errors() {
         json!([chain.program_tx.signatures[0].to_string()]),
     );
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_NOT_FOUND);
+    // With transaction history in blockstore, the node names the block of
+    // a transaction it no longer keeps receipts for.
+    chain
+        .blockstore
+        .write_transaction_status(
+            65,
+            chain.program_tx.signatures[0],
+            std::iter::empty(),
+            solana_transaction_status::TransactionStatusMeta::default(),
+            1,
+        )
+        .unwrap();
+    let (code, data) = small_rpc.error(
+        "getTransactionProof",
+        json!([chain.program_tx.signatures[0].to_string()]),
+    );
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
+    assert_eq!(
+        data,
+        json!({
+            "kind": "blockNotRetained",
+            "slot": 65,
+            "firstRetained": 130,
+            "lastRetained": 160,
+        })
+    );
+    // Blockstore places a transaction in a kept block whose receipts do
+    // not have it: the block is named, and no proof is served.
+    let stray = solana_signature::Signature::from([7u8; 64]);
+    chain
+        .blockstore
+        .write_transaction_status(
+            160,
+            stray,
+            std::iter::empty(),
+            solana_transaction_status::TransactionStatusMeta::default(),
+            7,
+        )
+        .unwrap();
+    let (code, data) = small_rpc.error("getTransactionProof", json!([stray.to_string()]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+    assert_eq!(data["slot"], json!(160));
+    // A transaction blockstore has only in a block that is not a root is
+    // not found.
+    let unrooted = solana_signature::Signature::from([9u8; 64]);
+    chain
+        .blockstore
+        .write_transaction_status(
+            161,
+            unrooted,
+            std::iter::empty(),
+            solana_transaction_status::TransactionStatusMeta::default(),
+            0,
+        )
+        .unwrap();
+    let (code, _) = small_rpc.error("getTransactionProof", json!([unrooted.to_string()]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_NOT_FOUND);
     // Its history still reaches back to 65: the leaves are kept longer.
     let response: RpcBlockHistoryProof = small_rpc
         .call("getBlockHistoryProof", json!([65, 160]))
