@@ -3,26 +3,34 @@
 //!
 //! One file per rooted block (`blocks/<slot>`), per slot with certificates
 //! (`certificates/<slot>`) and per signer set (`signer-sets/<epoch>`). A
-//! file is written to a temporary name and renamed, so a file is whole or
-//! absent after a crash of the process; nothing is synced to disk, so a
-//! power loss can lose the latest files. A file that does not parse is
-//! skipped with a warning.
+//! file is written to a temporary name, synced and renamed, so a file is
+//! whole or absent after a crash or a power loss. The directories are
+//! synced once per root ([`Persistence::sync_directories`]), so a power
+//! loss can lose the files of the latest root, never leave half of one. A
+//! file that does not parse is skipped with a warning.
 //!
-//! Not written: the accounts state of a block (a tree over all accounts,
-//! shared between blocks in memory), so account state proofs are served for
-//! blocks rooted since the node started only.
+//! The history leaves are kept in segment files (`history/<index>`, named
+//! by the index of their first leaf): the frontier of the leaves before the
+//! segment, then one 72-byte record per leaf, appended and synced at every
+//! root. A new segment starts every [`HISTORY_SEGMENT_LEN`] leaves, and a
+//! segment is removed when every leaf in it is older than the kept history.
+//!
+//! The accounts state of a block (trees shared between blocks in memory)
+//! is not written. A block file has instead what stepping back from the
+//! state after the block to the state before it needs, see
+//! [`super::StateRecord`].
 
 use {
-    super::{ActiveFeatures, RetainedBlock, SlotCertificates},
+    super::{ActiveFeatures, GenerationRecord, RetainedBlock, SlotCertificates, StateRecord},
     log::warn,
     solana_bls_signatures::Signature as BlsSignature,
     solana_clock::{Epoch, Slot},
     solana_hash::Hash,
     solana_light_client::{
-        Certificate, CertificateKind,
+        Certificate, CertificateKind, HISTORY_LEAF_LEN, history_leaf,
         solana_merkle_tree::{
             accounts_delta::{AccountsDelta, DeltaEntry},
-            commitment_tree::AppendOnlyFrontier,
+            commitment_tree::{AppendOnlyFrontier, TreeId, hash_leaf},
             epoch_boundary::EpochBoundary,
             receipt_tree::{
                 EventKind, EventRecord, InstructionRecord, ReceiptStatus, TransactionReceipt,
@@ -31,13 +39,16 @@ use {
         },
     },
     solana_runtime::bank::{
-        block_commitment::CommitmentVector, transaction_receipts::RetainedReceipt,
+        accounts_state::BaseId, block_commitment::CommitmentVector,
+        transaction_receipts::RetainedReceipt,
     },
     solana_svm::transaction_execution_result::ReceiptLeaves,
     std::{
-        fs, io,
+        collections::BTreeSet,
+        fs,
+        io::{self, Write},
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex},
     },
 };
 
@@ -49,6 +60,36 @@ const END: &[u8; 4] = b"end.";
 const BLOCKS: &str = "blocks";
 const CERTIFICATES: &str = "certificates";
 const SIGNER_SETS: &str = "signer-sets";
+const HISTORY: &str = "history";
+
+/// Number of history leaves per segment file.
+pub(super) const HISTORY_SEGMENT_LEN: u64 = 4096;
+
+/// A history leaf as kept: `(slot, block_id, commitment_root)`.
+pub(super) type HistoryEntry = (Slot, Hash, Hash);
+
+/// What the history segment files hold, kept by the one thread that writes
+/// them.
+#[derive(Default)]
+pub(super) struct HistoryFiles {
+    /// [`super::HistoryLog::restarts`] of the log the files follow.
+    pub restarts: u64,
+    /// The leaves before this index are in the files (or before them).
+    pub next: u64,
+    /// Frontier of the leaves `[0, next)`.
+    frontier: AppendOnlyFrontier,
+    /// First leaf index of every segment file, ascending.
+    segments: Vec<u64>,
+    /// Number of leaves in the last segment.
+    last_len: u64,
+}
+
+fn history_leaf_hash((slot, block_id, commitment_root): &HistoryEntry) -> Hash {
+    hash_leaf(
+        TreeId::BLOCK_HISTORY,
+        &history_leaf(*slot, block_id, commitment_root),
+    )
+}
 
 /// A rooted block as written: what the store keeps of it, and what
 /// ingesting it again needs.
@@ -61,13 +102,15 @@ pub(super) struct BlockRecord {
 
 pub(super) struct Persistence {
     dir: PathBuf,
+    /// Directories with new or removed files since they were last synced.
+    unsynced: Mutex<BTreeSet<&'static str>>,
 }
 
 impl Persistence {
     /// Opens (creating it if needed) the directory. `None`, with a warning,
     /// if it cannot be used: the store then keeps nothing on disk.
     pub fn open(dir: &Path) -> Option<Self> {
-        for sub in [BLOCKS, CERTIFICATES, SIGNER_SETS] {
+        for sub in [BLOCKS, CERTIFICATES, SIGNER_SETS, HISTORY] {
             if let Err(err) = fs::create_dir_all(dir.join(sub)) {
                 warn!(
                     "light-client proofs: cannot use {}: {err}; proof data will not survive a \
@@ -79,33 +122,56 @@ impl Persistence {
         }
         Some(Self {
             dir: dir.to_path_buf(),
+            unsynced: Mutex::default(),
         })
+    }
+
+    /// Makes the files written and removed since the last call durable: a
+    /// new file is on disk once its directory is.
+    pub fn sync_directories(&self) {
+        let unsynced = std::mem::take(&mut *self.unsynced.lock().unwrap());
+        for sub in unsynced {
+            let path = self.dir.join(sub);
+            if let Err(err) = fs::File::open(&path).and_then(|directory| directory.sync_all()) {
+                warn!("light-client proofs: cannot sync {}: {err}", path.display());
+            }
+        }
+    }
+
+    fn changed(&self, sub: &'static str) {
+        self.unsynced.lock().unwrap().insert(sub);
     }
 
     fn path(&self, sub: &str, number: u64) -> PathBuf {
         self.dir.join(sub).join(number.to_string())
     }
 
-    fn write(&self, sub: &str, number: u64, payload: Vec<u8>) {
+    fn write(&self, sub: &'static str, number: u64, payload: Vec<u8>) {
         let path = self.path(sub, number);
         let temporary = path.with_extension("tmp");
         let mut bytes = Vec::with_capacity(MAGIC.len() + payload.len() + END.len());
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&payload);
         bytes.extend_from_slice(END);
-        if let Err(err) = fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, &path))
-        {
-            warn!(
+        let written = fs::File::create(&temporary)
+            .and_then(|mut file| {
+                file.write_all(&bytes)?;
+                file.sync_all()
+            })
+            .and_then(|()| fs::rename(&temporary, &path));
+        match written {
+            Ok(()) => self.changed(sub),
+            Err(err) => warn!(
                 "light-client proofs: cannot write {}: {err}",
                 path.display()
-            );
+            ),
         }
     }
 
-    fn remove(&self, sub: &str, number: u64) {
+    fn remove(&self, sub: &'static str, number: u64) {
         let path = self.path(sub, number);
         match fs::remove_file(&path) {
-            Ok(()) => {}
+            Ok(()) => self.changed(sub),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => warn!(
                 "light-client proofs: cannot remove {}: {err}",
@@ -127,7 +193,7 @@ impl Persistence {
     }
 
     /// The payload of a file, if it is whole.
-    fn read(&self, sub: &str, number: u64) -> Option<Vec<u8>> {
+    fn read(&self, sub: &'static str, number: u64) -> Option<Vec<u8>> {
         let path = self.path(sub, number);
         let bytes = fs::read(&path)
             .map_err(|err| warn!("light-client proofs: cannot read {}: {err}", path.display()))
@@ -145,7 +211,11 @@ impl Persistence {
     }
 
     /// Every file of `sub` that parses, ascending by number.
-    fn load<T>(&self, sub: &str, decode: impl Fn(&mut Reader) -> Option<T>) -> Vec<(u64, T)> {
+    fn load<T>(
+        &self,
+        sub: &'static str,
+        decode: impl Fn(&mut Reader) -> Option<T>,
+    ) -> Vec<(u64, T)> {
         self.numbers(sub)
             .into_iter()
             .filter_map(|number| {
@@ -226,6 +296,189 @@ impl Persistence {
                 })
             })
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// History segments.
+
+impl Persistence {
+    /// Reads the history segments: the frontier before the first kept leaf
+    /// and the leaves, with the state to go on writing from. Segments are
+    /// taken while each starts where the one before ended, with the frontier
+    /// the leaves before it give; the rest is removed. A record cut short at
+    /// the end of the last segment is cut off.
+    pub fn load_history(
+        &self,
+    ) -> (
+        HistoryFiles,
+        Option<(AppendOnlyFrontier, Vec<HistoryEntry>)>,
+    ) {
+        let mut files = HistoryFiles::default();
+        let mut base = None;
+        let mut entries = Vec::new();
+        let numbers = self.numbers(HISTORY);
+        let mut rejected = None;
+        for (position, first) in numbers.iter().copied().enumerate() {
+            let path = self.path(HISTORY, first);
+            let segment = fs::read(&path).ok().and_then(|bytes| {
+                let mut reader = Reader(bytes.strip_prefix(MAGIC.as_slice())?);
+                let frontier = decode_frontier(&mut reader)?;
+                let fits = frontier.leaf_count() == first
+                    && (base.is_none() || (first == files.next && frontier == files.frontier));
+                let header_len = bytes.len().checked_sub(reader.0.len())?;
+                fits.then(|| (frontier, reader.0.to_vec(), header_len))
+            });
+            let Some((frontier, records, header_len)) = segment else {
+                rejected = Some(position);
+                break;
+            };
+            if base.is_none() {
+                files.frontier = frontier.clone();
+                files.next = first;
+                base = Some(frontier);
+            }
+            let whole = records.len() / HISTORY_LEAF_LEN;
+            for record in records.as_chunks::<HISTORY_LEAF_LEN>().0 {
+                let mut reader = Reader(record);
+                let (Some(slot), Some(block_id), Some(commitment_root)) =
+                    (reader.u64(), reader.hash(), reader.hash())
+                else {
+                    break;
+                };
+                let entry = (slot, block_id, commitment_root);
+                if files
+                    .frontier
+                    .append_leaf_hash(history_leaf_hash(&entry))
+                    .is_err()
+                {
+                    break;
+                }
+                files.next = files.next.saturating_add(1);
+                entries.push(entry);
+            }
+            if records.len() % HISTORY_LEAF_LEN != 0 {
+                let len = header_len.saturating_add(whole.saturating_mul(HISTORY_LEAF_LEN));
+                let cut = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| {
+                        file.set_len(len as u64)?;
+                        file.sync_all()
+                    });
+                if let Err(err) = cut {
+                    warn!("light-client proofs: cannot cut {}: {err}", path.display());
+                }
+            }
+            files.segments.push(first);
+            files.last_len = whole as u64;
+        }
+        if let Some(position) = rejected {
+            for first in &numbers[position..] {
+                warn!(
+                    "light-client proofs: {} does not continue the kept history, removing it",
+                    self.path(HISTORY, *first).display()
+                );
+                self.remove(HISTORY, *first);
+            }
+        }
+        let loaded = base.map(|base| (base, entries));
+        (files, loaded)
+    }
+
+    /// Brings the segment files up to date. With `restart`, the files are
+    /// replaced: the kept history then starts after the leaves of that
+    /// frontier, and `entries` are all its leaves. Otherwise `entries` are
+    /// the leaves from `files.next` on. Segments entirely before leaf
+    /// `base_len` are removed.
+    pub fn write_history(
+        &self,
+        files: &mut HistoryFiles,
+        restart: Option<(u64, AppendOnlyFrontier)>,
+        entries: &[HistoryEntry],
+        base_len: u64,
+    ) {
+        if let Some((restarts, base)) = restart {
+            for first in self.numbers(HISTORY) {
+                self.remove(HISTORY, first);
+            }
+            *files = HistoryFiles {
+                restarts,
+                next: base.leaf_count(),
+                frontier: base,
+                segments: Vec::new(),
+                last_len: 0,
+            };
+        }
+        let mut entries = entries;
+        while !entries.is_empty() {
+            let segment = match files.segments.last() {
+                Some(first) if files.last_len < HISTORY_SEGMENT_LEN => *first,
+                _ => {
+                    let mut writer = Writer::default();
+                    writer.bytes(MAGIC);
+                    encode_frontier(&mut writer, &files.frontier);
+                    let path = self.path(HISTORY, files.next);
+                    let created = fs::File::create(&path).and_then(|mut file| {
+                        file.write_all(&writer.0)?;
+                        file.sync_all()
+                    });
+                    if let Err(err) = created {
+                        warn!(
+                            "light-client proofs: cannot write {}: {err}",
+                            path.display()
+                        );
+                        return;
+                    }
+                    self.changed(HISTORY);
+                    files.segments.push(files.next);
+                    files.last_len = 0;
+                    files.next
+                }
+            };
+            let room = HISTORY_SEGMENT_LEN.saturating_sub(files.last_len);
+            let count = entries
+                .len()
+                .min(usize::try_from(room).unwrap_or(usize::MAX));
+            let (now, later) = entries.split_at(count);
+            let mut writer = Writer::default();
+            for (slot, block_id, commitment_root) in now {
+                writer.u64(*slot);
+                writer.hash(block_id);
+                writer.hash(commitment_root);
+            }
+            let path = self.path(HISTORY, segment);
+            let appended = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| {
+                    file.write_all(&writer.0)?;
+                    file.sync_data()
+                });
+            if let Err(err) = appended {
+                warn!(
+                    "light-client proofs: cannot write {}: {err}",
+                    path.display()
+                );
+                return;
+            }
+            for entry in now {
+                if files
+                    .frontier
+                    .append_leaf_hash(history_leaf_hash(entry))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            files.next = files.next.saturating_add(count as u64);
+            files.last_len = files.last_len.saturating_add(count as u64);
+            entries = later;
+        }
+        // A segment ends where the next one starts.
+        while files.segments.len() > 1 && files.segments[1] <= base_len {
+            self.remove(HISTORY, files.segments.remove(0));
+        }
     }
 }
 
@@ -439,6 +692,7 @@ fn encode_block(writer: &mut Writer, record: &BlockRecord) {
         // Not written, see the module documentation.
         accounts_state: _,
         accounts_state_not_kept: _,
+        state_record,
         epoch_boundary,
     } = block;
     writer.u64(*slot);
@@ -515,6 +769,30 @@ fn encode_block(writer: &mut Writer, record: &BlockRecord) {
         writer.hash(parent_commitment_root);
         writer.u64(*history_len);
     });
+    // Last, so that a file written before this was added still parses.
+    writer.option(state_record.as_deref(), |writer, record| {
+        let StateRecord {
+            parent_slot,
+            generation_in_use,
+            generations,
+        } = record;
+        writer.u64(*parent_slot);
+        writer.option(*generation_in_use, Writer::u64);
+        writer.len(generations.len());
+        for GenerationRecord { base, previous } in generations {
+            writer.u64(base.epoch);
+            writer.option(base.parent, |writer, (slot, bank_hash)| {
+                writer.u64(slot);
+                writer.hash(&bank_hash);
+            });
+            writer.option(previous.as_ref(), |writer, previous| {
+                writer.len(previous.len());
+                for hash in previous {
+                    writer.option(hash.as_ref(), Writer::hash);
+                }
+            });
+        }
+    });
 }
 
 fn decode_block(reader: &mut Reader) -> Option<BlockRecord> {
@@ -570,6 +848,27 @@ fn decode_block(reader: &mut Reader) -> Option<BlockRecord> {
             history_len: reader.u64()?,
         })
     })?;
+    let state_record = if reader.0.is_empty() {
+        None
+    } else {
+        reader.option(|reader| {
+            Some(Arc::new(StateRecord {
+                parent_slot: reader.u64()?,
+                generation_in_use: reader.option(Reader::u64)?,
+                generations: reader.vec(|reader| {
+                    Some(GenerationRecord {
+                        base: BaseId {
+                            epoch: reader.u64()?,
+                            parent: reader
+                                .option(|reader| Some((reader.u64()?, reader.hash()?)))?,
+                        },
+                        previous: reader
+                            .option(|reader| reader.vec(|reader| reader.option(Reader::hash)))?,
+                    })
+                })?,
+            }))
+        })?
+    };
     Some(BlockRecord {
         block: RetainedBlock {
             slot,
@@ -582,6 +881,7 @@ fn decode_block(reader: &mut Reader) -> Option<BlockRecord> {
             accounts_delta,
             accounts_state: None,
             accounts_state_not_kept: true,
+            state_record,
             epoch_boundary,
         },
         history,

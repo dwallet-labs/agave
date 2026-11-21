@@ -1382,6 +1382,140 @@ fn test_proof_store_survives_restart() {
     assert!(!block_file(160).exists());
 }
 
+/// After a restart the store rebuilds the accounts state of the blocks it
+/// kept, from the first bank it is given and each block's record of what it
+/// changed, and has the history leaves from before its oldest kept block.
+#[test]
+fn test_accounts_state_and_history_after_restart() {
+    let chain = build_chain();
+    let directory = solana_ledger::get_tmp_ledger_path!();
+    let config = LightClientProofConfig {
+        retained_blocks: 4,
+        persist_dir: Some(directory.clone()),
+        ..LightClientProofConfig::default()
+    };
+    let open = || {
+        Arc::new(LightClientProofStore::new(
+            config.clone(),
+            chain.blockstore.clone(),
+        ))
+    };
+    let store = open();
+    let rooted: Vec<_> = chain
+        .banks
+        .range(62..)
+        .map(|(_, bank)| bank.clone())
+        .collect();
+    store.on_rooted_banks(&rooted);
+
+    // Three more blocks of the generation of block 160. Between them they
+    // change an account that has an overlay entry, add one that did not
+    // exist, and change one that was last changed before the base.
+    let late = Pubkey::new_unique();
+    let mut parent = chain.bank(160).clone();
+    let mut banks = vec![];
+    for (slot, to) in [(161, chain.fresh), (162, late), (163, chain.quiet)] {
+        let bank = new_child(&parent, slot);
+        transfer(&bank, &chain.mint, &to, 5_000_000);
+        freeze_and_store(&chain.blockstore, &bank);
+        chain.blockstore.set_roots([slot].iter()).unwrap();
+        // As root handling does: the previous root comes with the new one.
+        store.on_rooted_banks(&[parent.clone(), bank.clone()]);
+        banks.push(bank.clone());
+        parent = bank;
+    }
+    let bank163 = parent;
+
+    let absent = Pubkey::new_unique();
+    let addresses = [chain.mint.pubkey(), chain.fresh, late, chain.quiet, absent];
+    let state_queries: Vec<_> = [161, 162, 163]
+        .into_iter()
+        .flat_map(|slot| {
+            addresses
+                .iter()
+                .map(move |address| json!([address.to_string(), {"slot": slot}]))
+        })
+        .collect();
+    let states = |store: &Arc<LightClientProofStore>| -> Vec<Value> {
+        let rpc = chain.rpc(store);
+        state_queries
+            .iter()
+            .map(|params| {
+                rpc.call::<Value>("getAccountStateProof", params.clone())
+                    .unwrap_or_else(|err| panic!("{params}: {err:?}"))
+            })
+            .collect()
+    };
+    let history = |store: &Arc<LightClientProofStore>, slot: u64| {
+        chain
+            .rpc(store)
+            .call::<Value>("getBlockHistoryProof", json!([slot, 163]))
+    };
+    let states_before = states(&store);
+    // Block 65 is no longer kept; its history leaf is.
+    let (code, _) = chain.rpc(&store).error("getFinalityProof", json!([65]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
+    let history_before = [history(&store, 65).unwrap(), history(&store, 162).unwrap()];
+    drop(store);
+
+    // Restarted: the history is as deep as before. No accounts state yet.
+    let restarted = open();
+    assert_eq!(restarted.highest_root(), Some(163));
+    assert_eq!(
+        [
+            history(&restarted, 65).unwrap(),
+            history(&restarted, 162).unwrap()
+        ],
+        history_before
+    );
+    let rpc = chain.rpc(&restarted);
+    let (code, _) = rpc.error("getAccountStateProof", state_queries[0].clone());
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+
+    // The first root after the restart brings the bank of block 163. Its
+    // state is taken, and those of 162 and 161 are rebuilt from it.
+    let bank164 = new_child(&bank163, 164);
+    freeze_and_store(&chain.blockstore, &bank164);
+    chain.blockstore.set_roots([164].iter()).unwrap();
+    restarted.on_rooted_banks(&[bank163.clone(), bank164.clone()]);
+    assert_eq!(states(&restarted), states_before);
+    // Block 160 is in an ended part of its generation's life no more than
+    // the others, but it left the kept blocks with the new root.
+    let (code, _) = chain.rpc(&restarted).error(
+        "getAccountStateProof",
+        json!([absent.to_string(), {"slot": 160}]),
+    );
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
+    drop(restarted);
+
+    // Restarted again, with only the bank of the latest block: every
+    // earlier state is rebuilt from records written by the store above.
+    let again = open();
+    assert_eq!(again.highest_root(), Some(164));
+    again.on_rooted_banks(std::slice::from_ref(&bank164));
+    assert_eq!(states(&again), states_before);
+    drop(again);
+
+    // A history segment that was changed on disk is not used: the history
+    // then starts again at the oldest kept block.
+    let segments: Vec<_> = std::fs::read_dir(directory.join("history"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(segments.len(), 1);
+    let mut bytes = std::fs::read(&segments[0]).unwrap();
+    let last = bytes.len() - 100;
+    bytes[last] ^= 1;
+    std::fs::write(&segments[0], bytes).unwrap();
+    let damaged = open();
+    assert_eq!(damaged.highest_root(), Some(164));
+    let rpc = chain.rpc(&damaged);
+    let (code, _) = rpc.error("getBlockHistoryProof", json!([65, 164]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+    rpc.call::<Value>("getBlockHistoryProof", json!([163, 164]))
+        .unwrap();
+}
+
 /// While the base tree of a new generation is being computed in the
 /// background, `getAccountStateProof` answers "base tree not ready" instead
 /// of waiting, and serves the proof once it is.
