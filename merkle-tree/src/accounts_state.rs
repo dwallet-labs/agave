@@ -168,21 +168,70 @@ pub enum BaseTreeError {
     NotSortedOrDuplicate { index: usize },
     /// An address without lamports has no base leaf.
     NoAccount { address: Address },
+    /// The stored bytes are not a whole number of leaves.
+    Length { bytes: usize },
+}
+
+/// Where the leaves of a base tree are held: one `base_leaf` after the
+/// other, [`BASE_LEAF_LEN`] bytes each, in address order. A `Vec<u8>` holds
+/// them in memory; a node with many accounts maps a file instead.
+pub trait BaseLeafStorage: Send + Sync {
+    fn bytes(&self) -> &[u8];
+}
+
+impl BaseLeafStorage for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+/// Computes `one(0), .., one(count - 1)` in order, stopping at the first
+/// error. The caller chooses how: one after the other
+/// ([`sequential_chunks`]), or on a thread pool.
+pub type ChunkMap<'a> = dyn Fn(
+        usize,
+        &(dyn Fn(usize) -> Result<Hash, BaseTreeError> + Sync),
+    ) -> Result<Vec<Hash>, BaseTreeError>
+    + 'a;
+
+/// A [`ChunkMap`] that computes one chunk after the other.
+pub fn sequential_chunks(
+    count: usize,
+    one: &(dyn Fn(usize) -> Result<Hash, BaseTreeError> + Sync),
+) -> Result<Vec<Hash>, BaseTreeError> {
+    (0..count).map(one).collect()
 }
 
 /// The base tree of one generation: the accounts with lamports of the base
 /// state, sorted by address, and their root.
 ///
-/// All leaves are held in memory (64 bytes per account), with the hashes
-/// of some inner nodes ([`ChunkLevels`]: about 32 bytes per
-/// [`CHUNK_LEN`] accounts), so that a proof hashes a few thousand nodes
-/// whatever the size of the tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The leaves are in a [`BaseLeafStorage`] (64 bytes per account). The tree
+/// itself keeps only the hashes of some inner nodes in memory
+/// ([`ChunkLevels`]: about 32 bytes per [`CHUNK_LEN`] accounts), so that a
+/// proof hashes a few thousand nodes whatever the size of the tree.
 pub struct BaseTree {
-    leaves: Vec<BaseLeaf>,
+    storage: Box<dyn BaseLeafStorage>,
+    len: usize,
     chunks: ChunkLevels,
     root: Hash,
 }
+
+impl std::fmt::Debug for BaseTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseTree")
+            .field("len", &self.len)
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BaseTree {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root && self.storage.bytes() == other.storage.bytes()
+    }
+}
+
+impl Eq for BaseTree {}
 
 /// Number of leaves, or of nodes of a level, under one stored node.
 pub const CHUNK_LEN: usize = 1 << CHUNK_BITS;
@@ -205,24 +254,18 @@ const CHUNK_BITS: u32 = 10;
 struct ChunkLevels(Vec<Vec<Hash>>);
 
 impl ChunkLevels {
-    /// The levels over the `leaf_count` leaves whose hashes
-    /// `leaf_hashes(range)` gives.
-    fn new(leaf_count: usize, leaf_hashes: impl Fn(std::ops::Range<usize>) -> Vec<Hash>) -> Self {
-        if leaf_count == 0 {
+    /// The levels above level 0, the nodes over each chunk of leaves (empty
+    /// for a tree without leaves).
+    fn new(level0: Vec<Hash>) -> Self {
+        if level0.is_empty() {
             return Self::default();
         }
-        let chunk_hashes = |count: usize, hashes: &dyn Fn(std::ops::Range<usize>) -> Vec<Hash>| {
-            (0..count)
-                .step_by(CHUNK_LEN)
-                .map(|start| {
-                    let end = start.saturating_add(CHUNK_LEN).min(count);
-                    tree_hash_from_leaf_hashes(&hashes(start..end))
-                })
-                .collect::<Vec<Hash>>()
-        };
-        let mut levels = vec![chunk_hashes(leaf_count, &leaf_hashes)];
+        let mut levels = vec![level0];
         while let Some(last) = levels.last().filter(|last| last.len() > CHUNK_LEN) {
-            let next = chunk_hashes(last.len(), &|range| last[range].to_vec());
+            let next = last
+                .chunks(CHUNK_LEN)
+                .map(tree_hash_from_leaf_hashes)
+                .collect();
             levels.push(next);
         }
         Self(levels)
@@ -234,8 +277,8 @@ impl ChunkLevels {
     }
 
     /// The siblings of leaf `index`, from the leaf towards the tree hash.
-    /// `index` must be less than `leaf_count`, and `leaf_hashes` as for
-    /// [`Self::new`].
+    /// `index` must be less than `leaf_count`, and `leaf_hashes(range)` the
+    /// hashes of the leaves in `range`.
     fn siblings(
         &self,
         leaf_count: usize,
@@ -274,33 +317,79 @@ impl ChunkLevels {
     }
 }
 
+/// The bytes of the leaves in `range`.
+fn leaf_bytes(bytes: &[u8], range: std::ops::Range<usize>) -> &[[u8; BASE_LEAF_LEN]] {
+    let leaves = bytes.as_chunks::<BASE_LEAF_LEN>().0;
+    &leaves[range]
+}
+
+fn leaf_from_bytes(bytes: &[u8; BASE_LEAF_LEN]) -> BaseLeaf {
+    let (address, account_hash) = bytes.split_at(ADDRESS_LEN);
+    BaseLeaf {
+        address: address.try_into().expect("an address"),
+        account_hash: Hash::new_from_array(account_hash.try_into().expect("a hash")),
+    }
+}
+
 impl BaseTree {
     /// The base tree of an empty state.
     pub fn empty() -> Self {
         Self::new(Vec::new()).expect("no leaves")
     }
 
-    /// Checks that `leaves` are sorted by address, unique and have accounts,
-    /// and computes the root.
+    /// The base tree of `leaves`, held in memory. Checks them as
+    /// [`Self::from_storage`] does.
     pub fn new(leaves: Vec<BaseLeaf>) -> Result<Self, BaseTreeError> {
-        if let Some(index) = leaves
-            .windows(2)
-            .position(|pair| pair[0].address >= pair[1].address)
-        {
-            return Err(BaseTreeError::NotSortedOrDuplicate { index: index + 1 });
+        let mut bytes = Vec::with_capacity(leaves.len().saturating_mul(BASE_LEAF_LEN));
+        for leaf in &leaves {
+            bytes.extend_from_slice(&leaf.bytes());
         }
-        if let Some(leaf) = leaves
-            .iter()
-            .find(|leaf| leaf.account_hash == NO_ACCOUNT_HASH)
-        {
-            return Err(BaseTreeError::NoAccount {
-                address: leaf.address,
-            });
+        Self::from_storage(Box::new(bytes), &sequential_chunks)
+    }
+
+    /// The base tree of the leaves in `storage`. Checks that they are sorted
+    /// by address, unique and have accounts, and computes the root: every
+    /// leaf is read and hashed once, one chunk of [`CHUNK_LEN`] leaves at a
+    /// time, as `map` schedules them.
+    pub fn from_storage(
+        storage: Box<dyn BaseLeafStorage>,
+        map: &ChunkMap,
+    ) -> Result<Self, BaseTreeError> {
+        let bytes = storage.bytes();
+        if !bytes.len().is_multiple_of(BASE_LEAF_LEN) {
+            return Err(BaseTreeError::Length { bytes: bytes.len() });
         }
-        let chunks = ChunkLevels::new(leaves.len(), |range| leaf_hashes(&leaves[range]));
-        let root = hash_root(TreeId::BASE_STATE, leaves.len() as u64, &chunks.tree_hash());
+        let len = bytes.len() / BASE_LEAF_LEN;
+        let chunk = |chunk: usize| {
+            let start = chunk.saturating_mul(CHUNK_LEN);
+            let end = start.saturating_add(CHUNK_LEN).min(len);
+            // The leaf before the chunk, to check the order across chunks.
+            let mut previous = start
+                .checked_sub(1)
+                .map(|before| &leaf_bytes(bytes, before..start)[0][..ADDRESS_LEN]);
+            let mut hashes = Vec::with_capacity(end.saturating_sub(start));
+            for (offset, leaf) in leaf_bytes(bytes, start..end).iter().enumerate() {
+                let (address, account_hash) = leaf.split_at(ADDRESS_LEN);
+                if previous.is_some_and(|previous| previous >= address) {
+                    return Err(BaseTreeError::NotSortedOrDuplicate {
+                        index: start.saturating_add(offset),
+                    });
+                }
+                if account_hash == NO_ACCOUNT_HASH.as_ref() {
+                    return Err(BaseTreeError::NoAccount {
+                        address: address.try_into().expect("an address"),
+                    });
+                }
+                hashes.push(hash_leaf(TreeId::BASE_STATE, leaf));
+                previous = Some(address);
+            }
+            Ok(tree_hash_from_leaf_hashes(&hashes))
+        };
+        let chunks = ChunkLevels::new(map(len.div_ceil(CHUNK_LEN), &chunk)?);
+        let root = hash_root(TreeId::BASE_STATE, len as u64, &chunks.tree_hash());
         Ok(Self {
-            leaves,
+            storage,
+            len,
             chunks,
             root,
         })
@@ -311,40 +400,60 @@ impl BaseTree {
         self.root
     }
 
-    pub fn leaves(&self) -> &[BaseLeaf] {
-        &self.leaves
+    /// Leaf `index`, which must be less than [`Self::len`].
+    pub fn leaf(&self, index: usize) -> BaseLeaf {
+        leaf_from_bytes(&leaf_bytes(self.storage.bytes(), index..index.saturating_add(1))[0])
+    }
+
+    /// The leaves in address order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = BaseLeaf> + '_ {
+        leaf_bytes(self.storage.bytes(), 0..self.len)
+            .iter()
+            .map(leaf_from_bytes)
+    }
+
+    /// A copy of all leaves: for small trees.
+    pub fn to_vec(&self) -> Vec<BaseLeaf> {
+        self.iter().collect()
     }
 
     pub fn len(&self) -> usize {
-        self.leaves.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+        self.len == 0
     }
 
     fn search(&self, address: &Address) -> Result<usize, usize> {
-        self.leaves
-            .binary_search_by(|leaf| leaf.address.cmp(address))
+        leaf_bytes(self.storage.bytes(), 0..self.len)
+            .binary_search_by(|leaf| leaf[..ADDRESS_LEN].cmp(address.as_slice()))
     }
 
     /// `account_hash` of `address` in the base state, if it had an account.
     pub fn get(&self, address: &Address) -> Option<Hash> {
         self.search(address)
             .ok()
-            .map(|index| self.leaves[index].account_hash)
+            .map(|index| self.leaf(index).account_hash)
+    }
+
+    fn leaf_hashes(&self, range: std::ops::Range<usize>) -> Vec<Hash> {
+        leaf_bytes(self.storage.bytes(), range)
+            .iter()
+            .map(|leaf| hash_leaf(TreeId::BASE_STATE, leaf))
+            .collect()
     }
 
     /// Proof of leaf `index` (in range), from the stored inner nodes.
     fn leaf_proof(&self, index: usize) -> BaseLeafProof {
         BaseLeafProof {
-            leaf: self.leaves[index],
+            leaf: self.leaf(index),
             proof: InclusionProof {
                 leaf_index: index as u64,
-                leaf_count: self.leaves.len() as u64,
-                siblings: self.chunks.siblings(self.leaves.len(), index, |range| {
-                    leaf_hashes(&self.leaves[range])
-                }),
+                leaf_count: self.len as u64,
+                siblings: self
+                    .chunks
+                    .siblings(self.len, index, |range| self.leaf_hashes(range)),
             },
         }
     }
@@ -361,14 +470,14 @@ impl BaseTree {
     /// it had one.
     pub fn absence_proof(&self, address: &Address) -> Option<BaseAbsenceProof> {
         let index = self.search(address).err()?;
-        if self.leaves.is_empty() {
+        if self.len == 0 {
             return Some(BaseAbsenceProof::EmptyTree);
         }
         Some(if index == 0 {
             BaseAbsenceProof::BeforeFirst {
                 first: self.leaf_proof(0),
             }
-        } else if index == self.leaves.len() {
+        } else if index == self.len {
             BaseAbsenceProof::AfterLast {
                 last: self.leaf_proof(index - 1),
             }
@@ -379,10 +488,6 @@ impl BaseTree {
             }
         })
     }
-}
-
-fn leaf_hashes(leaves: &[BaseLeaf]) -> Vec<Hash> {
-    leaves.iter().map(BaseLeaf::leaf_hash).collect()
 }
 
 /// Why base leaves could not be derived from an overlay.
@@ -404,77 +509,173 @@ pub enum OverlayMismatch {
     },
 }
 
-/// **By merge**: the leaves of the next base tree, from the leaves of the
-/// previous base tree `base` and the frozen overlay of its generation as of
-/// the last block before the next epoch. Entries with a zero first half are
-/// removed, the others replace or insert a leaf.
+/// Why deriving base leaves stopped: the overlay does not match, or the
+/// receiver of the leaves failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeriveError<E> {
+    Mismatch(OverlayMismatch),
+    Sink(E),
+}
+
+/// **By merge**: the leaves of the next base tree, in address order, from
+/// the previous base tree `base` and the frozen overlay of its generation as
+/// of the last block before the next epoch. Entries with a zero first half
+/// are removed, the others replace or insert a leaf. Each leaf is given to
+/// `sink` as it is derived; no more than one is held.
 ///
 /// Checks that every entry's base half is its hash in `base` (zero if absent),
 /// which holds for an overlay of `base`'s generation.
-pub fn apply_overlay(
+pub fn apply_overlay_into<E>(
     base: &BaseTree,
     overlay: &OverlayTree,
-) -> Result<Vec<BaseLeaf>, OverlayMismatch> {
-    let mut leaves = Vec::with_capacity(base.len().saturating_add(overlay.len() as usize));
-    let mut base_leaves = base.leaves().iter().peekable();
+    mut sink: impl FnMut(BaseLeaf) -> Result<(), E>,
+) -> Result<(), DeriveError<E>> {
+    let mut base_leaves = base.iter().peekable();
     for (address, value) in overlay.iter() {
         let (now, base_half) = split_overlay_value(value);
         while let Some(leaf) = base_leaves.next_if(|leaf| leaf.address < *address) {
-            leaves.push(*leaf);
+            sink(leaf).map_err(DeriveError::Sink)?;
         }
         let in_base = base_leaves
             .next_if(|leaf| leaf.address == *address)
             .map_or(NO_ACCOUNT_HASH, |leaf| leaf.account_hash);
         if in_base != base_half {
-            return Err(OverlayMismatch::Base {
+            return Err(DeriveError::Mismatch(OverlayMismatch::Base {
                 address: *address,
                 expected: in_base,
                 found: base_half,
-            });
+            }));
         }
         if now != NO_ACCOUNT_HASH {
-            leaves.push(BaseLeaf::new(*address, now));
+            sink(BaseLeaf::new(*address, now)).map_err(DeriveError::Sink)?;
         }
     }
-    leaves.extend(base_leaves);
-    Ok(leaves)
+    for leaf in base_leaves {
+        sink(leaf).map_err(DeriveError::Sink)?;
+    }
+    Ok(())
 }
 
-/// **By scan**: the leaves of the base tree of a generation, from the
-/// complete account state `current` (sorted by address, accounts with
-/// lamports only) of a block `X` of that generation, and the overlay of the
-/// generation as of `X`. An address without an overlay entry has its current
-/// state in the base; an address with one has its base hash in the entry.
+/// [`apply_overlay_into`] a vector: for small trees.
+pub fn apply_overlay(
+    base: &BaseTree,
+    overlay: &OverlayTree,
+) -> Result<Vec<BaseLeaf>, OverlayMismatch> {
+    let mut leaves = Vec::new();
+    let pushed = apply_overlay_into(base, overlay, |leaf| {
+        leaves.push(leaf);
+        Ok::<(), std::convert::Infallible>(())
+    });
+    match pushed {
+        Ok(()) => Ok(leaves),
+        Err(DeriveError::Mismatch(mismatch)) => Err(mismatch),
+        Err(DeriveError::Sink(never)) => match never {},
+    }
+}
+
+/// **By scan**: the leaves of the base tree of a generation, in address
+/// order, from the complete account state of a block `X` of that generation
+/// and the overlay of the generation as of `X`. An address without an
+/// overlay entry has its current state in the base; an address with one has
+/// its base hash in the entry.
 ///
-/// Checks that every entry's first half is its hash in `current` (zero if
-/// absent), which holds for an overlay as of the scanned block.
+/// The state is given leaf by leaf in address order (accounts with lamports
+/// only) to [`Self::push`], then [`Self::finish`]; each derived leaf goes to
+/// the sink at once. Checks that every entry's first half is its hash in the
+/// state (zero if absent), which holds for an overlay as of the scanned
+/// block.
+pub struct OverlaySubstitution<'a> {
+    entries: std::iter::Peekable<crate::keyed_tree::Iter<'a, OverlayValue>>,
+}
+
+impl<'a> OverlaySubstitution<'a> {
+    pub fn new(overlay: &'a OverlayTree) -> Self {
+        Self {
+            entries: overlay.iter().peekable(),
+        }
+    }
+
+    /// Handles the next overlay entry, whose address has `in_current` in the
+    /// scanned state.
+    fn entry<E>(
+        &mut self,
+        in_current: Hash,
+        sink: &mut impl FnMut(BaseLeaf) -> Result<(), E>,
+    ) -> Result<(), DeriveError<E>> {
+        let Some((address, value)) = self.entries.next() else {
+            return Ok(());
+        };
+        let (now, base_half) = split_overlay_value(value);
+        if in_current != now {
+            return Err(DeriveError::Mismatch(OverlayMismatch::Now {
+                address: *address,
+                expected: in_current,
+                found: now,
+            }));
+        }
+        if base_half != NO_ACCOUNT_HASH {
+            sink(BaseLeaf::new(*address, base_half)).map_err(DeriveError::Sink)?;
+        }
+        Ok(())
+    }
+
+    /// The next leaf of the scanned state.
+    pub fn push<E>(
+        &mut self,
+        leaf: BaseLeaf,
+        mut sink: impl FnMut(BaseLeaf) -> Result<(), E>,
+    ) -> Result<(), DeriveError<E>> {
+        // Entries before the leaf have no account in the scanned state.
+        while self
+            .entries
+            .peek()
+            .is_some_and(|(address, _)| **address < leaf.address)
+        {
+            self.entry(NO_ACCOUNT_HASH, &mut sink)?;
+        }
+        if self
+            .entries
+            .peek()
+            .is_some_and(|(address, _)| **address == leaf.address)
+        {
+            self.entry(leaf.account_hash, &mut sink)
+        } else {
+            sink(leaf).map_err(DeriveError::Sink)
+        }
+    }
+
+    /// After the last leaf of the scanned state.
+    pub fn finish<E>(
+        mut self,
+        mut sink: impl FnMut(BaseLeaf) -> Result<(), E>,
+    ) -> Result<(), DeriveError<E>> {
+        while self.entries.peek().is_some() {
+            self.entry(NO_ACCOUNT_HASH, &mut sink)?;
+        }
+        Ok(())
+    }
+}
+
+/// [`OverlaySubstitution`] over a slice, into a vector: for small trees.
 pub fn substitute_overlay(
     current: &[BaseLeaf],
     overlay: &OverlayTree,
 ) -> Result<Vec<BaseLeaf>, OverlayMismatch> {
     let mut leaves = Vec::with_capacity(current.len());
-    let mut current = current.iter().peekable();
-    for (address, value) in overlay.iter() {
-        let (now, base_half) = split_overlay_value(value);
-        while let Some(leaf) = current.next_if(|leaf| leaf.address < *address) {
-            leaves.push(*leaf);
-        }
-        let in_current = current
-            .next_if(|leaf| leaf.address == *address)
-            .map_or(NO_ACCOUNT_HASH, |leaf| leaf.account_hash);
-        if in_current != now {
-            return Err(OverlayMismatch::Now {
-                address: *address,
-                expected: in_current,
-                found: now,
-            });
-        }
-        if base_half != NO_ACCOUNT_HASH {
-            leaves.push(BaseLeaf::new(*address, base_half));
-        }
+    let mut sink = |leaf| {
+        leaves.push(leaf);
+        Ok::<(), std::convert::Infallible>(())
+    };
+    let mut substitution = OverlaySubstitution::new(overlay);
+    let pushed = current
+        .iter()
+        .try_for_each(|leaf| substitution.push(*leaf, &mut sink))
+        .and_then(|()| substitution.finish(&mut sink));
+    match pushed {
+        Ok(()) => Ok(leaves),
+        Err(DeriveError::Mismatch(mismatch)) => Err(mismatch),
+        Err(DeriveError::Sink(never)) => match never {},
     }
-    leaves.extend(current);
-    Ok(leaves)
 }
 
 /// A base leaf and its inclusion proof.
@@ -754,6 +955,10 @@ mod tests {
         [byte; 32]
     }
 
+    fn leaf_hashes(leaves: &[BaseLeaf]) -> Vec<Hash> {
+        leaves.iter().map(BaseLeaf::leaf_hash).collect()
+    }
+
     fn base_of(entries: &[(u8, u8)]) -> BaseTree {
         BaseTree::new(
             entries
@@ -767,7 +972,7 @@ mod tests {
     #[test]
     fn test_base_tree_root_matches_commitment_tree() {
         let tree = base_of(&[(1, 10), (3, 30), (5, 50)]);
-        let leaves: Vec<_> = tree.leaves().iter().map(BaseLeaf::bytes).collect();
+        let leaves: Vec<_> = tree.iter().map(|leaf| leaf.bytes()).collect();
         assert_eq!(tree.root(), compute_root(TreeId::BASE_STATE, &leaves));
         assert_eq!(
             BaseTree::empty().root(),
@@ -868,11 +1073,57 @@ mod tests {
         );
     }
 
+    /// A tree over stored bytes: chunks computed in any order give the same
+    /// tree, and the order of leaves is checked across chunks.
+    #[test]
+    fn test_base_tree_from_storage() {
+        let leaves: Vec<BaseLeaf> = (0..3 * CHUNK_LEN as u64 + 9)
+            .map(|i| {
+                let mut address = [0u8; ADDRESS_LEN];
+                address[..8].copy_from_slice(&i.to_be_bytes());
+                BaseLeaf::new(address, hash(&i.to_le_bytes()))
+            })
+            .collect();
+        let bytes: Vec<u8> = leaves.iter().flat_map(BaseLeaf::bytes).collect();
+        let expected = BaseTree::new(leaves.clone()).unwrap();
+        // Last chunk first, as a thread pool may.
+        let backwards: &ChunkMap = &|count, one| {
+            let mut hashes = (0..count).rev().map(one).collect::<Result<Vec<_>, _>>()?;
+            hashes.reverse();
+            Ok(hashes)
+        };
+        let tree = BaseTree::from_storage(Box::new(bytes.clone()), backwards).unwrap();
+        assert_eq!(tree, expected);
+        assert_eq!(tree.len(), leaves.len());
+        assert_eq!(tree.to_vec(), leaves);
+        assert_eq!(tree.leaf(CHUNK_LEN), leaves[CHUNK_LEN]);
+        assert_eq!(
+            tree.get(&leaves[2 * CHUNK_LEN].address),
+            Some(leaves[2 * CHUNK_LEN].account_hash)
+        );
+
+        // The first leaf of a chunk is not after the last of the one before.
+        let mut swapped = bytes.clone();
+        let (before, after) = swapped.split_at_mut(CHUNK_LEN * BASE_LEAF_LEN);
+        before[(CHUNK_LEN - 1) * BASE_LEAF_LEN..].swap_with_slice(&mut after[..BASE_LEAF_LEN]);
+        assert_eq!(
+            BaseTree::from_storage(Box::new(swapped), &sequential_chunks).unwrap_err(),
+            BaseTreeError::NotSortedOrDuplicate { index: CHUNK_LEN }
+        );
+        // Not a whole number of leaves.
+        let mut short = bytes;
+        short.pop();
+        assert_eq!(
+            BaseTree::from_storage(Box::new(short.clone()), &sequential_chunks).unwrap_err(),
+            BaseTreeError::Length { bytes: short.len() }
+        );
+    }
+
     #[test]
     fn test_base_proofs() {
         let tree = base_of(&[(2, 20), (4, 40), (6, 60), (8, 80), (10, 100)]);
         let root = tree.root();
-        for leaf in tree.leaves() {
+        for leaf in &tree.to_vec() {
             let proof = tree.inclusion_proof(&leaf.address).unwrap();
             assert!(proof.verify(&root));
             assert!(tree.absence_proof(&leaf.address).is_none());
@@ -975,12 +1226,12 @@ mod tests {
         );
         let next = apply_overlay(&base, &overlay).unwrap();
         let expected = base_of(&[(0, 1), (1, 10), (3, 31), (7, 70), (9, 91)]);
-        assert_eq!(next, expected.leaves());
+        assert_eq!(next, expected.to_vec());
 
         // By scan of the state after these changes, the previous base comes
         // back.
-        let rebuilt = substitute_overlay(expected.leaves(), &overlay).unwrap();
-        assert_eq!(rebuilt, base.leaves());
+        let rebuilt = substitute_overlay(&expected.to_vec(), &overlay).unwrap();
+        assert_eq!(rebuilt, base.to_vec());
 
         // A base half that does not match the base is detected.
         let mut bad = overlay.clone();
@@ -995,7 +1246,7 @@ mod tests {
         );
         // A first half that does not match the scanned state is detected.
         assert_eq!(
-            substitute_overlay(base.leaves(), &overlay),
+            substitute_overlay(&base.to_vec(), &overlay),
             Err(OverlayMismatch::Now {
                 address: addr(0),
                 expected: NO_ACCOUNT_HASH,
