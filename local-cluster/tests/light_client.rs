@@ -2252,28 +2252,69 @@ fn test_light_client_restart_from_snapshot() {
         Some(&recipient_hash),
     );
     verifier.verify_block(&rpc_restarted, snapshot.slot());
-    // Not the accounts state, which is not written to disk.
-    let message = expect_proof_error(
-        rpc_restarted.get_account_state_proof(
-            &recipient,
-            RpcAccountStateProofConfig {
-                slot: Some(t0.slot),
-            },
-        ),
-        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
-    );
-    assert!(message.contains("restarted"), "{message}");
-    info!(
-        "account state of slot {} after the restart: {message}",
-        t0.slot
-    );
+    // Its accounts state is rebuilt from a bank rooted after the restart if
+    // its generation is still held then; if not, the node says so.
+    match rpc_restarted.get_account_state_proof(
+        &recipient,
+        RpcAccountStateProofConfig {
+            slot: Some(t0.slot),
+        },
+    ) {
+        Ok(response) => {
+            AccountStateResponse::try_from(&response)
+                .unwrap()
+                .proof
+                .verify(&block_t0_again, &recipient, &recipient_hash)
+                .unwrap();
+            info!(
+                "account state of slot {} after the restart: rebuilt",
+                t0.slot
+            );
+        }
+        Err(err) => {
+            let message = expect_proof_error::<()>(
+                Err(err),
+                JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
+            );
+            assert!(message.contains("restarted"), "{message}");
+            info!(
+                "account state of slot {} after the restart: {message}",
+                t0.slot
+            );
+        }
+    }
 
     // Every block from the snapshot to the first new one: kept from before
     // the restart, or rooted by the node since.
     let slots = rooted_slots(&rpc_restarted, snapshot.slot() + 1, first_new);
+    // Those in the generation of the first new block also have their
+    // accounts state: taken from a bank, or rebuilt by undoing the changes
+    // of the blocks after them.
+    let generation_of = |slot: Slot| {
+        let epoch = schedule.get_epoch(slot);
+        let switch_slot =
+            schedule.get_first_slot_in_epoch(epoch) + schedule.get_slots_in_epoch(epoch) / 2;
+        if slot < switch_slot {
+            epoch.checked_sub(1)
+        } else {
+            Some(epoch)
+        }
+    };
+    let mut states_served = 0;
     for slot in &slots {
-        verifier.verify_block(&rpc_restarted, *slot);
+        let block = verifier.verify_block(&rpc_restarted, *slot);
+        if generation_of(*slot).is_some() && generation_of(*slot) == generation_of(first_new) {
+            verify_state(
+                &rpc_restarted,
+                &schedule,
+                &block,
+                &tc.program,
+                Some(&program_hash),
+            );
+            states_served += 1;
+        }
     }
+    info!("after the restart: the accounts state of {states_served} of those blocks is served");
     info!(
         "after the restart: {} blocks from {:?} to {:?} served (the cluster had finalized \
          {finalized_before} before the restart)",
