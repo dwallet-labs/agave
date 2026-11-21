@@ -1320,6 +1320,9 @@ impl Bank {
             .partitioned_epoch_rewards_config
             .stake_account_stores_per_block;
         let bank_id = rc.bank_id_generator.next();
+        let accounts_state_bases = Arc::new(accounts_state::AccountsStateBases::for_accounts(
+            &rc.accounts,
+        ));
         let mut bank = Self {
             rc,
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
@@ -1399,7 +1402,7 @@ impl Bank {
             epoch_boundary: RwLock::new(None),
             epoch_boundary_unknown: false,
             accounts_state: RwLock::new(None),
-            accounts_state_bases: Arc::default(),
+            accounts_state_bases,
             commitment_vector: RwLock::new(None),
             commitment_failure: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
@@ -2356,7 +2359,9 @@ impl Bank {
             .accounts_db
             .partitioned_epoch_rewards_config
             .stake_account_stores_per_block;
-        let accounts_state_bases = Arc::<accounts_state::AccountsStateBases>::default();
+        let accounts_state_bases = Arc::new(accounts_state::AccountsStateBases::for_accounts(
+            &bank_rc.accounts,
+        ));
         let mut bank = Self {
             rc: bank_rc,
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
