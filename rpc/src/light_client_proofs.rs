@@ -61,17 +61,26 @@
 //! root after they complete, and signer sets when first seen. A store
 //! opened on the directory takes the blocks back in order, as if they were
 //! rooted again, dropping any that blockstore does not have as a root. It
-//! then serves the same proofs for them as before, with two limits:
+//! then serves the same proofs for them as before. Files are synced, so
+//! what was written before the latest root survives a power loss.
 //!
-//! - the accounts state is not written (it cannot be kept per block), so
-//!   account state proofs are served for blocks rooted since the start
-//!   only;
-//! - the history leaves come back from the retained blocks, so history
-//!   proofs reach back to the oldest retained block, not
-//!   `retained_history` leaves. If the node resumes after a gap (it starts
-//!   from a snapshot later than its last retained block), the history
-//!   restarts at the first new block: older blocks are then served with
-//!   their own certificates only.
+//! - **History.** The kept history leaves are written too, so history
+//!   proofs reach as far back after a restart as before it. What is read
+//!   back is checked against the history frontier of a kept block before
+//!   it is used. If the node resumes after a gap (it starts from a snapshot
+//!   later than its last kept block), the leaves of the gap are missing
+//!   and the history restarts at the first new block: older blocks are
+//!   then served with their own certificates only.
+//! - **Accounts state.** The trees are not written: they are shared
+//!   between blocks and with the banks. Each block file has instead, for
+//!   every account the block changed, what the overlay held for it before
+//!   the block ([`StateRecord`]). After a restart the store takes the state
+//!   of the first block it has a bank for and steps back from it, block by
+//!   block, undoing each block's changes. Every state rebuilt this way is
+//!   checked against slot 5 of its block. A block is not reached if the
+//!   chain of kept blocks to it is broken, or if its generation ended
+//!   before the first bank after the restart (its base tree is then gone
+//!   as well); it answers "not kept" as before.
 //!
 //! A durable store would also cache the roots of complete history subtrees,
 //! so that a history proof does not rehash every kept leaf.
@@ -106,6 +115,7 @@ use {
         },
         solana_merkle_tree::{
             accounts_delta::AccountsDelta,
+            accounts_state::{accounts_state_root, overlay_value, split_overlay_value},
             commitment_tree::{
                 AppendOnlyFrontier, InclusionProof, TreeId, hash_leaf, hash_node,
                 make_inclusion_proof_from_leaf_hashes,
@@ -119,7 +129,7 @@ use {
     solana_rpc_client_api::{custom_error::LightClientProofError, light_client::RpcProofSelection},
     solana_runtime::bank::{
         Bank,
-        accounts_state::{AccountsState, AccountsStateProofError, BaseWait},
+        accounts_state::{AccountsState, AccountsStateProofError, BaseId, BaseWait, Generation},
         block_commitment::CommitmentVector,
         transaction_receipts::RetainedReceipt,
     },
@@ -129,14 +139,14 @@ use {
         path::PathBuf,
         sync::{
             Arc, Mutex, RwLock,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
     },
 };
 
 mod persist;
 
-use persist::{BlockRecord, Persistence};
+use persist::{BlockRecord, HistoryFiles, Persistence};
 
 /// Default number of rooted blocks whose proof data is kept.
 pub const DEFAULT_RETAINED_BLOCKS: usize = 1024;
@@ -190,7 +200,139 @@ impl ActiveFeatures {
     }
 }
 
+/// What is written of the accounts state of a block: what stepping back
+/// from the state after the block to the state after its parent needs.
+struct StateRecord {
+    parent_slot: Slot,
+    generation_in_use: Option<Epoch>,
+    /// The generations the block holds, in ascending epoch order.
+    generations: Vec<GenerationRecord>,
+}
+
+struct GenerationRecord {
+    base: BaseId,
+    /// For each entry of the block's accounts delta, in its order: the
+    /// account hash the overlay held for the address before the block
+    /// (`None`: it had no entry). `None` for all of them: the state before
+    /// the block was not at hand when the block was rooted.
+    previous: Option<Vec<Option<Hash>>>,
+}
+
+impl StateRecord {
+    fn new(
+        parent_slot: Slot,
+        state: &AccountsState,
+        generation_in_use: Option<Epoch>,
+        delta: Option<&AccountsDelta>,
+        parent_state: Option<&AccountsState>,
+    ) -> Self {
+        let generations = state
+            .generations()
+            .iter()
+            .map(|generation| {
+                let base = generation.base().id();
+                let previous = delta.zip(parent_state).map(|(delta, parent_state)| {
+                    // A generation the parent does not hold starts with this
+                    // block: its overlay was empty before.
+                    let before = parent_state
+                        .generations()
+                        .iter()
+                        .find(|parent| parent.base().id() == base);
+                    delta
+                        .entries()
+                        .iter()
+                        .map(|entry| {
+                            before?
+                                .overlay()
+                                .get(&entry.address)
+                                .map(|value| split_overlay_value(value).0)
+                        })
+                        .collect()
+                });
+                GenerationRecord { base, previous }
+            })
+            .collect();
+        Self {
+            parent_slot,
+            generation_in_use,
+            generations,
+        }
+    }
+}
+
+/// The accounts state after `block`, from the state after `next`, its child:
+/// the overlay of each generation of `block` is the one of `next` with the
+/// changes of `next` undone. A generation that `next` no longer holds is
+/// left out. `None` if the records do not allow it, or if the result is not
+/// the state `block` committed to in slot 5.
+fn state_before(
+    block: &RetainedBlock,
+    next: &RetainedBlock,
+    next_state: &AccountsState,
+) -> Option<Arc<AccountsState>> {
+    let record = block.state_record.as_deref()?;
+    let next_record = next.state_record.as_deref()?;
+    if next_record.parent_slot != block.slot {
+        return None;
+    }
+    let mut generations = Vec::new();
+    for generation in &record.generations {
+        let later = next_state
+            .generations()
+            .iter()
+            .find(|later| later.base().id() == generation.base);
+        let previous = next_record
+            .generations
+            .iter()
+            .find(|later| later.base == generation.base)
+            .and_then(|later| later.previous.as_ref());
+        let (Some(later), Some(previous)) = (later, previous) else {
+            continue;
+        };
+        let entries = next.accounts_delta.as_ref().map(|delta| delta.entries())?;
+        if entries.len() != previous.len() {
+            return None;
+        }
+        let mut overlay = later.overlay().clone();
+        for (entry, previous) in entries.iter().zip(previous) {
+            match previous {
+                Some(now) => {
+                    let (_, base) = split_overlay_value(overlay.get(&entry.address)?);
+                    overlay.insert(entry.address, overlay_value(now, &base));
+                }
+                None => {
+                    overlay.remove(&entry.address)?;
+                }
+            }
+        }
+        generations.push(Generation::from_parts(overlay, later.base().clone()));
+    }
+    if generations.is_empty() && !record.generations.is_empty() {
+        return None;
+    }
+    let state = AccountsState::from_generations(generations);
+    if let Some(epoch) = record.generation_in_use {
+        let generation = state.generation(epoch)?;
+        let (_, vector) = block.commitment.as_ref().ok()?;
+        // Without the base root (its job is still running) the check is
+        // left to the proof, which opens slot 5 itself.
+        if let Some(base_root) = generation.base().root_if_known() {
+            let committed = vector.0[CommitmentSlot::AccountsStateRoot.index() as usize];
+            if accounts_state_root(epoch, &base_root, &generation.overlay().root()) != committed {
+                warn!(
+                    "light-client proofs: the accounts state rebuilt for block {} is not the \
+                     one in its commitment root; not serving it",
+                    block.slot
+                );
+                return None;
+            }
+        }
+    }
+    Some(Arc::new(state))
+}
+
 /// What the store keeps of one rooted block.
+#[derive(Clone)]
 struct RetainedBlock {
     slot: Slot,
     epoch: Epoch,
@@ -205,13 +347,15 @@ struct RetainedBlock {
     accounts_delta: Option<Arc<AccountsDelta>>,
     accounts_state: Option<(Arc<AccountsState>, Option<Epoch>)>,
     /// The block was read back from disk, where the accounts state is not
-    /// kept.
+    /// kept, and its state was not rebuilt (yet).
     accounts_state_not_kept: bool,
+    state_record: Option<Arc<StateRecord>>,
     epoch_boundary: Option<EpochBoundary>,
 }
 
 impl RetainedBlock {
-    fn from_bank(bank: &Bank) -> Self {
+    /// `parent_state`: the accounts state of the parent block, if at hand.
+    fn from_bank(bank: &Bank, parent_state: Option<&AccountsState>) -> Self {
         let features = ActiveFeatures::of(bank);
         let commitment = match (bank.block_commitment(), bank.commitment_vector()) {
             (Some(commitment), Some(vector)) => Ok((commitment.commitment_root, vector)),
@@ -229,6 +373,19 @@ impl RetainedBlock {
         let receipts = bank
             .retained_transaction_receipts()
             .map(|receipts| receipts.map(Arc::new).map_err(|err| err.to_string()));
+        let accounts_delta = bank.accounts_delta();
+        let accounts_state = bank
+            .accounts_state()
+            .map(|state| (state, bank.accounts_state_generation_in_use()));
+        let state_record = accounts_state.as_ref().map(|(state, generation_in_use)| {
+            Arc::new(StateRecord::new(
+                bank.parent_slot(),
+                state,
+                *generation_in_use,
+                accounts_delta.as_deref(),
+                parent_state,
+            ))
+        });
         Self {
             slot: bank.slot(),
             epoch: bank.epoch(),
@@ -239,11 +396,10 @@ impl RetainedBlock {
                 .map(|commitment| commitment.block_history.leaf_count()),
             commitment,
             receipts,
-            accounts_delta: bank.accounts_delta(),
-            accounts_state: bank
-                .accounts_state()
-                .map(|state| (state, bank.accounts_state_generation_in_use())),
+            accounts_delta,
+            accounts_state,
             accounts_state_not_kept: false,
+            state_record,
             epoch_boundary: bank.epoch_boundary(),
         }
     }
@@ -327,9 +483,35 @@ struct HistoryLog {
     /// Frontier of all leaves, to check each new block against in
     /// `O(log n)`.
     all: AppendOnlyFrontier,
+    /// Number of times the log was restarted: the files follow one log.
+    restarts: u64,
 }
 
 impl HistoryLog {
+    /// The log of the leaves after `base`.
+    fn from_parts(base: AppendOnlyFrontier, entries: Vec<(Slot, Hash, Hash)>) -> Self {
+        let mut log = Self {
+            all: base.clone(),
+            base,
+            ..Self::default()
+        };
+        for (slot, block_id, commitment_root) in entries {
+            log.push(slot, block_id, commitment_root);
+        }
+        log
+    }
+
+    /// The root of the first `leaf_count` leaves, if they are the base and
+    /// kept leaves.
+    fn root_of_first(&self, leaf_count: u64) -> Option<Hash> {
+        let kept = usize::try_from(leaf_count.checked_sub(self.base_len())?).ok()?;
+        let mut frontier = self.base.clone();
+        for leaf_hash in self.leaf_hashes.get(..kept)? {
+            frontier.append_leaf_hash(*leaf_hash).ok()?;
+        }
+        Some(frontier.root(TreeId::BLOCK_HISTORY))
+    }
+
     fn base_len(&self) -> u64 {
         self.base.leaf_count()
     }
@@ -345,6 +527,7 @@ impl HistoryLog {
     /// Restarts the log at `H(B)` of a block: its frontier, or, when it is
     /// the anchor leaf alone, that leaf (so that the anchor can be proven).
     fn reset(&mut self, frontier: AppendOnlyFrontier, anchor: Option<(Slot, Hash)>) {
+        self.restarts = self.restarts.saturating_add(1);
         self.leaf_hashes.clear();
         self.entries.clear();
         self.all = frontier.clone();
@@ -596,6 +779,12 @@ pub struct LightClientProofStore {
     /// Slot of the oldest kept block (0: none yet).
     oldest_retained: AtomicU64,
     persistence: Option<Persistence>,
+    /// What the history files hold. Taken by the thread that roots, never
+    /// while the store's lock is held for writing.
+    history_files: Mutex<HistoryFiles>,
+    /// Blocks read back from disk may still get their accounts state from
+    /// the first banks rooted after the restart.
+    states_to_rebuild: AtomicBool,
 }
 
 impl LightClientProofStore {
@@ -609,8 +798,14 @@ impl LightClientProofStore {
             unwritten_certificates: Mutex::default(),
             oldest_retained: AtomicU64::new(0),
             persistence,
+            history_files: Mutex::default(),
+            states_to_rebuild: AtomicBool::new(false),
         };
         store.load();
+        store.write_history();
+        if let Some(persistence) = &store.persistence {
+            persistence.sync_directories();
+        }
         store
     }
 
@@ -632,22 +827,61 @@ impl LightClientProofStore {
             .lock()
             .unwrap()
             .extend(persistence.load_certificates());
-        let mut loaded = 0usize;
-        for record in persistence.load_blocks() {
-            let slot = record.block.slot;
-            if !self.blockstore.is_root(slot) {
+        let records: Vec<_> = persistence
+            .load_blocks()
+            .into_iter()
+            .filter(|record| {
+                let slot = record.block.slot;
+                let is_root = self.blockstore.is_root(slot);
+                if !is_root {
+                    warn!(
+                        "light-client proofs: kept block {slot} is not a root in blockstore, \
+                         dropping it"
+                    );
+                    persistence.remove_block(slot);
+                }
+                is_root
+            })
+            .collect();
+        // The history leaves, checked against the latest kept block whose
+        // history they cover. Leaves after it are checked when the next
+        // block is rooted, like any other.
+        let (files, history) = persistence.load_history();
+        *self.history_files.lock().unwrap() = files;
+        if let Some((base, entries)) = history {
+            let log = HistoryLog::from_parts(base, entries);
+            let mismatch = records
+                .iter()
+                .rev()
+                .filter_map(|record| record.history.as_ref())
+                .find_map(|frontier| {
+                    let root = log.root_of_first(frontier.leaf_count())?;
+                    Some(root != frontier.root(TreeId::BLOCK_HISTORY))
+                })
+                .unwrap_or(false);
+            if mismatch {
                 warn!(
-                    "light-client proofs: kept block {slot} is not a root in blockstore, \
-                     dropping it"
+                    "light-client proofs: the kept history leaves do not match the kept blocks, \
+                     dropping them"
                 );
-                persistence.remove_block(slot);
-                continue;
+                // The files follow restart 0: they are replaced at the next
+                // write.
+                inner.history.restarts = 1;
+            } else {
+                inner.history = log;
             }
+        }
+        let mut loaded = 0usize;
+        for record in records {
             let BlockRecord {
                 block,
                 history,
                 parent_slot,
             } = record;
+            self.states_to_rebuild.fetch_or(
+                block.accounts_state_not_kept && block.features.accounts_state_root,
+                Ordering::Relaxed,
+            );
             self.ingest(&mut inner, block, history, parent_slot);
             loaded += 1;
         }
@@ -674,15 +908,42 @@ impl LightClientProofStore {
         let mut banks: Vec<_> = banks.iter().collect();
         banks.sort_unstable_by_key(|bank| bank.slot());
         // Read what is needed from the banks before taking the lock.
-        let (highest_root, mut missing_epochs) = {
+        let (highest_root, mut missing_epochs, mut states) = {
             let inner = self.inner.read().unwrap();
             let missing: BTreeSet<Epoch> = banks
                 .iter()
                 .flat_map(|bank| [bank.epoch(), bank.epoch() + 1])
                 .filter(|epoch| !inner.signer_sets.contains_key(epoch))
                 .collect();
-            (inner.highest_root, missing)
+            // The accounts state after each block, to record what a block
+            // changes in it: of the latest kept block, and of the banks.
+            let states: HashMap<Slot, Arc<AccountsState>> = inner
+                .blocks
+                .values()
+                .next_back()
+                .and_then(|block| Some((block.slot, block.accounts_state.as_ref()?.0.clone())))
+                .into_iter()
+                .collect();
+            (inner.highest_root, missing, states)
         };
+        states.extend(
+            banks
+                .iter()
+                .filter_map(|bank| Some((bank.slot(), bank.accounts_state()?))),
+        );
+        let rebuild = self.states_to_rebuild.load(Ordering::Relaxed);
+        let rooted_states: Vec<_> = banks
+            .iter()
+            .filter(|_| rebuild)
+            .filter_map(|bank| {
+                Some((
+                    bank.slot(),
+                    bank.block_id()?.to_hash(),
+                    bank.accounts_state()?,
+                    bank.accounts_state_generation_in_use(),
+                ))
+            })
+            .collect();
         let new_blocks: Vec<_> = banks
             .into_iter()
             .filter(|bank| highest_root.is_none_or(|root| bank.slot() > root))
@@ -694,7 +955,10 @@ impl LightClientProofStore {
                     .collect();
                 (
                     BlockRecord {
-                        block: RetainedBlock::from_bank(bank),
+                        block: RetainedBlock::from_bank(
+                            bank,
+                            states.get(&bank.parent_slot()).map(Arc::as_ref),
+                        ),
                         history: bank
                             .block_commitment()
                             .map(|commitment| commitment.block_history),
@@ -721,23 +985,131 @@ impl LightClientProofStore {
                 }
             }
         }
-        if new_blocks.is_empty() {
+        let ingested = !new_blocks.is_empty();
+        if ingested {
+            let mut inner = self.inner.write().unwrap();
+            for (record, signer_sets) in new_blocks {
+                let BlockRecord {
+                    block,
+                    history,
+                    parent_slot,
+                } = record;
+                if inner.highest_root.is_some_and(|root| block.slot <= root) {
+                    continue;
+                }
+                inner.signer_sets.extend(signer_sets);
+                self.ingest(&mut inner, block, history, parent_slot);
+            }
+            self.prune(&mut inner);
+        }
+        if rebuild {
+            self.rebuild_accounts_states(&rooted_states);
+            // Once a new block is in, every block that can be reached from
+            // a bank has been.
+            if ingested {
+                self.states_to_rebuild.store(false, Ordering::Relaxed);
+            }
+        }
+        if ingested {
+            self.write_history();
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.sync_directories();
+        }
+    }
+
+    /// Writes the history leaves that are not in the files yet.
+    fn write_history(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let mut files = self.history_files.lock().unwrap();
+        let (restart, entries, base_len) = {
+            let inner = self.inner.read().unwrap();
+            let history = &inner.history;
+            let from = files
+                .next
+                .checked_sub(history.base_len())
+                .and_then(|from| usize::try_from(from).ok())
+                .filter(|from| {
+                    files.restarts == history.restarts && *from <= history.entries.len()
+                });
+            match from {
+                Some(from) => (None, history.entries[from..].to_vec(), history.base_len()),
+                None => (
+                    Some((history.restarts, history.base.clone())),
+                    history.entries.clone(),
+                    history.base_len(),
+                ),
+            }
+        };
+        if restart.is_none() && entries.is_empty() {
             return;
         }
-        let mut inner = self.inner.write().unwrap();
-        for (record, signer_sets) in new_blocks {
-            let BlockRecord {
-                block,
-                history,
-                parent_slot,
-            } = record;
-            if inner.highest_root.is_some_and(|root| block.slot <= root) {
+        persistence.write_history(&mut files, restart, &entries, base_len);
+    }
+
+    /// Gives the blocks read back from disk their accounts state: from the
+    /// rooted banks of the same blocks (`rooted`: slot, block id, state,
+    /// generation in use), and for the blocks before a block with a state by
+    /// undoing that block's changes (see [`state_before`]).
+    fn rebuild_accounts_states(&self, rooted: &[(Slot, Hash, Arc<AccountsState>, Option<Epoch>)]) {
+        let blocks: Vec<Arc<RetainedBlock>> = self
+            .inner
+            .read()
+            .unwrap()
+            .blocks
+            .values()
+            .cloned()
+            .collect();
+        let mut rebuilt: Vec<(Slot, Arc<AccountsState>, Option<Epoch>)> = Vec::new();
+        // From the latest block down: `next` is the block after, with its
+        // state, while the chain of states is unbroken.
+        let mut next: Option<(&RetainedBlock, Arc<AccountsState>)> = None;
+        for block in blocks.iter().rev() {
+            if let Some((state, _)) = &block.accounts_state {
+                next = Some((block, state.clone()));
                 continue;
             }
-            inner.signer_sets.extend(signer_sets);
-            self.ingest(&mut inner, block, history, parent_slot);
+            if !block.accounts_state_not_kept {
+                next = None;
+                continue;
+            }
+            let from_bank = rooted
+                .iter()
+                .find(|(slot, block_id, ..)| {
+                    *slot == block.slot && Some(*block_id) == block.block_id
+                })
+                .map(|(_, _, state, generation_in_use)| (state.clone(), *generation_in_use));
+            let state = from_bank.or_else(|| {
+                let (after, after_state) = next.as_ref()?;
+                let state = state_before(block, after, after_state)?;
+                let generation_in_use = block.state_record.as_ref()?.generation_in_use;
+                Some((state, generation_in_use))
+            });
+            next = state.map(|(state, generation_in_use)| {
+                rebuilt.push((block.slot, state.clone(), generation_in_use));
+                (block.as_ref(), state)
+            });
         }
-        self.prune(&mut inner);
+        if rebuilt.is_empty() {
+            return;
+        }
+        info!(
+            "light-client proofs: rebuilt the accounts state of {} kept blocks, back to slot {}",
+            rebuilt.len(),
+            rebuilt.last().map(|(slot, ..)| *slot).unwrap_or_default()
+        );
+        let mut inner = self.inner.write().unwrap();
+        for (slot, state, generation_in_use) in rebuilt {
+            if let Some(block) = inner.blocks.get_mut(&slot) {
+                *block = Arc::new(RetainedBlock {
+                    accounts_state: Some((state, generation_in_use)),
+                    accounts_state_not_kept: false,
+                    ..RetainedBlock::clone(block)
+                });
+            }
+        }
     }
 
     fn ingest(
@@ -753,8 +1125,13 @@ impl LightClientProofStore {
         if let (Some(frontier), Ok((commitment_root, _)), Some(block_id)) =
             (history, &block.commitment, block.block_id)
         {
-            if inner.history.len() != frontier.leaf_count()
-                || inner.history.frontier_root() != frontier.root(TreeId::BLOCK_HISTORY)
+            // A leaf read back from the history files is already there.
+            let kept = frontier.leaf_count() < inner.history.len()
+                && inner.history.find(slot)
+                    == Some((frontier.leaf_count(), (slot, block_id, *commitment_root)));
+            if !kept
+                && (inner.history.len() != frontier.leaf_count()
+                    || inner.history.frontier_root() != frontier.root(TreeId::BLOCK_HISTORY))
             {
                 if inner.history.len() > 0 {
                     warn!(
@@ -770,7 +1147,9 @@ impl LightClientProofStore {
                     .and_then(|parent| Some((parent.slot, parent.block_id?)));
                 inner.history.reset(frontier, anchor);
             }
-            inner.history.push(slot, block_id, *commitment_root);
+            if !kept {
+                inner.history.push(slot, block_id, *commitment_root);
+            }
         }
 
         if let Some(Ok(receipts)) = &block.receipts {
@@ -1536,6 +1915,131 @@ mod tests {
 
     fn leaf_hash(i: u64) -> Hash {
         hash_leaf(TreeId::BLOCK_HISTORY, &i.to_le_bytes())
+    }
+
+    /// The history files across segments: written in batches, read back,
+    /// pruned from the front, restarted, and with a record cut short.
+    #[test]
+    fn test_history_files() {
+        use persist::HISTORY_SEGMENT_LEN;
+        let directory = solana_ledger::get_tmp_ledger_path!();
+        let persistence = Persistence::open(&directory).unwrap();
+        let segment_files = || {
+            let mut names: Vec<u64> = std::fs::read_dir(directory.join("history"))
+                .unwrap()
+                .map(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        let entry = |i: u64| (i, leaf_hash(i), leaf_hash(i + 1_000_000));
+
+        // A history that starts after five leaves that are not kept.
+        let base = AppendOnlyFrontier::from_leaf_hashes(&(0..5).map(leaf_hash).collect::<Vec<_>>())
+            .unwrap();
+        let total = 2 * HISTORY_SEGMENT_LEN + 100;
+        let entries: Vec<_> = (5..5 + total).map(entry).collect();
+        let (mut files, loaded) = persistence.load_history();
+        assert!(loaded.is_none());
+        let mut written = 0usize;
+        for (round, batch) in [1usize, 3000, 0, 1500, 4000, usize::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            let end = written.saturating_add(batch).min(entries.len());
+            let restart = (round == 0).then(|| (7, base.clone()));
+            persistence.write_history(&mut files, restart, &entries[written..end], 5);
+            written = end;
+            assert_eq!(files.next, 5 + written as u64);
+        }
+        assert_eq!(files.restarts, 7);
+        assert_eq!(
+            segment_files(),
+            [5, 5 + HISTORY_SEGMENT_LEN, 5 + 2 * HISTORY_SEGMENT_LEN]
+        );
+        let (reloaded, loaded) = persistence.load_history();
+        assert_eq!(loaded, Some((base.clone(), entries.clone())));
+        assert_eq!(reloaded.next, files.next);
+        // The log rebuilt from them has the root of all the leaves.
+        let log = HistoryLog::from_parts(base.clone(), entries.clone());
+        assert_eq!(log.len(), 5 + total);
+        assert_eq!(log.root_of_first(5), Some(base.root(TreeId::BLOCK_HISTORY)));
+        assert_eq!(log.root_of_first(5 + total), Some(log.frontier_root()));
+        assert_eq!(log.root_of_first(4), None);
+
+        // A record cut short is cut off, and writing goes on after it.
+        let last = directory
+            .join("history")
+            .join((5 + 2 * HISTORY_SEGMENT_LEN).to_string());
+        let whole = std::fs::read(&last).unwrap();
+        std::fs::write(&last, &whole[..whole.len() - 10]).unwrap();
+        let (mut files, loaded) = persistence.load_history();
+        assert_eq!(
+            loaded,
+            Some((base.clone(), entries[..entries.len() - 1].to_vec()))
+        );
+        persistence.write_history(&mut files, None, &entries[entries.len() - 1..], 5);
+        assert_eq!(std::fs::read(&last).unwrap(), whole);
+
+        // Leaves folded into the base: a segment goes once all of it is.
+        persistence.write_history(&mut files, None, &[], 5 + HISTORY_SEGMENT_LEN - 1);
+        assert_eq!(segment_files().len(), 3);
+        persistence.write_history(&mut files, None, &[], 5 + HISTORY_SEGMENT_LEN);
+        assert_eq!(
+            segment_files(),
+            [5 + HISTORY_SEGMENT_LEN, 5 + 2 * HISTORY_SEGMENT_LEN]
+        );
+        let (_, loaded) = persistence.load_history();
+        let (loaded_base, loaded_entries) = loaded.unwrap();
+        assert_eq!(loaded_base.leaf_count(), 5 + HISTORY_SEGMENT_LEN);
+        assert_eq!(
+            loaded_entries,
+            entries[HISTORY_SEGMENT_LEN as usize..].to_vec()
+        );
+
+        // A segment that does not follow the one before is removed, with
+        // those after it.
+        std::fs::remove_file(
+            directory
+                .join("history")
+                .join((5 + HISTORY_SEGMENT_LEN).to_string()),
+        )
+        .unwrap();
+        std::fs::write(
+            directory
+                .join("history")
+                .join((5 + HISTORY_SEGMENT_LEN).to_string()),
+            &whole,
+        )
+        .unwrap();
+        let (_, loaded) = persistence.load_history();
+        assert!(loaded.is_none());
+        assert!(segment_files().is_empty());
+
+        // A restart replaces the files.
+        let (mut files, _) = persistence.load_history();
+        persistence.write_history(&mut files, Some((8, base.clone())), &entries[..10], 5);
+        persistence.write_history(
+            &mut files,
+            Some((9, AppendOnlyFrontier::new())),
+            &entries[..3],
+            0,
+        );
+        assert_eq!(segment_files(), [0]);
+        let (files, loaded) = persistence.load_history();
+        assert_eq!(
+            loaded,
+            Some((AppendOnlyFrontier::new(), entries[..3].to_vec()))
+        );
+        assert_eq!(files.next, 3);
     }
 
     /// Proofs from a log whose first leaves are folded into the base agree
