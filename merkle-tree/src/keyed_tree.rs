@@ -335,6 +335,49 @@ impl<V: KeyedValue> KeyedTree<V> {
         });
     }
 
+    /// Removes the entry of `key`. Returns its value. Like an insertion, it
+    /// copies only the shared nodes on the path of `key`, so trees cloned
+    /// from this one are not affected.
+    ///
+    /// The state overlay never removes an entry. This is for a prover that
+    /// steps an overlay back by one block, to the tree it was before the
+    /// block inserted the entry.
+    pub fn remove(&mut self, key: &Key) -> Option<V> {
+        self.get(key)?;
+        let root = self.root.as_mut().expect("tree is not empty");
+        let value = match &root.kind {
+            NodeKind::Leaf { value, .. } => {
+                let value = value.clone();
+                self.root = None;
+                value
+            }
+            NodeKind::Branch { .. } => Self::remove_below(root, key),
+        };
+        self.len -= 1;
+        Some(value)
+    }
+
+    /// Removes the existing `key` below the branch `node`. The branch whose
+    /// child is the leaf of `key` is replaced by its other child.
+    fn remove_below(node: &mut Arc<Node<V>>, key: &Key) -> V {
+        let NodeKind::Branch { bit, children } = &node.kind else {
+            unreachable!("the caller passes a branch")
+        };
+        let side = usize::from(key_bit(key, *bit));
+        if let NodeKind::Leaf { value, .. } = &children[side].kind {
+            let value = value.clone();
+            let sibling = children[1 - side].clone();
+            *node = sibling;
+            return value;
+        }
+        let node = Arc::make_mut(node);
+        node.hash = OnceLock::new();
+        let NodeKind::Branch { children, .. } = &mut node.kind else {
+            unreachable!("checked above")
+        };
+        Self::remove_below(&mut children[side], key)
+    }
+
     /// `KTH(tree_id, S)`.
     pub fn tree_hash(&self) -> Hash {
         self.root
@@ -757,6 +800,54 @@ mod tests {
             assert_eq!(tree_of(&shuffled).root(), version.root());
             assert_eq!(tree_of(&shuffled), *version);
         }
+    }
+
+    /// Removal gives the tree of the remaining set, whatever the order, and
+    /// leaves the trees it was cloned from as they were.
+    #[test]
+    fn test_remove() {
+        let mut prng = Prng(5000);
+        let mut tree: KeyedTree<Vec<u8>> = KeyedTree::new(TID);
+        assert_eq!(tree.remove(&[1; 32]), None);
+        let mut model: Vec<(Key, Vec<u8>)> = Vec::new();
+        let mut versions = Vec::new();
+        for round in 0..40u8 {
+            for _ in 0..12 {
+                let key = prng.key();
+                let value = vec![round, prng.below(256) as u8];
+                assert_eq!(tree.insert(key, value.clone()), None);
+                model.push((key, value));
+            }
+            // Hash only every other round, so that some removals change
+            // nodes whose hash was never computed.
+            if round % 2 == 0 {
+                assert_eq!(tree.root(), reference_root(TID, &model));
+            }
+            versions.push((tree.clone(), model.clone()));
+            for _ in 0..prng.below(10) {
+                let (key, value) = model.swap_remove(prng.below(model.len() as u64) as usize);
+                assert_eq!(tree.remove(&key), Some(value));
+                assert_eq!(tree.remove(&key), None);
+                assert!(!tree.contains_key(&key));
+            }
+            assert_eq!(tree.len(), model.len() as u64);
+            assert_eq!(tree.root(), reference_root(TID, &model));
+            assert_eq!(tree, tree_of(&model));
+            versions.push((tree.clone(), model.clone()));
+        }
+        for (version, model) in &versions {
+            assert_eq!(version.root(), reference_root(TID, model));
+            assert_eq!(version.len(), model.len() as u64);
+        }
+        let absent: Vec<_> = (0..20).map(|_| prng.key()).collect();
+        check_proofs(&tree, &model, &absent);
+        // Down to nothing: one entry, then the empty tree.
+        while let Some((key, value)) = model.pop() {
+            assert_eq!(tree.remove(&key), Some(value));
+            assert_eq!(tree.root(), reference_root(TID, &model));
+        }
+        assert!(tree.is_empty());
+        assert_eq!(tree.root(), empty_keyed_root(TID));
     }
 
     #[test]

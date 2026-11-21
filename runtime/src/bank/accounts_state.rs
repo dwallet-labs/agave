@@ -448,6 +448,16 @@ pub struct Generation {
 }
 
 impl Generation {
+    /// A generation from its parts, for a prover that rebuilds the state of
+    /// an earlier block from a later one's. Nothing a bank computes uses it.
+    pub fn from_parts(overlay: OverlayTree, base: Arc<BaseCell>) -> Self {
+        Self {
+            epoch: base.id.epoch,
+            overlay,
+            base,
+        }
+    }
+
     pub fn epoch(&self) -> Epoch {
         self.epoch
     }
@@ -469,6 +479,12 @@ pub struct AccountsState {
 }
 
 impl AccountsState {
+    /// A state from generations in ascending epoch order (see
+    /// [`Generation::from_parts`]).
+    pub fn from_generations(generations: Vec<Generation>) -> Self {
+        Self { generations }
+    }
+
     pub fn generations(&self) -> &[Generation] {
         &self.generations
     }
