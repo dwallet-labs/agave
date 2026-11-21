@@ -636,6 +636,65 @@ fn test_chain_across_epochs_and_switch_slots() {
         parent = bank;
     }
     h.check_proofs(&parent, &addresses);
+
+    // The leaves of the bases are in files, of the two latest epochs only.
+    let state = parent.accounts_state().unwrap();
+    let base = state.generation(3).unwrap().base().wait_tree().unwrap();
+    assert!(!base.is_empty());
+    let dir = parent.accounts_state_bases.dir.clone();
+    let mut epochs: Vec<String> = std::fs::read_dir(dir.path().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .map(|name| {
+            assert!(name.ends_with(".leaves"), "{name}");
+            name.split('-').next().unwrap().to_string()
+        })
+        .collect();
+    epochs.sort();
+    assert_eq!(epochs, ["2", "3"]);
+    let on_disk = dir.open(&state.generation(3).unwrap().base().id()).unwrap();
+    assert_eq!(on_disk.bytes().len(), base.len() * 64);
+}
+
+/// After a restart, the leaves on disk are used only if they have the base
+/// root the snapshot carries.
+#[test]
+fn test_base_file_reused_only_with_the_snapshot_root() {
+    let accounts = TempDir::new().unwrap();
+    let bases = AccountsStateBases::for_accounts_path(accounts.path());
+    let id = BaseId {
+        epoch: 7,
+        parent: Some((447, Hash::new_unique())),
+    };
+    let mut leaves: Vec<_> = (0..3_000u64)
+        .map(|i| {
+            solana_merkle_tree::accounts_state::BaseLeaf::new(
+                hashv(&[&i.to_le_bytes()]).to_bytes(),
+                hashv(&[b"state", &i.to_le_bytes()]),
+            )
+        })
+        .collect();
+    leaves.sort_unstable();
+    let mut writer = bases.dir.writer(&id);
+    for leaf in &leaves {
+        writer.push(*leaf).unwrap();
+    }
+    let tree = tree_from_storage(writer.finish().unwrap()).unwrap();
+    assert_eq!(tree, BaseTree::new(leaves).unwrap());
+
+    // A later process, on the same directory.
+    let bases = AccountsStateBases::for_accounts_path(accounts.path());
+    let cell = bases.snapshot_cell(id, Some(tree.root()));
+    assert_eq!(reuse_base_file(&bases.dir, &cell).unwrap(), tree);
+    // The snapshot has no root for the base: the file cannot be checked. It
+    // is left for a snapshot that has one.
+    let cell = bases.snapshot_cell(id, None);
+    assert!(reuse_base_file(&bases.dir, &cell).is_none());
+    assert!(bases.dir.open(&id).is_some());
+    // The snapshot has another root: the file is not its base.
+    let cell = bases.snapshot_cell(id, Some(Hash::new_unique()));
+    assert!(reuse_base_file(&bases.dir, &cell).is_none());
+    assert!(bases.dir.open(&id).is_none());
 }
 
 /// The feature activates at the first epoch boundary: zero until the switch

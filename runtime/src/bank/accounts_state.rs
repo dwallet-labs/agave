@@ -75,8 +75,15 @@
 //! update in the overlay (`O(depth)` node copies) and the hashes of the changed
 //! nodes, each hashed once when the root is computed. An overlay entry costs a
 //! leaf node and a branch node (about 250 bytes) and is shared by every bank
-//! that holds the generation. Base trees are held in memory, 64 bytes per
-//! account, while a bank holds their generation.
+//! that holds the generation.
+//!
+//! The leaves of a base tree, 64 bytes per account, are in a file that is
+//! mapped, not in memory (see [`base_files`]): the leaves of the two latest
+//! epochs are kept on disk. A base is derived as a stream, by merge from the
+//! file of the previous base, or by scan through a sorter that spills to
+//! disk, and its leaves are hashed on a few threads. A node that restarts
+//! from a snapshot uses the files it finds, if they have the base roots the
+//! snapshot carries, and scans only otherwise.
 
 use {
     super::{
@@ -88,6 +95,7 @@ use {
     },
     agave_feature_set as feature_set,
     log::*,
+    rayon::prelude::*,
     solana_account::ReadableAccount,
     solana_accounts_db::accounts_db::AccountsDb,
     solana_clock::{Epoch, Slot},
@@ -97,20 +105,25 @@ use {
     solana_merkle_tree::{
         accounts_delta::{AccountsDelta, Address},
         accounts_state::{
-            AccountProof, AccountsStateOpening, BaseLeaf, BaseTree, OverlayEntry, OverlayTree,
-            account_lookup, accounts_state_root, apply_block_changes, apply_overlay, new_overlay,
-            substitute_overlay,
+            AccountProof, AccountsStateOpening, BaseTree, DeriveError, OverlayEntry,
+            OverlaySubstitution, OverlayTree, account_lookup, accounts_state_root,
+            apply_block_changes, apply_overlay_into, new_overlay,
         },
     },
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
+        path::Path,
         sync::{
             Arc, Condvar, Mutex, Weak,
             atomic::{AtomicBool, Ordering},
         },
     },
 };
+
+mod base_files;
+
+use base_files::{BaseDir, on_base_pool, tree_from_storage};
 
 /// Minimum number of slots of an epoch for its generation to exist. Shorter
 /// epochs have no generation, and the blocks that would use it have zero in
@@ -312,6 +325,8 @@ impl BaseCell {
 #[derive(Default)]
 pub struct AccountsStateBases {
     cells: Mutex<HashMap<BaseId, Weak<BaseCell>>>,
+    /// Where the leaves of the base trees are kept.
+    dir: Arc<BaseDir>,
 }
 
 impl std::fmt::Debug for AccountsStateBases {
@@ -321,6 +336,24 @@ impl std::fmt::Debug for AccountsStateBases {
 }
 
 impl AccountsStateBases {
+    /// The bases of a node whose accounts are in `accounts_path`: the leaves
+    /// of its base trees are kept in files near it (see [`base_files`]).
+    /// The default keeps them in memory.
+    pub fn for_accounts_path(accounts_path: &Path) -> Self {
+        Self {
+            cells: Mutex::default(),
+            dir: Arc::new(BaseDir::for_accounts_path(accounts_path)),
+        }
+    }
+
+    /// [`Self::for_accounts_path`] of the first path of an accounts database.
+    pub(super) fn for_accounts(accounts: &solana_accounts_db::accounts::Accounts) -> Self {
+        match accounts.accounts_db.paths.first() {
+            Some(path) => Self::for_accounts_path(path),
+            None => Self::default(),
+        }
+    }
+
     /// The cell of `id`, created with `job` running on a background thread
     /// if no bank holds it yet.
     fn request(
@@ -399,45 +432,136 @@ fn spawn_base_job(
     }
 }
 
+/// Number of accounts hashed together by a scan.
+const SCAN_BATCH: usize = 4096;
+
 /// Scans the account state of `bank`, checks it against the bank's accounts
-/// lattice hash, and derives one base tree per overlay: the base tree of the
-/// generation of each overlay, which must be the overlay of that generation
-/// as of `bank` (an empty overlay gives the state of `bank` itself).
+/// lattice hash, and derives one base tree per `(base, overlay)`: the base
+/// tree of the generation of each overlay, which must be the overlay of that
+/// generation as of `bank` (an empty overlay gives the state of `bank`
+/// itself).
 ///
-/// TODO(simd-accounts-state-root): the scan holds every account's 64-byte
-/// leaf in memory and runs on one thread; on mainnet the leaves belong on
-/// disk and the scan should be parallel over the index bins.
-fn scan_base_trees(bank: &Bank, overlays: &[&OverlayTree]) -> Result<Vec<BaseTree>, String> {
+/// The accounts are read by one thread, as the accounts database gives
+/// them, and hashed in batches on the base threads. The leaves go through a
+/// sorter that spills to disk and from there to the file of each base, so
+/// what is held in memory does not grow with the number of accounts.
+///
+/// TODO(simd-accounts-state-root): the read itself is one thread. On mainnet
+/// it should go over the index bins in parallel, as the lattice hash check at
+/// startup does.
+fn scan_base_trees(
+    bank: &Bank,
+    dir: &BaseDir,
+    bases: &[(BaseId, &OverlayTree)],
+) -> Result<Vec<BaseTree>, String> {
     let mut lt_hash = LtHash::identity();
-    let mut current = Vec::new();
+    let mut sorter = dir.sorter();
+    let mut failure: Option<String> = None;
+    let mut batch = Vec::with_capacity(SCAN_BATCH);
+    let mut hash_batch = |batch: &mut Vec<(Pubkey, _)>| {
+        let hash_one = |(address, account): &(Pubkey, _)| {
+            let account_lt_hash = AccountsDb::lt_hash_account(account, address);
+            (
+                address.to_bytes(),
+                lt_hash_prefix(&account_lt_hash.0),
+                account_lt_hash,
+            )
+        };
+        let hashed: Vec<_> = if batch.len() < SCAN_BATCH {
+            batch.iter().map(hash_one).collect()
+        } else {
+            on_base_pool(|| batch.par_iter().map(hash_one).collect())
+        };
+        batch.clear();
+        for (address, account_hash, account_lt_hash) in hashed {
+            lt_hash.mix_in(&account_lt_hash.0);
+            if failure.is_none()
+                && let Err(err) = sorter.push(&address, &account_hash)
+            {
+                failure = Some(format!("cannot sort the scanned accounts: {err}"));
+            }
+        }
+    };
     bank.scan_all_accounts(|item| {
         if let Some((address, account, _slot)) = item
             && account.lamports() != 0
         {
-            let account_lt_hash = AccountsDb::lt_hash_account(&account, address);
-            lt_hash.mix_in(&account_lt_hash.0);
-            current.push(BaseLeaf::new(
-                address.to_bytes(),
-                lt_hash_prefix(&account_lt_hash.0),
-            ));
+            batch.push((*address, account));
+            if batch.len() == SCAN_BATCH {
+                hash_batch(&mut batch);
+            }
         }
     })
     .map_err(|err| format!("scan of bank {} failed: {err}", bank.slot()))?;
+    hash_batch(&mut batch);
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
     if lt_hash != bank.accounts_lt_hash.lock().unwrap().0 {
         return Err(format!(
             "the scanned state of bank {} does not match its accounts lattice hash",
             bank.slot()
         ));
     }
-    current.sort_unstable_by_key(|leaf| leaf.address);
-    overlays
+    // One pass over the sorted state gives the leaves of every base.
+    let mut outputs: Vec<_> = bases
         .iter()
-        .map(|overlay| {
-            let leaves = substitute_overlay(&current, overlay)
-                .map_err(|err| format!("overlay does not match bank {}: {err:?}", bank.slot()))?;
-            BaseTree::new(leaves).map_err(|err| format!("{err:?}"))
+        .map(|(id, overlay)| (OverlaySubstitution::new(overlay), dir.writer(id)))
+        .collect();
+    let derive_error = |err| match err {
+        DeriveError::Mismatch(mismatch) => {
+            format!("overlay does not match bank {}: {mismatch:?}", bank.slot())
+        }
+        DeriveError::Sink(err) => format!("cannot write the base leaves: {err}"),
+    };
+    sorter.into_sorted(|leaf| {
+        outputs.iter_mut().try_for_each(|(substitution, writer)| {
+            substitution
+                .push(leaf, |derived| writer.push(derived))
+                .map_err(derive_error)
+        })
+    })?;
+    outputs
+        .into_iter()
+        .map(|(substitution, mut writer)| {
+            substitution
+                .finish(|derived| writer.push(derived))
+                .map_err(derive_error)?;
+            let storage = writer
+                .finish()
+                .map_err(|err| format!("cannot write the base leaves: {err}"))?;
+            tree_from_storage(storage).map_err(|err| format!("{err:?}"))
         })
         .collect()
+}
+
+/// The base tree of a cell loaded from a snapshot, from the leaves this node
+/// wrote before it restarted: used if they have the base root the snapshot
+/// carries. A file with another root (damaged, or of another ledger) is
+/// removed.
+fn reuse_base_file(dir: &BaseDir, cell: &BaseCell) -> Option<BaseTree> {
+    let known_root = cell.known_root?;
+    let storage = dir.open(&cell.id)?;
+    match tree_from_storage(storage) {
+        Ok(tree) if tree.root() == known_root => {
+            info!(
+                "accounts state base {:?}: using the {} leaves on disk",
+                cell.id,
+                tree.len()
+            );
+            Some(tree)
+        }
+        result => {
+            warn!(
+                "accounts state base {:?}: the leaves on disk are not those of the snapshot's \
+                 base root {known_root} ({:?}); scanning instead",
+                cell.id,
+                result.map(|tree| tree.root())
+            );
+            dir.remove(&cell.id);
+            None
+        }
+    }
 }
 
 /// One generation held by a bank: its epoch, its overlay as of the bank, and
@@ -791,6 +915,7 @@ impl Bank {
             epoch,
             parent: Some((parent.slot(), parent.hash())),
         };
+        let dir = self.accounts_state_bases.dir.clone();
         // By merge, from the latest generation of `P`, whose overlay as of `P`
         // is frozen.
         if let Some(source) = parent_generations.last() {
@@ -800,15 +925,28 @@ impl Bank {
                 let previous = previous
                     .wait_tree()
                     .map_err(|reason| format!("previous base unavailable: {reason}"))?;
-                let leaves = apply_overlay(&previous, &overlay)
-                    .map_err(|err| format!("overlay does not match the previous base: {err:?}"))?;
-                BaseTree::new(leaves).map_err(|err| format!("{err:?}"))
+                // Nothing older than the previous base is derived from again.
+                dir.retain_epochs(|kept| kept == epoch || kept.checked_add(1) == Some(epoch));
+                let mut writer = dir.writer(&id);
+                apply_overlay_into(&previous, &overlay, |leaf| writer.push(leaf)).map_err(
+                    |err| match err {
+                        DeriveError::Mismatch(mismatch) => {
+                            format!("overlay does not match the previous base: {mismatch:?}")
+                        }
+                        DeriveError::Sink(err) => format!("cannot write the base leaves: {err}"),
+                    },
+                )?;
+                let storage = writer
+                    .finish()
+                    .map_err(|err| format!("cannot write the base leaves: {err}"))?;
+                tree_from_storage(storage).map_err(|err| format!("{err:?}"))
             });
         }
         // By scan of `P` (activation, or no generation in the previous epoch).
         let parent = parent.clone();
         self.accounts_state_bases.request(id, move || {
-            scan_base_trees(&parent, &[&new_overlay()]).map(|mut trees| trees.remove(0))
+            dir.retain_epochs(|kept| kept == epoch || kept.checked_add(1) == Some(epoch));
+            scan_base_trees(&parent, &dir, &[(id, &new_overlay())]).map(|mut trees| trees.remove(0))
         })
     }
 
@@ -831,10 +969,31 @@ impl Bank {
             return;
         }
         let bank = self.clone();
+        let dir = self.accounts_state_bases.dir.clone();
         let cells = pending.iter().map(|g| g.base.clone()).collect();
         spawn_base_job(cells, move || {
-            let overlays: Vec<_> = pending.iter().map(|g| &g.overlay).collect();
-            scan_base_trees(&bank, &overlays)
+            // The leaves this node wrote before it restarted, if they have
+            // the root the snapshot carries.
+            let mut trees: Vec<Option<BaseTree>> = pending
+                .iter()
+                .map(|g| reuse_base_file(&dir, &g.base))
+                .collect();
+            let missing: Vec<_> = pending
+                .iter()
+                .zip(&trees)
+                .filter(|(_, tree)| tree.is_none())
+                .map(|(g, _)| (g.base.id, &g.overlay))
+                .collect();
+            if !missing.is_empty() {
+                let mut scanned = scan_base_trees(&bank, &dir, &missing)?.into_iter();
+                for tree in trees.iter_mut().filter(|tree| tree.is_none()) {
+                    *tree = scanned.next();
+                }
+            }
+            trees
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| "the scan did not give every base".to_string())
         });
     }
 
@@ -927,7 +1086,12 @@ impl Bank {
         } else {
             return Err("the parent is neither in the generation nor its base block".into());
         };
-        let tree = scan_base_trees(&parent, &[&overlay])?.remove(0);
+        let tree = scan_base_trees(
+            &parent,
+            &self.accounts_state_bases.dir,
+            &[(generation.base.id, &overlay)],
+        )?
+        .remove(0);
         let root = tree.root();
         // Replace the failure, so that the other banks of the chain use the
         // result.
