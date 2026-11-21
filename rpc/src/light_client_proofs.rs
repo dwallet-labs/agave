@@ -168,6 +168,9 @@ pub const DEFAULT_RETAINED_BLOCKS: usize = 1024;
 pub const DEFAULT_RETAINED_HISTORY: usize = 1 << 18;
 /// Number of epochs whose signer sets are kept.
 pub const RETAINED_SIGNER_SET_EPOCHS: usize = 4;
+/// A rooted block this close to the latest root may not have its block id
+/// record in blockstore yet (see [`LightClientProofStore::footer_proof`]).
+const RECENT_ROOT_SLOTS: Slot = 32;
 
 type ProofResult<T> = Result<T, LightClientProofError>;
 
@@ -793,6 +796,8 @@ pub struct LightClientProofStore {
     unwritten_certificates: Mutex<BTreeSet<Slot>>,
     /// Slot of the oldest kept block (0: none yet).
     oldest_retained: AtomicU64,
+    /// Slot of the latest rooted block taken (0: none yet).
+    latest_root: AtomicU64,
     /// The files, read at startup. `None`: the store keeps nothing on disk.
     persistence: Option<Arc<Persistence>>,
     /// The thread that writes the files. Nothing else writes them, so the
@@ -821,6 +826,7 @@ impl LightClientProofStore {
             certificates: Mutex::default(),
             unwritten_certificates: Mutex::default(),
             oldest_retained: AtomicU64::new(0),
+            latest_root: AtomicU64::new(0),
             // Without the thread nothing is written, so nothing is read.
             persistence: persistence.filter(|_| writer.is_some()),
             writer,
@@ -1246,6 +1252,7 @@ impl LightClientProofStore {
 
         inner.blocks.insert(slot, Arc::new(block));
         inner.highest_root = Some(slot);
+        self.latest_root.store(slot, Ordering::Relaxed);
     }
 
     fn prune(&self, inner: &mut Inner) {
@@ -1380,10 +1387,14 @@ impl LightClientProofStore {
     /// final through it).
     ///
     /// The node that produced a block votes on it, and can root it, before
-    /// its broadcast has written the last shreds of the block to blockstore.
-    /// Until then the block cannot be proven final from this node: the
-    /// answer is "block not final", which callers retry, as for a block
-    /// that is not rooted yet.
+    /// its broadcast has written the last shreds of the block to blockstore,
+    /// and blockstore writes the record of a block id a moment after the
+    /// block is complete. Until then the block cannot be proven final from
+    /// this node: the answer is "block not final", which callers retry, as
+    /// for a block that is not rooted yet. A complete block without the
+    /// record gets that answer only while it is among the latest
+    /// [`RECENT_ROOT_SLOTS`] slots rooted; after that the record is not
+    /// coming.
     fn footer_proof(
         &self,
         block: &RetainedBlock,
@@ -1396,11 +1407,13 @@ impl LightClientProofStore {
             .get_parent_repair_metadata(slot, *block_id)
             .map_err(|err| data_not_available(slot, format!("blockstore: {err}")))?
         else {
+            let recent =
+                slot.saturating_add(RECENT_ROOT_SLOTS) > self.latest_root.load(Ordering::Relaxed);
             return Err(match self.blockstore.meta(slot) {
                 // Still being written. Every block before `asked` was
                 // rooted earlier, so `asked - 1` is a lower bound of the
                 // latest slot that is final here.
-                Ok(Some(slot_meta)) if !slot_meta.is_full() => {
+                Ok(Some(slot_meta)) if !slot_meta.is_full() || recent => {
                     LightClientProofError::BlockNotFinal {
                         slot: asked,
                         finalized_slot: Some(asked.saturating_sub(1)),
