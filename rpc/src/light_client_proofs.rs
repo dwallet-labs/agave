@@ -61,16 +61,27 @@
 //! root after they complete, and signer sets when first seen. A store
 //! opened on the directory takes the blocks back in order, as if they were
 //! rooted again, dropping any that blockstore does not have as a root. It
-//! then serves the same proofs for them as before. Files are synced, so
-//! what was written before the latest root survives a power loss.
+//! then serves the same proofs for them as before.
+//!
+//! The thread that roots writes nothing: it queues the files for a thread
+//! of the store, which writes and syncs them in the same order
+//! ([`persist::DiskWriter`]). What that thread had written and synced
+//! survives a power loss; it is normally a root or two behind. If the disk
+//! falls thousands of files behind, new block files are not queued until
+//! it has caught up: those blocks are served from memory and are not there
+//! after a restart.
 //!
 //! - **History.** The kept history leaves are written too, so history
 //!   proofs reach as far back after a restart as before it. What is read
 //!   back is checked against the history frontier of a kept block before
 //!   it is used. If the node resumes after a gap (it starts from a snapshot
-//!   later than its last kept block), the leaves of the gap are missing
-//!   and the history restarts at the first new block: older blocks are
-//!   then served with their own certificates only.
+//!   later than its last kept block, or block files were not written), the
+//!   leaves of the gap are taken from blockstore: each block's id and the
+//!   commitment root in its footer, checked against the history of the
+//!   first new block. If blockstore does not have the blocks of the gap
+//!   (the node started from a snapshot made elsewhere), the history
+//!   restarts at the first new block: older blocks are then served with
+//!   their own certificates only.
 //! - **Accounts state.** The trees are not written: they are shared
 //!   between blocks and with the banks. Each block file has instead, for
 //!   every account the block changed, what the overlay held for it before
@@ -79,8 +90,10 @@
 //!   block, undoing each block's changes. Every state rebuilt this way is
 //!   checked against slot 5 of its block. A block is not reached if the
 //!   chain of kept blocks to it is broken, or if its generation ended
-//!   before the first bank after the restart (its base tree is then gone
-//!   as well); it answers "not kept" as before.
+//!   before the first bank after the restart; it answers "not kept" as
+//!   before. A generation ends once per epoch, at the switch slot, so this
+//!   concerns a restart within [`LightClientProofConfig::retained_blocks`]
+//!   blocks after a switch slot, and then only the kept blocks before it.
 //!
 //! A durable store would also cache the roots of complete history subtrees,
 //! so that a history proof does not rehash every kept leaf.
@@ -89,7 +102,8 @@
 //!
 //! Ingesting a rooted block takes the store's write lock briefly: what is
 //! read from the bank is read before, and the new history leaf is checked
-//! against the block's history frontier in `O(log n)`. Certificates have
+//! against the block's history frontier in `O(log n)`. Nothing is written
+//! to disk by the thread that roots. Certificates have
 //! their own lock. Queries copy what they need under the read lock and
 //! build proofs after releasing it: a history proof hashes every kept leaf
 //! after the base (`O(retained_history)`), an account state proof from the
@@ -146,7 +160,7 @@ use {
 
 mod persist;
 
-use persist::{BlockRecord, HistoryFiles, Persistence};
+use persist::{BlockRecord, DiskWriter, Job, Persistence};
 
 /// Default number of rooted blocks whose proof data is kept.
 pub const DEFAULT_RETAINED_BLOCKS: usize = 1024;
@@ -769,7 +783,8 @@ struct Inner {
 pub struct LightClientProofStore {
     config: LightClientProofConfig,
     blockstore: Arc<Blockstore>,
-    inner: RwLock<Inner>,
+    /// Shared with the thread that writes the files.
+    inner: Arc<RwLock<Inner>>,
     /// Certificates by slot, under their own lock: the consensus pool never
     /// waits for a query.
     certificates: Mutex<BTreeMap<Slot, SlotCertificates>>,
@@ -778,10 +793,11 @@ pub struct LightClientProofStore {
     unwritten_certificates: Mutex<BTreeSet<Slot>>,
     /// Slot of the oldest kept block (0: none yet).
     oldest_retained: AtomicU64,
-    persistence: Option<Persistence>,
-    /// What the history files hold. Taken by the thread that roots, never
-    /// while the store's lock is held for writing.
-    history_files: Mutex<HistoryFiles>,
+    /// The files, read at startup. `None`: the store keeps nothing on disk.
+    persistence: Option<Arc<Persistence>>,
+    /// The thread that writes the files. Nothing else writes them, so the
+    /// thread that roots never waits for the disk.
+    writer: Option<DiskWriter>,
     /// Blocks read back from disk may still get their accounts state from
     /// the first banks rooted after the restart.
     states_to_rebuild: AtomicBool,
@@ -789,24 +805,50 @@ pub struct LightClientProofStore {
 
 impl LightClientProofStore {
     pub fn new(config: LightClientProofConfig, blockstore: Arc<Blockstore>) -> Self {
-        let persistence = config.persist_dir.as_deref().and_then(Persistence::open);
+        let inner = Arc::<RwLock<Inner>>::default();
+        let persistence = config
+            .persist_dir
+            .as_deref()
+            .and_then(Persistence::open)
+            .map(Arc::new);
+        let writer = persistence
+            .as_ref()
+            .and_then(|persistence| DiskWriter::start(persistence.clone(), inner.clone()));
         let store = Self {
             config,
             blockstore,
-            inner: RwLock::default(),
+            inner,
             certificates: Mutex::default(),
             unwritten_certificates: Mutex::default(),
             oldest_retained: AtomicU64::new(0),
-            persistence,
-            history_files: Mutex::default(),
+            // Without the thread nothing is written, so nothing is read.
+            persistence: persistence.filter(|_| writer.is_some()),
+            writer,
             states_to_rebuild: AtomicBool::new(false),
         };
         store.load();
-        store.write_history();
-        if let Some(persistence) = &store.persistence {
-            persistence.sync_directories();
-        }
+        store.flush_writes();
         store
+    }
+
+    /// Queues `job` for the thread that writes the files, if there is one.
+    fn disk(&self, job: Job) {
+        if let Some(writer) = &self.writer {
+            writer.send(job);
+        }
+    }
+
+    /// Waits until everything the store has to write is on disk and
+    /// durable. Root handling never calls this.
+    pub fn flush_writes(&self) {
+        if let Some(writer) = &self.writer {
+            writer.flush();
+        }
+    }
+
+    /// Number of files not written because the disk was too far behind.
+    pub fn dropped_writes(&self) -> u64 {
+        self.writer.as_ref().map_or(0, DiskWriter::dropped)
     }
 
     /// Takes back what a store wrote to the directory before: the blocks in
@@ -838,7 +880,7 @@ impl LightClientProofStore {
                         "light-client proofs: kept block {slot} is not a root in blockstore, \
                          dropping it"
                     );
-                    persistence.remove_block(slot);
+                    self.disk(Job::RemoveBlock(slot));
                 }
                 is_root
             })
@@ -847,7 +889,7 @@ impl LightClientProofStore {
         // history they cover. Leaves after it are checked when the next
         // block is rooted, like any other.
         let (files, history) = persistence.load_history();
-        *self.history_files.lock().unwrap() = files;
+        self.disk(Job::HistoryFiles(files));
         if let Some((base, entries)) = history {
             let log = HistoryLog::from_parts(base, entries);
             let mismatch = records
@@ -968,26 +1010,44 @@ impl LightClientProofStore {
                 )
             })
             .collect();
-        // Files are written before the lock is taken: a query never waits
-        // for the disk.
-        if let Some(persistence) = &self.persistence {
+        // A gap between the kept history and the first new block (the node
+        // restarted from a snapshot later than its last kept block) is
+        // filled from blockstore, if the blocks are there.
+        let backfill = new_blocks.first().and_then(|(record, _)| {
+            self.history_gap_from_blockstore(record.block.slot, record.history.as_ref()?)
+        });
+        // The files are queued for the writer thread: neither this thread
+        // nor a query waits for the disk.
+        if self.writer.is_some() {
             for (record, signer_sets) in &new_blocks {
-                persistence.write_block(record);
+                self.disk(Job::Block(Box::new(record.clone())));
                 for (epoch, signers) in signer_sets {
-                    persistence.write_signer_set(*epoch, signers);
+                    self.disk(Job::SignerSet(*epoch, signers.clone()));
                 }
             }
             let unwritten = std::mem::take(&mut *self.unwritten_certificates.lock().unwrap());
             for slot in unwritten {
                 let certificates = self.certificates.lock().unwrap().get(&slot).cloned();
                 if let Some(certificates) = certificates {
-                    persistence.write_certificates(slot, &certificates);
+                    self.disk(Job::Certificates(slot, certificates));
                 }
             }
         }
         let ingested = !new_blocks.is_empty();
         if ingested {
             let mut inner = self.inner.write().unwrap();
+            if let Some((kept, leaves)) = backfill
+                && inner.history.len() == kept
+            {
+                info!(
+                    "light-client proofs: took {} history leaves from blockstore, from slot {:?}",
+                    leaves.len(),
+                    leaves.first().map(|(slot, ..)| *slot)
+                );
+                for (slot, block_id, commitment_root) in leaves {
+                    inner.history.push(slot, block_id, commitment_root);
+                }
+            }
             for (record, signer_sets) in new_blocks {
                 let BlockRecord {
                     block,
@@ -1010,43 +1070,67 @@ impl LightClientProofStore {
                 self.states_to_rebuild.store(false, Ordering::Relaxed);
             }
         }
-        if ingested {
-            self.write_history();
-        }
-        if let Some(persistence) = &self.persistence {
-            persistence.sync_directories();
-        }
+        // The history leaves are written from the store itself, after the
+        // files queued above.
+        self.disk(Job::Commit);
     }
 
-    /// Writes the history leaves that are not in the files yet.
-    fn write_history(&self) {
-        let Some(persistence) = &self.persistence else {
-            return;
-        };
-        let mut files = self.history_files.lock().unwrap();
-        let (restart, entries, base_len) = {
+    /// The history leaves between the kept history and `frontier`, the
+    /// history of the rooted block at `slot` before its own leaf, read from
+    /// blockstore: the blocks from the parent of `slot` back to the last
+    /// kept leaf, each with the commitment root its footer carries. With
+    /// them the kept history has exactly the root of `frontier`, or `None`
+    /// is returned: blockstore does not have every block of the gap (the
+    /// node started from a snapshot it did not make), or there is no gap.
+    ///
+    /// Returns the number of leaves the kept history had, and the leaves.
+    fn history_gap_from_blockstore(
+        &self,
+        slot: Slot,
+        frontier: &AppendOnlyFrontier,
+    ) -> Option<(u64, Vec<persist::HistoryEntry>)> {
+        let (kept, (last_slot, last_block_id, _), mut all) = {
             let inner = self.inner.read().unwrap();
             let history = &inner.history;
-            let from = files
-                .next
-                .checked_sub(history.base_len())
-                .and_then(|from| usize::try_from(from).ok())
-                .filter(|from| {
-                    files.restarts == history.restarts && *from <= history.entries.len()
-                });
-            match from {
-                Some(from) => (None, history.entries[from..].to_vec(), history.base_len()),
-                None => (
-                    Some((history.restarts, history.base.clone())),
-                    history.entries.clone(),
-                    history.base_len(),
-                ),
-            }
+            (
+                history.len(),
+                history.entries.last().copied()?,
+                history.all.clone(),
+            )
         };
-        if restart.is_none() && entries.is_empty() {
-            return;
+        let missing = frontier
+            .leaf_count()
+            .checked_sub(kept)
+            .filter(|missing| (1..=self.config.retained_history as u64).contains(missing))?;
+        let parent_of = |meta: &solana_ledger::blockstore_meta::SlotMeta| {
+            Some((meta.parent_slot?, meta.parent_block_id))
+        };
+        let mut at = parent_of(&self.blockstore.meta(slot).ok()??)?;
+        let mut leaves = Vec::new();
+        while at.0 > last_slot {
+            if leaves.len() as u64 >= missing {
+                return None;
+            }
+            let (meta, slot_meta) = self
+                .blockstore
+                .get_parent_repair_metadata(at.0, at.1)
+                .ok()??;
+            leaves.push((at.0, at.1, meta.footer_binding()?.commitment_root));
+            at = parent_of(&slot_meta)?;
         }
-        persistence.write_history(&mut files, restart, &entries, base_len);
+        if at != (last_slot, last_block_id) || leaves.len() as u64 != missing {
+            return None;
+        }
+        leaves.reverse();
+        for (slot, block_id, commitment_root) in &leaves {
+            all.append_leaf_hash(hash_leaf(
+                TreeId::BLOCK_HISTORY,
+                &history_leaf(*slot, block_id, commitment_root),
+            ))
+            .ok()?;
+        }
+        (all.root(TreeId::BLOCK_HISTORY) == frontier.root(TreeId::BLOCK_HISTORY))
+            .then_some((kept, leaves))
     }
 
     /// Gives the blocks read back from disk their accounts state: from the
@@ -1172,9 +1256,7 @@ impl LightClientProofStore {
                     inner.signatures.remove(&retained.receipt.signature);
                 }
             }
-            if let Some(persistence) = &self.persistence {
-                persistence.remove_block(slot);
-            }
+            self.disk(Job::RemoveBlock(slot));
         }
         if let Some(oldest) = inner.blocks.keys().next().copied() {
             self.oldest_retained.store(oldest, Ordering::Relaxed);
@@ -1183,16 +1265,14 @@ impl LightClientProofStore {
                 let kept = certificates.split_off(&oldest);
                 !std::mem::replace(&mut *certificates, kept).is_empty()
             };
-            if let Some(persistence) = self.persistence.as_ref().filter(|_| dropped) {
-                persistence.remove_certificates_before(oldest);
+            if dropped {
+                self.disk(Job::RemoveCertificatesBefore(oldest));
             }
         }
         inner.history.prune(self.config.retained_history.max(1));
         while inner.signer_sets.len() > RETAINED_SIGNER_SET_EPOCHS {
-            if let (Some((epoch, _)), Some(persistence)) =
-                (inner.signer_sets.pop_first(), &self.persistence)
-            {
-                persistence.remove_signer_set(epoch);
+            if let Some((epoch, _)) = inner.signer_sets.pop_first() {
+                self.disk(Job::RemoveSignerSet(epoch));
             }
         }
     }
@@ -1226,7 +1306,7 @@ impl LightClientProofStore {
         if slot < self.oldest_retained.load(Ordering::Relaxed) {
             return;
         }
-        if self.persistence.is_some() {
+        if self.writer.is_some() {
             self.unwritten_certificates.lock().unwrap().insert(slot);
         }
         let mut certificates = self.certificates.lock().unwrap();

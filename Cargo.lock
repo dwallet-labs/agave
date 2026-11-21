@@ -10219,6 +10219,7 @@ dependencies = [
  "libc",
  "libsecp256k1",
  "log",
+ "memmap2 0.9.12",
  "mockall",
  "num-derive 0.5.1",
  "num-traits",
