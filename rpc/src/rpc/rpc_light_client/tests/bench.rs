@@ -13,6 +13,13 @@
 //! that serves proofs); building the base tree of the accounts state;
 //! taking the block into the proof store; building each proof; and
 //! verifying each proof as a client. Sizes are those of the JSON answers.
+//!
+//! [`Mix::MainnetLike`] replaces the transfers by a block shaped like the
+//! mainnet blocks sampled in `measurements/`: about 410 transactions of
+//! which 36% fail, about 1,300 changed accounts, most of them accounts with
+//! data that already existed, calls into an on-chain program that makes
+//! nested calls and logs events, and an overlay that already holds the
+//! accounts changed earlier in the epoch.
 
 use {
     super::*,
@@ -37,6 +44,56 @@ enum Mode {
     Retain,
 }
 
+/// What the transactions of the measured block are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mix {
+    /// Each a transfer from its own payer to a new account.
+    Transfers,
+    /// Of every 25 transactions: 9 fail (5 transfers of more than the payer
+    /// has, 4 program calls that return an error), 5 call a program that
+    /// calls itself, then the system program, and logs three events, 6 pay
+    /// eight existing 165-byte accounts each, 3 create a 165-byte account,
+    /// and 2 are transfers to new accounts.
+    MainnetLike,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Transfer,
+    FailingTransfer,
+    FailingProgram,
+    Program,
+    MultiTransfer,
+    CreateAccount,
+}
+
+impl Mix {
+    fn kind(self, index: usize) -> Kind {
+        match (self, index % 25) {
+            (Mix::Transfers, _) => Kind::Transfer,
+            (_, 0..=4) => Kind::FailingTransfer,
+            (_, 5..=8) => Kind::FailingProgram,
+            (_, 9..=13) => Kind::Program,
+            (_, 14..=19) => Kind::MultiTransfer,
+            (_, 20..=22) => Kind::CreateAccount,
+            _ => Kind::Transfer,
+        }
+    }
+}
+
+/// Size of the data of the accounts the mix pays and creates: that of a
+/// token account.
+const DATA_LEN: usize = 165;
+/// Accounts paid by one transaction that pays several.
+const PAID_PER_TRANSACTION: usize = 8;
+
+/// An address spread like a hash, unlike `Pubkey::new_unique`.
+fn spread_pubkey() -> Pubkey {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Pubkey::from(solana_sha256_hasher::hashv(&[b"bench", &index.to_le_bytes()]).to_bytes())
+}
+
 struct Scenario {
     validators: usize,
     extra_accounts: usize,
@@ -45,6 +102,10 @@ struct Scenario {
     /// With a mode other than `Off`: the features that are active, or all
     /// six.
     only: Option<Vec<Pubkey>>,
+    mix: Mix,
+    /// Accounts changed earlier in the epoch: entries the overlay of the
+    /// accounts state already holds when the measured block is frozen.
+    overlay_entries: usize,
 }
 
 #[derive(Default)]
@@ -55,7 +116,11 @@ struct Measured {
     empty_freeze: Duration,
     proofs: Vec<(&'static str, Duration, usize, Duration)>,
     ingest: Duration,
+    /// From the end of `ingest` until the block is durable on disk.
+    durable: Duration,
     block_file_bytes: u64,
+    changed_accounts: usize,
+    failed: usize,
 }
 
 fn median(mut samples: Vec<Duration>) -> Duration {
@@ -87,6 +152,8 @@ fn run(scenario: &Scenario) -> Measured {
         transfers,
         mode,
         ref only,
+        mix,
+        overlay_entries,
     } = *scenario;
     let mut measured = Measured::default();
 
@@ -133,7 +200,32 @@ fn run(scenario: &Scenario) -> Measured {
     // limited.
     let extra = AccountSharedData::from(system_account(1_000_000_000));
     for _ in 0..extra_accounts {
-        bank0.store_account(&Pubkey::new_unique(), &extra);
+        bank0.store_account(&spread_pubkey(), &extra);
+    }
+    // For the mix: the program, and the accounts with data that are paid.
+    let data_owner = Pubkey::new_unique();
+    let data_account_lamports = genesis_config.rent.minimum_balance(DATA_LEN);
+    let mut paid: Vec<Pubkey> = Vec::new();
+    let mut program = Pubkey::default();
+    if mix == Mix::MainnetLike {
+        program = create_program_with_elf(
+            &bank0,
+            &bpf_loader_upgradeable::id(),
+            &Pubkey::default(),
+            RECEIPT_TEST_PROGRAM,
+        );
+        let data_account = AccountSharedData::from(solana_account::Account {
+            lamports: data_account_lamports,
+            data: vec![1; DATA_LEN],
+            owner: data_owner,
+            ..solana_account::Account::default()
+        });
+        paid = (0..transfers * PAID_PER_TRANSACTION)
+            .map(|_| spread_pubkey())
+            .collect();
+        for address in &paid {
+            bank0.store_account(address, &data_account);
+        }
     }
     goto_end_of_slot(bank0.clone());
     bank0.freeze();
@@ -148,29 +240,119 @@ fn run(scenario: &Scenario) -> Measured {
     let bank64 = new_child(&bank1, 64);
     freeze_and_store(&blockstore, &bank64);
     let bank96 = new_child(&bank64, 96);
+    for _ in 0..overlay_entries {
+        bank96.store_account(&spread_pubkey(), &extra);
+    }
     freeze_and_store(&blockstore, &bank96);
     measured.base_tree = base_start.elapsed();
 
     // The measured block.
     let bank100 = new_child(&bank96, 100);
-    let recipients: Vec<Pubkey> = (0..transfers).map(|_| Pubkey::new_unique()).collect();
+    let blockhash = bank100.last_blockhash();
+    let mut recipients: Vec<Pubkey> = Vec::with_capacity(transfers);
     let transactions: Vec<Transaction> = payers
         .iter()
-        .zip(&recipients)
-        .map(|(payer, recipient)| {
-            system_transaction::transfer(payer, recipient, 1_000_000_000, bank100.last_blockhash())
+        .enumerate()
+        .map(|(index, payer)| {
+            let paid = |offset: usize| paid[index * PAID_PER_TRANSACTION + offset];
+            let program_call = |data: &[u8]| {
+                let instruction = Instruction::new_with_bytes(
+                    program,
+                    data,
+                    vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new(paid(0), false),
+                        AccountMeta::new_readonly(system_program::id(), false),
+                        AccountMeta::new_readonly(program, false),
+                    ],
+                );
+                Transaction::new_signed_with_payer(
+                    &[instruction],
+                    Some(&payer.pubkey()),
+                    &[payer],
+                    blockhash,
+                )
+            };
+            let (recipient, transaction) = match mix.kind(index) {
+                Kind::Transfer => {
+                    let recipient = Pubkey::new_unique();
+                    let transaction =
+                        system_transaction::transfer(payer, &recipient, 1_000_000_000, blockhash);
+                    (recipient, transaction)
+                }
+                // More than the payer has.
+                Kind::FailingTransfer => {
+                    let recipient = Pubkey::new_unique();
+                    let transaction = system_transaction::transfer(
+                        payer,
+                        &recipient,
+                        1_000_000_000_000,
+                        blockhash,
+                    );
+                    (recipient, transaction)
+                }
+                Kind::Program => (paid(0), program_call(&[0, 0xaa, 0xbb])),
+                Kind::FailingProgram => (paid(0), program_call(&[2])),
+                Kind::MultiTransfer => {
+                    let instructions: Vec<_> = (0..PAID_PER_TRANSACTION)
+                        .map(|offset| {
+                            solana_system_interface::instruction::transfer(
+                                &payer.pubkey(),
+                                &paid(offset),
+                                1_000_000,
+                            )
+                        })
+                        .collect();
+                    let transaction = Transaction::new_signed_with_payer(
+                        &instructions,
+                        Some(&payer.pubkey()),
+                        &[payer],
+                        blockhash,
+                    );
+                    (paid(0), transaction)
+                }
+                Kind::CreateAccount => {
+                    let created = Keypair::new();
+                    let instruction = solana_system_interface::instruction::create_account(
+                        &payer.pubkey(),
+                        &created.pubkey(),
+                        data_account_lamports,
+                        DATA_LEN as u64,
+                        &data_owner,
+                    );
+                    let transaction = Transaction::new_signed_with_payer(
+                        &[instruction],
+                        Some(&payer.pubkey()),
+                        &[payer, &created],
+                        blockhash,
+                    );
+                    (created.pubkey(), transaction)
+                }
+            };
+            recipients.push(recipient);
+            transaction
         })
         .collect();
     let start = Instant::now();
     let results = bank100.process_transactions(transactions.iter());
     measured.execute = start.elapsed();
-    assert!(results.iter().all(|result| result.is_ok()));
+    let expected_failures = (0..transfers)
+        .filter(|index| {
+            matches!(
+                mix.kind(*index),
+                Kind::FailingTransfer | Kind::FailingProgram
+            )
+        })
+        .count();
+    measured.failed = results.iter().filter(|result| result.is_err()).count();
+    assert_eq!(measured.failed, expected_failures, "{results:?}");
     // Registers the remaining ticks (the same work in every mode) and
     // freezes the bank.
     let start = Instant::now();
     goto_end_of_slot(bank100.clone());
     measured.freeze = start.elapsed();
     store_frozen(&blockstore, &bank100);
+    measured.changed_accounts = bank100.accounts_delta().map_or(0, |delta| delta.len());
     assert_eq!(bank100.commitment_failure(), None);
     assert_eq!(bank100.commitment_root().is_some(), mode != Mode::Off);
 
@@ -203,9 +385,14 @@ fn run(scenario: &Scenario) -> Measured {
         blockstore.clone(),
     );
     store.on_rooted_banks(&[bank1.clone(), bank64.clone(), bank96.clone()]);
+    // The files of the earlier blocks are not part of what is timed.
+    store.flush_writes();
     let start = Instant::now();
     store.on_rooted_banks(std::slice::from_ref(&bank100));
     measured.ingest = start.elapsed();
+    let start = Instant::now();
+    store.flush_writes();
+    measured.durable = start.elapsed();
     measured.block_file_bytes = std::fs::metadata(directory.join("blocks").join("100"))
         .unwrap()
         .len();
@@ -250,7 +437,10 @@ fn run(scenario: &Scenario) -> Measured {
     );
 
     if transfers > 0 {
-        let middle = transfers / 2;
+        // A transfer that succeeds, near the middle of the block.
+        let middle = (transfers / 2..transfers)
+            .find(|index| mix.kind(*index) == Kind::Transfer)
+            .expect("a transfer in the second half of the block");
         let signature = transactions[middle].signatures[0];
         let signature_bytes: [u8; 64] = signature.into();
         let (build, json) = timed(RUNS, || {
@@ -439,6 +629,8 @@ fn bench_light_client_block_cost() {
                         transfers,
                         mode,
                         only: None,
+                        mix: Mix::Transfers,
+                        overlay_entries: 0,
                     })
                 })
                 .collect();
@@ -464,12 +656,15 @@ fn bench_light_client_proofs_by_block_size() {
             transfers,
             mode: Mode::Retain,
             only: None,
+            mix: Mix::Transfers,
+            overlay_entries: 0,
         });
         print_proofs(
             &format!(
-                "{transfers} transfers, 3 validators: taking the block into the store {} ms, \
-                 {} bytes on disk",
+                "{transfers} transfers, 3 validators: taking the block into the store {} ms \
+                 on the thread that roots, durable {} ms later, {} bytes on disk",
                 ms(measured.ingest),
+                ms(measured.durable),
                 measured.block_file_bytes
             ),
             &measured,
@@ -488,6 +683,8 @@ fn bench_light_client_accounts() {
             transfers: 100,
             mode: Mode::Retain,
             only: None,
+            mix: Mix::Transfers,
+            overlay_entries: 0,
         });
         print_proofs(
             &format!(
@@ -511,6 +708,8 @@ fn bench_light_client_validators() {
             transfers: 100,
             mode: Mode::Retain,
             only: None,
+            mix: Mix::Transfers,
+            overlay_entries: 0,
         });
         print_proofs(&format!("{validators} validators"), &measured);
     }
@@ -567,6 +766,8 @@ fn bench_light_client_cost_by_feature() {
                     transfers: 5_000,
                     mode,
                     only: Some(only.clone()),
+                    mix: Mix::Transfers,
+                    overlay_entries: 0,
                 })
             })
             .collect();
@@ -578,4 +779,68 @@ fn bench_light_client_cost_by_feature() {
             ms(pick(|m| m.empty_freeze)),
         );
     }
+}
+
+/// A block shaped like a mainnet block (see [`Mix::MainnetLike`]): its cost
+/// with the features off, on, and on with the proof data kept, then its
+/// proofs. 100,000 more accounts exist, and the overlay holds a million
+/// accounts changed earlier in the epoch.
+#[test]
+#[ignore = "measurement; run in release mode"]
+fn bench_light_client_mainnet_like_block() {
+    use feature_set::accounts_state_root;
+    let scenario = |mode, only: Option<Vec<Pubkey>>, overlay_entries| Scenario {
+        validators: 3,
+        extra_accounts: 100_000,
+        transfers: 410,
+        mode,
+        only,
+        mix: Mix::MainnetLike,
+        overlay_entries,
+    };
+    let without_state: Vec<Pubkey> = all_features()
+        .into_iter()
+        .filter(|feature| *feature != accounts_state_root::id())
+        .collect();
+    let cases = [
+        ("off", Mode::Off, None, 1_000_000),
+        ("drafts 1 to 5", Mode::On, Some(without_state), 1_000_000),
+        ("all six, empty overlay", Mode::On, None, 0),
+        ("all six", Mode::On, None, 1_000_000),
+        ("all six, proof data kept", Mode::Retain, None, 1_000_000),
+    ];
+    println!(
+        "\n| features | transactions | failed | changed accounts | execute ms | end of slot + \
+         freeze ms | same, empty block ms |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    let mut retained = None;
+    for (name, mode, only, overlay_entries) in cases {
+        let runs: Vec<Measured> = (0..5)
+            .map(|_| run(&scenario(mode, only.clone(), overlay_entries)))
+            .collect();
+        let pick = |f: fn(&Measured) -> Duration| median(runs.iter().map(f).collect());
+        println!(
+            "| {name} | 410 | {} | {} | {} | {} | {} |",
+            runs[0].failed,
+            runs[0].changed_accounts,
+            ms(pick(|m| m.execute)),
+            ms(pick(|m| m.freeze)),
+            ms(pick(|m| m.empty_freeze)),
+        );
+        if mode == Mode::Retain {
+            retained = runs.into_iter().next();
+        }
+    }
+    let measured = retained.expect("the last mode");
+    print_proofs(
+        &format!(
+            "mainnet-like block: taking the block into the store {} ms on the thread that \
+             roots, durable {} ms later, {} bytes on disk",
+            ms(measured.ingest),
+            ms(measured.durable),
+            measured.block_file_bytes
+        ),
+        &measured,
+    );
 }

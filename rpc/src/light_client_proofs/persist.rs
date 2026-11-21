@@ -15,13 +15,21 @@
 //! root. A new segment starts every [`HISTORY_SEGMENT_LEN`] leaves, and a
 //! segment is removed when every leaf in it is older than the kept history.
 //!
+//! Nothing is written by the thread that roots: it queues what is to be
+//! written and a thread of the store writes it ([`DiskWriter`]), in the
+//! same order. A node whose disk falls far behind stops queueing new files
+//! until it catches up, and says so; the history leaves are still written,
+//! in one piece, once it has.
+//!
 //! The accounts state of a block (trees shared between blocks in memory)
 //! is not written. A block file has instead what stepping back from the
 //! state after the block to the state before it needs, see
 //! [`super::StateRecord`].
 
 use {
-    super::{ActiveFeatures, GenerationRecord, RetainedBlock, SlotCertificates, StateRecord},
+    super::{
+        ActiveFeatures, GenerationRecord, Inner, RetainedBlock, SlotCertificates, StateRecord,
+    },
     log::warn,
     solana_bls_signatures::Signature as BlsSignature,
     solana_clock::{Epoch, Slot},
@@ -48,7 +56,12 @@ use {
         fs,
         io::{self, Write},
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex, RwLock,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread::JoinHandle,
     },
 };
 
@@ -93,6 +106,7 @@ fn history_leaf_hash((slot, block_id, commitment_root): &HistoryEntry) -> Hash {
 
 /// A rooted block as written: what the store keeps of it, and what
 /// ingesting it again needs.
+#[derive(Clone)]
 pub(super) struct BlockRecord {
     pub block: RetainedBlock,
     /// `H(B)`: the block history before the block's own leaf.
@@ -480,6 +494,187 @@ impl Persistence {
             self.remove(HISTORY, files.segments.remove(0));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The thread that writes.
+
+/// Files queued beyond this number are not written: the disk is far behind
+/// (at one block and a few certificates per root, more than half an hour).
+const MAX_QUEUED_JOBS: usize = 16_384;
+
+/// The writer makes what it wrote durable when it has nothing left to do,
+/// and at the latest after this many jobs.
+const MAX_JOBS_PER_COMMIT: usize = 256;
+
+/// One thing for the writer to do.
+pub(super) enum Job {
+    Block(Box<BlockRecord>),
+    SignerSet(Epoch, Arc<Vec<Signer>>),
+    Certificates(Slot, SlotCertificates),
+    RemoveBlock(Slot),
+    RemoveCertificatesBefore(Slot),
+    RemoveSignerSet(Epoch),
+    /// What the history files hold, as read at startup.
+    HistoryFiles(HistoryFiles),
+    /// Brings the history files up to date with the store and syncs the
+    /// directories: what was queued before is then durable.
+    Commit,
+    /// As `Commit`, now, then answers.
+    Flush(mpsc::Sender<()>),
+}
+
+/// The thread that writes the files of the store, and the queue to it.
+pub(super) struct DiskWriter {
+    sender: Option<mpsc::Sender<Job>>,
+    thread: Option<JoinHandle<()>>,
+    /// Jobs queued and not taken yet.
+    queued: Arc<AtomicUsize>,
+    /// Files not written because the queue was full.
+    dropped: AtomicU64,
+}
+
+impl DiskWriter {
+    /// Starts the thread. `None`, with a warning, if it cannot be started.
+    pub fn start(persistence: Arc<Persistence>, inner: Arc<RwLock<Inner>>) -> Option<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let thread = std::thread::Builder::new()
+            .name("solLcProofWrtr".to_string())
+            .spawn({
+                let queued = queued.clone();
+                move || write_jobs(&persistence, &inner, receiver, &queued)
+            })
+            .map_err(|err| {
+                warn!(
+                    "light-client proofs: cannot start the writer thread: {err}; proof data \
+                     will not survive a restart"
+                )
+            })
+            .ok()?;
+        Some(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+            queued,
+            dropped: AtomicU64::new(0),
+        })
+    }
+
+    /// Queues `job`. Never waits for the disk. A file to write is dropped
+    /// if the queue is full; removals and commits are always queued.
+    pub fn send(&self, job: Job) {
+        let is_file = matches!(
+            job,
+            Job::Block(_) | Job::SignerSet(..) | Job::Certificates(..)
+        );
+        if is_file && self.queued.load(Ordering::Relaxed) >= MAX_QUEUED_JOBS {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed);
+            if dropped.is_multiple_of(1024) {
+                warn!(
+                    "light-client proofs: the disk is {MAX_QUEUED_JOBS} files behind; not \
+                     writing new ones until it catches up ({} dropped). The blocks are served \
+                     from memory, and are not kept across a restart.",
+                    dropped.saturating_add(1)
+                );
+            }
+            return;
+        }
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        if sender.send(job).is_err() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Waits until everything queued so far is written and durable.
+    pub fn flush(&self) {
+        let (done, wait) = mpsc::channel();
+        self.send(Job::Flush(done));
+        let _ = wait.recv();
+    }
+
+    /// Number of files not written because the disk was too far behind.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for DiskWriter {
+    /// Lets the thread write what is queued, and waits for it.
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn write_jobs(
+    persistence: &Persistence,
+    inner: &RwLock<Inner>,
+    receiver: mpsc::Receiver<Job>,
+    queued: &AtomicUsize,
+) {
+    let mut files = HistoryFiles::default();
+    let mut uncommitted = 0usize;
+    let mut commit_asked = false;
+    for job in receiver {
+        let left = queued.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        uncommitted = uncommitted.saturating_add(1);
+        match job {
+            Job::Block(record) => persistence.write_block(&record),
+            Job::SignerSet(epoch, signers) => persistence.write_signer_set(epoch, &signers),
+            Job::Certificates(slot, certificates) => {
+                persistence.write_certificates(slot, &certificates)
+            }
+            Job::RemoveBlock(slot) => persistence.remove_block(slot),
+            Job::RemoveCertificatesBefore(oldest) => persistence.remove_certificates_before(oldest),
+            Job::RemoveSignerSet(epoch) => persistence.remove_signer_set(epoch),
+            Job::HistoryFiles(loaded) => files = loaded,
+            Job::Commit => commit_asked = true,
+            Job::Flush(done) => {
+                commit(persistence, inner, &mut files);
+                (uncommitted, commit_asked) = (0, false);
+                let _ = done.send(());
+            }
+        }
+        // Behind: one commit for all the roots queued.
+        if commit_asked && (left == 0 || uncommitted >= MAX_JOBS_PER_COMMIT) {
+            commit(persistence, inner, &mut files);
+            (uncommitted, commit_asked) = (0, false);
+        }
+    }
+    if uncommitted > 0 {
+        commit(persistence, inner, &mut files);
+    }
+}
+
+/// Writes the history leaves of the store that are not in the files yet,
+/// and makes everything written so far durable.
+fn commit(persistence: &Persistence, inner: &RwLock<Inner>, files: &mut HistoryFiles) {
+    let (restart, entries, base_len) = {
+        let inner = inner.read().unwrap();
+        let history = &inner.history;
+        let from = files
+            .next
+            .checked_sub(history.base_len())
+            .and_then(|from| usize::try_from(from).ok())
+            .filter(|from| files.restarts == history.restarts && *from <= history.entries.len());
+        match from {
+            Some(from) => (None, history.entries[from..].to_vec(), history.base_len()),
+            None => (
+                Some((history.restarts, history.base.clone())),
+                history.entries.clone(),
+                history.base_len(),
+            ),
+        }
+    };
+    if restart.is_some() || !entries.is_empty() {
+        persistence.write_history(files, restart, &entries, base_len);
+    }
+    persistence.sync_directories();
 }
 
 // ---------------------------------------------------------------------------
@@ -927,4 +1122,71 @@ fn decode_certificates(reader: &mut Reader) -> Option<SlotCertificates> {
         fast_finalize: list(reader, CertificateKind::FastFinalize)?,
         finalize: reader.option(|reader| decode_certificate(reader, CertificateKind::Finalize))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signers(stake: u64) -> Arc<Vec<Signer>> {
+        Arc::new(vec![Signer {
+            bls_pubkey_compressed: [7; 48],
+            stake,
+            vote_pubkey: [9; 32],
+        }])
+    }
+
+    /// The writer does its jobs in the order they were queued, a flush
+    /// waits for all of them, and dropping the writer writes what is left.
+    #[test]
+    fn test_writer_order_flush_and_drop() {
+        let directory = solana_ledger::get_tmp_ledger_path!();
+        let persistence = Arc::new(Persistence::open(&directory).unwrap());
+        let writer = DiskWriter::start(persistence.clone(), Arc::default()).unwrap();
+        for epoch in 0..200 {
+            writer.send(Job::SignerSet(epoch, signers(epoch)));
+        }
+        // Written again, then removed: the removal is last.
+        writer.send(Job::SignerSet(5, signers(55)));
+        writer.send(Job::RemoveSignerSet(7));
+        writer.send(Job::Commit);
+        writer.flush();
+        let loaded = persistence.load_signer_sets();
+        assert_eq!(loaded.len(), 199);
+        assert!(loaded.iter().all(|(epoch, _)| *epoch != 7));
+        assert_eq!(loaded[5].1[0].stake, 55);
+        assert_eq!(writer.dropped(), 0);
+
+        writer.send(Job::SignerSet(1_000, signers(1)));
+        drop(writer);
+        assert_eq!(persistence.load_signer_sets().len(), 200);
+    }
+
+    /// With the queue full, new files are not queued; removals and commits
+    /// are, and files are queued again once the disk has caught up.
+    #[test]
+    fn test_writer_drops_files_when_far_behind() {
+        let directory = solana_ledger::get_tmp_ledger_path!();
+        let persistence = Arc::new(Persistence::open(&directory).unwrap());
+        let writer = DiskWriter::start(persistence.clone(), Arc::default()).unwrap();
+        writer.send(Job::SignerSet(1, signers(1)));
+        writer.send(Job::SignerSet(2, signers(2)));
+        writer.flush();
+
+        // As if the thread had not taken anything for a long time.
+        writer.queued.fetch_add(MAX_QUEUED_JOBS, Ordering::Relaxed);
+        writer.send(Job::SignerSet(3, signers(3)));
+        writer.send(Job::RemoveSignerSet(1));
+        assert_eq!(writer.dropped(), 1);
+        writer.queued.fetch_sub(MAX_QUEUED_JOBS, Ordering::Relaxed);
+        writer.send(Job::SignerSet(4, signers(4)));
+        writer.flush();
+        let epochs: Vec<_> = persistence
+            .load_signer_sets()
+            .into_iter()
+            .map(|(epoch, _)| epoch)
+            .collect();
+        assert_eq!(epochs, [2, 4]);
+        assert_eq!(writer.dropped(), 1);
+    }
 }

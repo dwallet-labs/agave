@@ -1241,6 +1241,14 @@ fn test_finality_proof_before_block_is_in_blockstore() {
     assert_eq!(rpc.finality(160).slot, 160);
 }
 
+/// What a node that stops does: the files queued are written before the
+/// store goes. Waiting here, not for the drop, because the RPC handlers of
+/// the test still hold the store.
+fn close(store: Arc<LightClientProofStore>) {
+    store.flush_writes();
+    drop(store);
+}
+
 /// A store that writes to a directory, and a second store opened on it (a
 /// restarted node): the second serves the same proofs without having seen
 /// a bank or a certificate, except account state proofs, and goes on from
@@ -1321,7 +1329,7 @@ fn test_proof_store_survives_restart() {
         .rpc(&store)
         .call::<Value>("getAccountStateProof", json!([mint, {"slot": 160}]))
         .unwrap();
-    drop(store);
+    close(store);
 
     // The restarted store: the same answers.
     let restarted = open();
@@ -1350,7 +1358,7 @@ fn test_proof_store_survives_restart() {
     rpc.call::<Value>("getAccountStateProof", json!([mint, {"slot": 161}]))
         .unwrap();
     restarted.on_rooted_banks(&[]);
-    drop(restarted);
+    close(restarted);
 
     // A second restart, keeping two blocks: the older files are removed,
     // and a file cut short is skipped.
@@ -1372,7 +1380,7 @@ fn test_proof_store_survives_restart() {
     assert_eq!(small_rpc.finality(160).slot, 160);
     let (code, _) = small_rpc.error("getFinalityProof", json!([96]));
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
-    drop(small);
+    close(small);
 
     // A kept block that blockstore does not have as a root is dropped.
     let other_ledger = solana_ledger::get_tmp_ledger_path!();
@@ -1380,6 +1388,101 @@ fn test_proof_store_survives_restart() {
     let empty = LightClientProofStore::new(config.clone(), other);
     assert_eq!(empty.highest_root(), None);
     assert!(!block_file(160).exists());
+}
+
+/// A node that restarts from a snapshot later than its last kept block has
+/// a gap in its history. If its blockstore has the blocks of the gap, the
+/// leaves are taken from there and the history goes on: blocks from before
+/// the gap, and the blocks of the gap, are still proven from a new block.
+#[test]
+fn test_history_gap_is_filled_from_blockstore() {
+    let chain = build_chain();
+    let directory = solana_ledger::get_tmp_ledger_path!();
+    let config = LightClientProofConfig {
+        persist_dir: Some(directory.clone()),
+        ..LightClientProofConfig::default()
+    };
+    let open = || {
+        Arc::new(LightClientProofStore::new(
+            config.clone(),
+            chain.blockstore.clone(),
+        ))
+    };
+    let banks = |slots: std::ops::RangeInclusive<Slot>| -> Vec<Arc<Bank>> {
+        chain
+            .banks
+            .range(slots)
+            .map(|(_, bank)| bank.clone())
+            .collect()
+    };
+    // The node kept the blocks up to 66, then stopped.
+    let store = open();
+    store.on_rooted_banks(&banks(62..=66));
+    close(store);
+
+    // It starts again from a snapshot at 130: the first bank it roots is
+    // 160. Blocks 96, 100 and 130 were never given to the store.
+    let restarted = open();
+    assert_eq!(restarted.highest_root(), Some(66));
+    restarted.on_rooted_banks(&banks(160..=160));
+    let set2 = SignerSet::new(2, chain.bank(100).validator_set_signers(2).unwrap()).unwrap();
+    let keys2 = keypairs_by_rank(&chain.validators, &set2);
+    restarted.on_certificate(&fast_certificate(chain.bank(160), &keys2));
+    let rpc = chain.rpc(&restarted);
+    let client = LightClient::new(
+        chain.genesis_config.epoch_schedule.clone(),
+        SHRED_VERSION,
+        set2,
+    );
+    let v160 = rpc.finality(160).verify(&client, 160).unwrap();
+    // A block from before the gap, and one of the gap.
+    for slot in [65, 66, 96, 100, 130] {
+        let response: RpcBlockHistoryProof = rpc
+            .call("getBlockHistoryProof", json!([slot, 160]))
+            .unwrap();
+        let history = BlockHistoryResponse::try_from(&response).unwrap();
+        let ancestor = client.verify_ancestor(&v160, &history.history).unwrap();
+        assert_eq!(
+            *ancestor.commitment_root(),
+            chain.bank(slot).commitment_root().unwrap()
+        );
+    }
+    // A block kept before the gap is final through 160.
+    let finality66 = rpc.finality(66);
+    assert!(matches!(finality66.finality, Finality::Descendant(_)));
+    finality66.verify(&client, 66).unwrap();
+    // The blocks of the gap have history leaves but no kept data.
+    let (code, _) = rpc.error("getFinalityProof", json!([100]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
+    close(restarted);
+
+    // The leaves taken from blockstore were written with the others.
+    let again = open();
+    let rpc = chain.rpc(&again);
+    let response: RpcBlockHistoryProof =
+        rpc.call("getBlockHistoryProof", json!([100, 160])).unwrap();
+    assert_eq!(response.history.slot, 100);
+
+    // Without the blocks in blockstore the history restarts, as before: a
+    // ledger that has 160 as a root and nothing of the gap.
+    let other_directory = solana_ledger::get_tmp_ledger_path!();
+    let other_config = LightClientProofConfig {
+        persist_dir: Some(other_directory),
+        ..LightClientProofConfig::default()
+    };
+    let other_ledger = solana_ledger::get_tmp_ledger_path!();
+    let other = Arc::new(Blockstore::open(&other_ledger).unwrap());
+    other.set_roots([62, 65, 66, 160].iter()).unwrap();
+    let store = LightClientProofStore::new(other_config.clone(), other.clone());
+    store.on_rooted_banks(&banks(62..=66));
+    store.flush_writes();
+    drop(store);
+    let restarted = LightClientProofStore::new(other_config, other);
+    restarted.on_rooted_banks(&banks(160..=160));
+    assert!(matches!(
+        restarted.block_history_proof(65, 160),
+        Err(LightClientProofError::DataNotAvailable { .. })
+    ));
 }
 
 /// After a restart the store rebuilds the accounts state of the blocks it
@@ -1456,7 +1559,7 @@ fn test_accounts_state_and_history_after_restart() {
     let (code, _) = chain.rpc(&store).error("getFinalityProof", json!([65]));
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
     let history_before = [history(&store, 65).unwrap(), history(&store, 162).unwrap()];
-    drop(store);
+    close(store);
 
     // Restarted: the history is as deep as before. No accounts state yet.
     let restarted = open();
@@ -1486,7 +1589,7 @@ fn test_accounts_state_and_history_after_restart() {
         json!([absent.to_string(), {"slot": 160}]),
     );
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED);
-    drop(restarted);
+    close(restarted);
 
     // Restarted again, with only the bank of the latest block: every
     // earlier state is rebuilt from records written by the store above.
@@ -1494,7 +1597,7 @@ fn test_accounts_state_and_history_after_restart() {
     assert_eq!(again.highest_root(), Some(164));
     again.on_rooted_banks(std::slice::from_ref(&bank164));
     assert_eq!(states(&again), states_before);
-    drop(again);
+    close(again);
 
     // A history segment that was changed on disk is not used: the history
     // then starts again at the oldest kept block.
