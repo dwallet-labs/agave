@@ -923,6 +923,86 @@ fn test_base_job_is_run_again_after_a_failure() {
     assert!(attempts.load(Ordering::Relaxed) < BASE_JOB_ATTEMPTS);
 }
 
+/// A base whose job failed for good is rebuilt in the background by a scan,
+/// started by the next block frozen in the epoch, long before the switch
+/// slot. The block at the switch slot then finds it ready, with the root
+/// the reference gives.
+#[test]
+fn test_failed_base_job_is_replaced_by_a_background_scan() {
+    let (mut h, bank0) = Harness::new(
+        EpochSchedule::custom(SLOTS_PER_EPOCH, SLOTS_PER_EPOCH, false),
+        Some(true),
+    );
+    let mut parent = bank0;
+    for slot in [1, 63, 64, 70] {
+        let bank = h.child(&parent, slot);
+        h.transfer(&bank, &Pubkey::new_unique(), LAMPORTS_PER_SOL);
+        h.freeze(&bank);
+        parent = bank;
+    }
+    let state = parent.accounts_state().unwrap();
+    let cell = state.generation(1).unwrap().base().clone();
+    let root = cell.wait_root().unwrap();
+    cell.fail_for_tests("injected");
+    assert!(cell.wait_root().is_err());
+
+    // The next block: the scan is started, and reported once.
+    let bank71 = h.child(&parent, 71);
+    h.transfer(&bank71, &Pubkey::new_unique(), LAMPORTS_PER_SOL);
+    h.freeze(&bank71);
+    assert_eq!(cell.wait_root(), Ok(root));
+    let state = bank71.accounts_state().unwrap();
+    assert!(
+        bank71
+            .report_base_problems(state.generations(), 96)
+            .is_empty()
+    );
+
+    // It is not started twice: a second failure is reported, and left to
+    // the block that needs the base.
+    cell.fail_for_tests("injected again");
+    let problems = bank71.report_base_problems(state.generations(), 96);
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].1.ends_with("injected again"), "{problems:?}");
+    assert!(cell.wait_root().is_err());
+    let bank96 = h.child(&bank71, 96);
+    h.freeze(&bank96);
+    assert_eq!(cell.wait_root(), Ok(root));
+}
+
+/// A base whose job is still running a quarter of the epoch in is reported
+/// by the block frozen then, once, and not at or after the switch slot.
+#[test]
+fn test_late_base_is_reported_once() {
+    let (mut h, bank0) = Harness::new(
+        EpochSchedule::custom(SLOTS_PER_EPOCH, SLOTS_PER_EPOCH, false),
+        Some(true),
+    );
+    let mut parent = bank0;
+    let mut banks = HashMap::new();
+    for slot in [1, 63, 64, 79, 80, 81, 96] {
+        let bank = h.child(&parent, slot);
+        h.freeze(&bank);
+        banks.insert(slot, bank.clone());
+        parent = bank;
+    }
+    // The generation of epoch 1 with a base whose job has not finished.
+    let pending = banks[&64]
+        .accounts_state()
+        .unwrap()
+        .with_pending_bases_for_tests();
+    let report = |slot: Slot| banks[&slot].report_base_problems(pending.generations(), 96);
+    // Epoch 1 is slots 64 to 127; its base is needed from slot 96.
+    assert!(report(64).is_empty());
+    assert!(report(79).is_empty());
+    assert!(report(96).is_empty());
+    let problems = report(80);
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].0.epoch, 1);
+    assert!(problems[0].1.contains("still running"), "{problems:?}");
+    assert!(report(81).is_empty());
+}
+
 /// Neither the state nor any base job exists while the feature is inactive,
 /// and slot 5 is zero.
 #[test]
