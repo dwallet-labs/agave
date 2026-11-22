@@ -1295,6 +1295,107 @@ mod tests {
         }])
     }
 
+    /// An ended overlay is read back as it was written; a file that is not
+    /// whole is not used; a newer generation replaces the file.
+    #[test]
+    fn test_ended_overlay_file() {
+        let directory = solana_ledger::get_tmp_ledger_path!();
+        let persistence = Persistence::open(&directory).unwrap();
+        let mut overlay = new_overlay();
+        for i in 0..1000u64 {
+            let key = solana_sha256_hasher::hash(&i.to_le_bytes()).to_bytes();
+            overlay.insert(key, [i as u8; OVERLAY_VALUE_LEN]);
+        }
+        let ended = EndedOverlay {
+            base: BaseId {
+                epoch: 5,
+                parent: Some((319, Hash::new_unique())),
+            },
+            as_of: 351,
+            overlay: overlay.clone(),
+        };
+        persistence.write_ended_overlay(&ended);
+        let header = EndedOverlayHeader {
+            base: ended.base,
+            as_of: 351,
+            entries: 1000,
+        };
+        assert_eq!(persistence.ended_overlays(), [header]);
+        let loaded = persistence.load_ended_overlay(5).unwrap();
+        assert_eq!(loaded.root(), overlay.root());
+
+        // Cut short: not used.
+        let path = persistence.path(ENDED_OVERLAYS, 5);
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(persistence.ended_overlays().is_empty());
+        assert!(persistence.load_ended_overlay(5).is_none());
+        fs::write(&path, &bytes).unwrap();
+
+        // The next generation replaces it.
+        let next = EndedOverlay {
+            base: BaseId {
+                epoch: 6,
+                parent: None,
+            },
+            as_of: 415,
+            overlay: new_overlay(),
+        };
+        persistence.write_ended_overlay(&next);
+        let headers = persistence.ended_overlays();
+        assert_eq!(headers.len(), 1);
+        assert_eq!((headers[0].base, headers[0].entries), (next.base, 0));
+        assert!(persistence.load_ended_overlay(6).unwrap().is_empty());
+    }
+
+    /// Time and size of an ended overlay at a realistic number of entries.
+    /// Run with `--ignored --nocapture`; `ENDED_OVERLAY_BENCH_ENTRIES` sets
+    /// the size.
+    #[test]
+    #[ignore]
+    fn bench_ended_overlay_file() {
+        let entries: u64 = std::env::var("ENDED_OVERLAY_BENCH_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5_000_000);
+        let directory = solana_ledger::get_tmp_ledger_path!();
+        let persistence = Persistence::open(&directory).unwrap();
+        let mut overlay = new_overlay();
+        for i in 0..entries {
+            let key = solana_sha256_hasher::hash(&i.to_le_bytes()).to_bytes();
+            overlay.insert(key, [i as u8; OVERLAY_VALUE_LEN]);
+        }
+        let root = overlay.root();
+        let ended = EndedOverlay {
+            base: BaseId {
+                epoch: 5,
+                parent: None,
+            },
+            as_of: 1,
+            overlay,
+        };
+        let start = std::time::Instant::now();
+        persistence.write_ended_overlay(&ended);
+        let write = start.elapsed();
+        let size = fs::metadata(persistence.path(ENDED_OVERLAYS, 5))
+            .unwrap()
+            .len();
+        drop(ended);
+        let start = std::time::Instant::now();
+        let loaded = persistence.load_ended_overlay(5).unwrap();
+        let read = start.elapsed();
+        let start = std::time::Instant::now();
+        assert_eq!(loaded.root(), root);
+        println!(
+            "{entries} entries: {} MB, written in {:.1} s, read back in {:.1} s, hashed in {:.1} s",
+            size / 1_000_000,
+            write.as_secs_f64(),
+            read.as_secs_f64(),
+            start.elapsed().as_secs_f64(),
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
     /// The writer does its jobs in the order they were queued, a flush
     /// waits for all of them, and dropping the writer writes what is left.
     #[test]
