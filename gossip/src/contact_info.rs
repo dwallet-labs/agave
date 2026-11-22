@@ -111,8 +111,11 @@ pub struct ContactInfo {
     // All sockets have a unique key and a valid IP address index.
     #[wincode(with = "wincode::containers::Vec<SocketEntry, short_vec::ShortU16>")]
     sockets: Vec<SocketEntry>,
-    #[wincode(with = "wincode::containers::Vec<Extension, short_vec::ShortU16>")]
-    extensions: Vec<Extension>,
+    // Kept as received, with the records of types this build does not
+    // know: the signature of a contact info covers them, so a node that
+    // dropped them could no longer verify it.
+    #[wincode(with = "wincode::containers::Vec<TlvRecord, short_vec::ShortU16>")]
+    extensions: Vec<TlvRecord>,
     // Only sanitized socket-addrs can be cached!
     #[wincode(skip(default_val = EMPTY_SOCKET_ADDR_CACHE))]
     cache: [SocketAddr; SOCKET_CACHE_SIZE],
@@ -137,8 +140,12 @@ define_tlv_enum!(
     ///
     /// On the wire each record is: [type: u8][len: varint][bytes]
     /// Extensions with unknown types are skipped by tlv::parse,
-    /// so new types can be added without breaking legacy code,
-    /// and support by all clients is not required.
+    /// and ContactInfo keeps their records as received.
+    ///
+    /// A new type is NOT safe to publish on a cluster with nodes of a
+    /// build that drops unknown records when it reads a contact info:
+    /// such a node checks the signature over what it kept, and rejects
+    /// the whole contact info.
     ///
     /// Always add new TLV records to the end of this enum.
     /// Never reorder or reuse a type.
@@ -170,7 +177,6 @@ struct ContactInfoLite {
     addrs: Vec<IpAddr>,
     #[wincode(with = "wincode::containers::Vec<SocketEntry, short_vec::ShortU16>")]
     sockets: Vec<SocketEntry>,
-    #[allow(dead_code)]
     #[wincode(with = "wincode::containers::Vec<TlvRecord, short_vec::ShortU16>")]
     extensions: Vec<TlvRecord>,
 }
@@ -302,17 +308,19 @@ impl ContactInfo {
     /// address, so that a node looking for one need not ask every RPC node.
     /// A node that says so is not trusted more for it.
     pub fn serves_light_client_proofs(&self) -> bool {
-        self.extensions
+        tlv::parse::<Extension>(&self.extensions)
             .iter()
             .any(|extension| matches!(extension, Extension::LightClientProofs(_)))
     }
 
     pub fn set_serves_light_client_proofs(&mut self, serves: bool) {
-        self.extensions
-            .retain(|extension| !matches!(extension, Extension::LightClientProofs(_)));
+        let marker = Extension::LightClientProofs(LIGHT_CLIENT_PROOFS_VERSION);
+        let Ok(record) = TlvRecord::try_from(&marker) else {
+            return;
+        };
+        self.extensions.retain(|other| other.typ != record.typ);
         if serves {
-            self.extensions
-                .push(Extension::LightClientProofs(LIGHT_CLIENT_PROOFS_VERSION));
+            self.extensions.push(record);
         }
     }
 
@@ -616,7 +624,7 @@ impl TryFrom<ContactInfoLite> for ContactInfo {
             version,
             addrs,
             sockets,
-            extensions: tlv::parse(&extensions),
+            extensions,
             cache: EMPTY_SOCKET_ADDR_CACHE,
         };
         // Populate node.cache.

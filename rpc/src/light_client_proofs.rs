@@ -155,7 +155,7 @@ use {
         Bank,
         accounts_state::{
             AccountsState, AccountsStateBases, AccountsStateProofError, BaseId, BaseWait,
-            Generation,
+            Generation, HeldBase,
         },
         block_commitment::CommitmentVector,
         transaction_receipts::RetainedReceipt,
@@ -859,6 +859,9 @@ pub struct LightClientProofStore {
     closing: Arc<AtomicBool>,
     /// The thread that reads back the overlay of an ended generation.
     ended_rebuild: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The base leaves of the ended generations, kept open since the node
+    /// started (see [`Self::hold_ended_bases`]).
+    held_bases: Mutex<Vec<HeldBase>>,
 }
 
 impl LightClientProofStore {
@@ -884,6 +887,7 @@ impl LightClientProofStore {
             writer,
             states_to_rebuild: AtomicBool::new(false),
             ended_rebuild: Mutex::default(),
+            held_bases: Mutex::default(),
             history_peers: RwLock::new(
                 config
                     .history_peers
@@ -1178,6 +1182,7 @@ impl LightClientProofStore {
             // a bank has been.
             if ingested {
                 self.states_to_rebuild.store(false, Ordering::Relaxed);
+                self.held_bases.lock().unwrap().clear();
             }
         }
         // The history leaves are written from the store itself, after the
@@ -1341,6 +1346,28 @@ impl LightClientProofStore {
             .ok();
     }
 
+    /// Keeps open the base leaves of the generations whose overlays this
+    /// store wrote when they ended. Called when the node starts, before it
+    /// replays blocks: the first bank of a new epoch removes the base
+    /// leaves of the generation that ended in the epoch before. A node
+    /// restarted shortly before that bank could otherwise replay it before
+    /// the store, which finds out at the first rooted block whether it
+    /// needs the leaves, has opened and read them (minutes at mainnet
+    /// size). They are let go once it knows. Returns how many are kept open.
+    pub fn hold_ended_bases(&self, bases: &AccountsStateBases) -> usize {
+        let Some(persistence) = &self.persistence else {
+            return 0;
+        };
+        let held: Vec<_> = persistence
+            .ended_overlays()
+            .into_iter()
+            .filter_map(|header| bases.hold_on_disk(header.base))
+            .collect();
+        let count = held.len();
+        *self.held_bases.lock().unwrap() = held;
+        count
+    }
+
     /// Sets where nodes to ask for history leaves are found when none is
     /// named in the configuration (see
     /// [`history_peer::gossip_history_peers`]).
@@ -1461,10 +1488,19 @@ impl LightClientProofStore {
         let Some(header) = header else {
             return;
         };
+        let held = {
+            let mut held = self.held_bases.lock().unwrap();
+            let position = held.iter().position(|held| held.id() == header.base);
+            position.map(|position| held.swap_remove(position))
+        };
         let (inner, persistence, bases) = (self.inner.clone(), persistence.clone(), bases.clone());
         let job = move || {
             let base_id = header.base;
-            let Some(base) = bases.open_from_disk(base_id) else {
+            let base = match held {
+                Some(held) => Some(bases.open_held(held)),
+                None => bases.open_from_disk(base_id),
+            };
+            let Some(base) = base else {
                 info!(
                     "light-client proofs: the base leaves of {base_id:?} are not on disk; the \
                      blocks kept from before slot {} stay without accounts state",
