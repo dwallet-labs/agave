@@ -1722,6 +1722,29 @@ fn test_history_from_a_peer() {
     }
     drop(node);
 
+    // No node is named: those the source gives are asked. With a named
+    // node, the source is not used.
+    let source_used = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let from_source = |named: Vec<Arc<dyn HistoryPeer>>| {
+        let store = Arc::new(LightClientProofStore::new(
+            LightClientProofConfig::default(),
+            Arc::new(Blockstore::open(&ledger_path).unwrap()),
+        ));
+        store.set_history_peers(named);
+        let (used, peer) = (source_used.clone(), honest.clone());
+        store.set_history_peer_source(Arc::new(move || {
+            used.store(true, std::sync::atomic::Ordering::Relaxed);
+            vec![peer.clone()]
+        }));
+        store.on_rooted_banks(std::slice::from_ref(chain.bank(160)));
+        store.finish_history_fetch();
+        history(&store, 66).unwrap();
+    };
+    from_source(vec![honest.clone()]);
+    assert!(!source_used.load(std::sync::atomic::Ordering::Relaxed));
+    from_source(vec![]);
+    assert!(source_used.load(std::sync::atomic::Ordering::Relaxed));
+
     // A node that keeps four leaves asks for the three before its own.
     let node = new_node(4, vec![honest]);
     node.finish_history_fetch();

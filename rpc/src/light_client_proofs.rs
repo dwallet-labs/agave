@@ -80,9 +80,10 @@
 //!   commitment root in its footer, checked against the history of the
 //!   first new block. If blockstore does not have the blocks of the gap
 //!   (the node started from a snapshot made elsewhere), the history
-//!   restarts at the first new block, and a thread of the store asks the
-//!   nodes of [`LightClientProofConfig::history_peers`] for the leaves
-//!   before it ([`history_peer`]). What a peer gives is used only if it
+//!   restarts at the first new block, and a thread of the store asks other
+//!   nodes for the leaves before it ([`history_peer`]): the nodes of
+//!   [`LightClientProofConfig::history_peers`], or, if none is named,
+//!   nodes that publish an RPC address in gossip. What a peer gives is used only if it
 //!   has exactly the history root of that block. Until then, and if no
 //!   peer gives them, older blocks are served with their own certificates
 //!   only.
@@ -175,8 +176,8 @@ mod persist;
 
 use {
     history_peer::{
-        FetchTarget, HistoryPeer, MAX_HISTORY_LEAVES_PER_REQUEST, RpcHistoryLeaf, RpcHistoryLeaves,
-        RpcHistoryPeer,
+        FetchTarget, HistoryPeer, HistoryPeerSource, MAX_HISTORY_LEAVES_PER_REQUEST,
+        RpcHistoryLeaf, RpcHistoryLeaves, RpcHistoryPeer,
     },
     persist::{BlockRecord, DiskWriter, EndedOverlay, Job, Persistence},
 };
@@ -202,7 +203,8 @@ pub struct LightClientProofConfig {
     pub persist_dir: Option<PathBuf>,
     /// JSON RPC URLs of nodes to ask for the history leaves this node does
     /// not have after it starts from a snapshot made elsewhere (see
-    /// [`history_peer`]). They are not trusted.
+    /// [`history_peer`]). They are not trusted. Empty: the nodes found
+    /// in gossip are asked.
     pub history_peers: Vec<String>,
 }
 
@@ -849,6 +851,8 @@ pub struct LightClientProofStore {
     states_to_rebuild: AtomicBool,
     /// The nodes asked for history leaves this node does not have.
     history_peers: RwLock<Vec<Arc<dyn HistoryPeer>>>,
+    /// Where to find nodes to ask when none is named above.
+    history_peer_source: RwLock<Option<HistoryPeerSource>>,
     /// The thread that asks them.
     history_fetch: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Set when the store is dropped: the threads of the store stop.
@@ -887,6 +891,7 @@ impl LightClientProofStore {
                     .map(|url| Arc::new(RpcHistoryPeer::new(url.clone())) as Arc<dyn HistoryPeer>)
                     .collect(),
             ),
+            history_peer_source: RwLock::default(),
             history_fetch: Mutex::default(),
             closing: Arc::default(),
             config,
@@ -1302,13 +1307,19 @@ impl LightClientProofStore {
         }
     }
 
-    /// Starts a thread that asks the history peers for the leaves before
-    /// `target`, if there are peers and no such thread is running.
+    /// Starts a thread that asks other nodes for the leaves before
+    /// `target`, if no such thread is running: the nodes named in the
+    /// configuration, or, if none is, those the peer source gives.
     fn fetch_history_from_peers(&self, target: FetchTarget) {
-        let peers = self.history_peers.read().unwrap().clone();
-        if peers.is_empty() {
-            return;
-        }
+        let named = self.history_peers.read().unwrap().clone();
+        let peers: HistoryPeerSource = if named.is_empty() {
+            match self.history_peer_source.read().unwrap().clone() {
+                Some(source) => source,
+                None => return,
+            }
+        } else {
+            Arc::new(move || named.clone())
+        };
         let mut thread = self.history_fetch.lock().unwrap();
         if thread.as_ref().is_some_and(|thread| !thread.is_finished()) {
             return;
@@ -1318,10 +1329,23 @@ impl LightClientProofStore {
         *thread = std::thread::Builder::new()
             .name("solLcProofHist".to_string())
             .spawn(move || {
-                history_peer::fetch_history(&inner, &peers, target, retained_history, &closing)
+                history_peer::fetch_history(
+                    &inner,
+                    peers.as_ref(),
+                    target,
+                    retained_history,
+                    &closing,
+                )
             })
             .map_err(|err| warn!("light-client proofs: cannot start a thread: {err}"))
             .ok();
+    }
+
+    /// Sets where nodes to ask for history leaves are found when none is
+    /// named in the configuration (see
+    /// [`history_peer::gossip_history_peers`]).
+    pub fn set_history_peer_source(&self, source: HistoryPeerSource) {
+        *self.history_peer_source.write().unwrap() = Some(source);
     }
 
     /// Replaces the nodes asked for history leaves.
@@ -1442,7 +1466,8 @@ impl LightClientProofStore {
             let base_id = header.base;
             let Some(base) = bases.open_from_disk(base_id) else {
                 info!(
-                    "light-client proofs: the base leaves of {base_id:?} are not on disk; the                      blocks kept from before slot {} stay without accounts state",
+                    "light-client proofs: the base leaves of {base_id:?} are not on disk; the \
+                     blocks kept from before slot {} stay without accounts state",
                     header.as_of.saturating_add(1)
                 );
                 return;

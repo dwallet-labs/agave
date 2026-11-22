@@ -10,12 +10,20 @@
 //! it gives, appended to the frontier it gives, must have exactly the
 //! history root of this node's own rooted block, or they are not used. A
 //! node that gives wrong leaves can only make the fetch fail.
+//!
+//! Which nodes are asked: those named in the configuration, if any.
+//! Otherwise the nodes that publish an RPC address in gossip, with this
+//! node's shred version ([`gossip_history_peers`]), as a node that
+//! downloads a snapshot finds its source. Most of them do not serve
+//! light-client proofs and answer with an error; a few are tried in each
+//! round.
 
 use {
     super::{HistoryLog, Inner, persist::HistoryEntry},
     log::*,
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
+    solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
     solana_light_client::{
         history_leaf,
@@ -77,17 +85,63 @@ pub trait HistoryPeer: Send + Sync {
     ) -> Result<RpcHistoryLeaves, String>;
 }
 
+/// Gives the nodes to ask, each time a round of asking starts.
+pub type HistoryPeerSource = Arc<dyn Fn() -> Vec<Arc<dyn HistoryPeer>> + Send + Sync>;
+
+/// Nodes found in gossip that are asked in one round.
+const GOSSIP_PEERS_PER_ROUND: usize = 16;
+
+/// Time a node named in the configuration has to answer.
+const NAMED_PEER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time a node found in gossip has to answer: most do not serve this.
+const GOSSIP_PEER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The nodes that publish an RPC address in gossip with this node's shred
+/// version: at most [`GOSSIP_PEERS_PER_ROUND`] of them per call, others on
+/// the next call.
+pub fn gossip_history_peers(cluster_info: Arc<ClusterInfo>) -> HistoryPeerSource {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    Arc::new(move || {
+        let shred_version = cluster_info.my_shred_version();
+        let mut urls: Vec<String> = cluster_info
+            .rpc_peers()
+            .into_iter()
+            .filter(|node| node.shred_version() == shred_version)
+            .filter_map(|node| Some(format!("http://{}", node.rpc()?)))
+            .collect();
+        // The order gossip gives changes; a sorted list is walked in turn.
+        urls.sort_unstable();
+        urls.dedup();
+        let count = urls.len().min(GOSSIP_PEERS_PER_ROUND);
+        let start = next.fetch_add(count, Ordering::Relaxed);
+        (0..count)
+            .map(|offset| {
+                let url = urls[start.wrapping_add(offset) % urls.len()].clone();
+                Arc::new(RpcHistoryPeer::with_timeout(url, GOSSIP_PEER_TIMEOUT))
+                    as Arc<dyn HistoryPeer>
+            })
+            .collect()
+    })
+}
+
 /// A node reached over JSON RPC.
 pub struct RpcHistoryPeer {
     url: String,
+    timeout: Duration,
     /// Made by the thread that fetches, on first use.
     client: OnceLock<solana_rpc_client::rpc_client::RpcClient>,
 }
 
 impl RpcHistoryPeer {
     pub fn new(url: String) -> Self {
+        Self::with_timeout(url, NAMED_PEER_TIMEOUT)
+    }
+
+    pub fn with_timeout(url: String, timeout: Duration) -> Self {
         Self {
             url,
+            timeout,
             client: OnceLock::new(),
         }
     }
@@ -108,7 +162,7 @@ impl HistoryPeer for RpcHistoryPeer {
             .get_or_init(|| {
                 solana_rpc_client::rpc_client::RpcClient::new_with_timeout(
                     self.url.clone(),
-                    Duration::from_secs(30),
+                    self.timeout,
                 )
             })
             .send(
@@ -232,18 +286,19 @@ fn splice(
     true
 }
 
-/// Asks the peers, in turn, for the leaves before the target frontier,
-/// until one gives them. Runs on a thread of the store.
+/// Asks the peers `peers` gives, in turn, for the leaves before the target
+/// frontier, until one gives them. `peers` is called once per round. Runs
+/// on a thread of the store.
 pub(super) fn fetch_history(
     inner: &RwLock<Inner>,
-    peers: &[Arc<dyn HistoryPeer>],
+    peers: &(dyn Fn() -> Vec<Arc<dyn HistoryPeer>> + Send + Sync),
     target: FetchTarget,
     retained_history: usize,
     exit: &AtomicBool,
 ) {
     let end = target.frontier.leaf_count();
     for round in 0..FETCH_ROUNDS {
-        for peer in peers {
+        for peer in &peers() {
             match fetch_from(peer.as_ref(), &target, exit) {
                 Ok((base, entries)) => {
                     let count = entries.len();
@@ -285,4 +340,61 @@ pub(super) fn fetch_history(
         "light-client proofs: no peer gave the history leaves before leaf {end}; blocks before \
          it are served with their own certificates only"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*, solana_gossip::contact_info::ContactInfo, solana_keypair::Keypair,
+        solana_net_utils::SocketAddrSpace, solana_signer::Signer, std::net::Ipv4Addr,
+    };
+
+    /// The gossip source gives the nodes with an RPC address and this
+    /// node's shred version, a bounded number per round, all of them over
+    /// the rounds.
+    #[test]
+    fn test_gossip_history_peers() {
+        let node = |shred_version: u16, rpc_port: Option<u16>| {
+            let mut info = ContactInfo::new(
+                Keypair::new().pubkey(),
+                solana_time_utils::timestamp(),
+                shred_version,
+            );
+            info.set_gossip((Ipv4Addr::LOCALHOST, 7000)).unwrap();
+            if let Some(port) = rpc_port {
+                info.set_rpc((Ipv4Addr::LOCALHOST, port)).unwrap();
+            }
+            info
+        };
+        let keypair = Arc::new(Keypair::new());
+        let mut own = node(7, Some(8899));
+        own.hot_swap_pubkey(keypair.pubkey());
+        let cluster_info = Arc::new(ClusterInfo::new(own, keypair, SocketAddrSpace::Unspecified));
+        let source = gossip_history_peers(cluster_info.clone());
+        assert!(source().is_empty());
+
+        // Not asked: no RPC address, another shred version.
+        cluster_info.insert_info(node(7, None));
+        cluster_info.insert_info(node(8, Some(9000)));
+        cluster_info.insert_info(node(7, Some(9001)));
+        cluster_info.insert_info(node(7, Some(9002)));
+        let names = |peers: Vec<Arc<dyn HistoryPeer>>| -> Vec<String> {
+            peers.iter().map(|peer| peer.name()).collect()
+        };
+        assert_eq!(
+            names(source()),
+            ["http://127.0.0.1:9001", "http://127.0.0.1:9002"]
+        );
+
+        // More nodes than one round asks: the next round goes on.
+        for port in 9003..9003 + 2 * GOSSIP_PEERS_PER_ROUND as u16 {
+            cluster_info.insert_info(node(7, Some(port)));
+        }
+        let source = gossip_history_peers(cluster_info);
+        let mut asked: Vec<String> = (0..3).flat_map(|_| names(source())).collect();
+        assert_eq!(asked.len(), 3 * GOSSIP_PEERS_PER_ROUND);
+        asked.sort_unstable();
+        asked.dedup();
+        assert_eq!(asked.len(), 2 * GOSSIP_PEERS_PER_ROUND + 2);
+    }
 }
