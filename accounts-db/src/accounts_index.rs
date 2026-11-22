@@ -374,6 +374,36 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         }
     }
 
+    /// [`Self::scan_accounts`] for the pubkeys of one bin of the index, so
+    /// that several threads can each scan bins of their own.
+    pub(crate) fn scan_accounts_in_bin<F>(
+        &self,
+        bin: usize,
+        ancestors: &Ancestors,
+        max_root: Slot,
+        mut func: F,
+        mut should_abort: impl FnMut() -> bool,
+    ) where
+        F: FnMut(&Pubkey, LockedSlotListItem<'_, T>),
+    {
+        let map = &self.account_maps[bin];
+        for pubkey in map.keys() {
+            map.get_internal_inner(&pubkey, |entry| {
+                if let Some(list) = entry {
+                    let list_r = &list.slot_list_read_lock();
+                    if let Some(index) = self.latest_slot(Some(ancestors), list_r, Some(max_root)) {
+                        func(&pubkey, list_r.locked_item(index));
+                    }
+                }
+                let add_to_in_mem_cache = false;
+                (add_to_in_mem_cache, ())
+            });
+            if should_abort() {
+                return;
+            }
+        }
+    }
+
     /// Returns the list of pubkeys from the secondary index for the given key.
     pub(crate) fn get_index_key_pubkeys(&self, index_key: &IndexKey) -> Vec<Pubkey> {
         match index_key {

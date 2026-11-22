@@ -441,63 +441,64 @@ const SCAN_BATCH: usize = 4096;
 /// generation as of `bank` (an empty overlay gives the state of `bank`
 /// itself).
 ///
-/// The accounts are read by one thread, as the accounts database gives
-/// them, and hashed in batches on the base threads. The leaves go through a
-/// sorter that spills to disk and from there to the file of each base, so
-/// what is held in memory does not grow with the number of accounts.
-///
-/// TODO(simd-accounts-state-root): the read itself is one thread. On mainnet
-/// it should go over the index bins in parallel, as the lattice hash check at
-/// startup does.
+/// The accounts are read and hashed on the base threads, each taking one
+/// bin of the accounts index at a time. The leaves go through a sorter that
+/// spills to disk, so memory does not grow with the number of accounts.
 fn scan_base_trees(
     bank: &Bank,
     dir: &BaseDir,
     bases: &[(BaseId, &OverlayTree)],
 ) -> Result<Vec<BaseTree>, String> {
-    let mut lt_hash = LtHash::identity();
-    let mut sorter = dir.sorter();
-    let mut failure: Option<String> = None;
-    let mut batch = Vec::with_capacity(SCAN_BATCH);
-    let mut hash_batch = |batch: &mut Vec<(Pubkey, _)>| {
-        let hash_one = |(address, account): &(Pubkey, _)| {
-            let account_lt_hash = AccountsDb::lt_hash_account(account, address);
-            (
-                address.to_bytes(),
-                lt_hash_prefix(&account_lt_hash.0),
-                account_lt_hash,
-            )
-        };
-        let hashed: Vec<_> = if batch.len() < SCAN_BATCH {
-            batch.iter().map(hash_one).collect()
-        } else {
-            on_base_pool(|| batch.par_iter().map(hash_one).collect())
-        };
-        batch.clear();
-        for (address, account_hash, account_lt_hash) in hashed {
-            lt_hash.mix_in(&account_lt_hash.0);
+    // What one thread gathers from one bin of the accounts index.
+    struct Part {
+        leaves: Vec<(Address, Hash)>,
+        lt_hash: LtHash,
+    }
+    let sorter = Mutex::new((dir.sorter(), None::<String>));
+    let lt_hash = Mutex::new(LtHash::identity());
+    let give_leaves = |leaves: &mut Vec<(Address, Hash)>| {
+        let mut guard = sorter.lock().unwrap();
+        let (sorter, failure) = &mut *guard;
+        for (address, account_hash) in leaves.drain(..) {
             if failure.is_none()
                 && let Err(err) = sorter.push(&address, &account_hash)
             {
-                failure = Some(format!("cannot sort the scanned accounts: {err}"));
+                *failure = Some(format!("cannot sort the scanned accounts: {err}"));
             }
         }
     };
-    bank.scan_all_accounts(|item| {
-        if let Some((address, account, _slot)) = item
-            && account.lamports() != 0
-        {
-            batch.push((*address, account));
-            if batch.len() == SCAN_BATCH {
-                hash_batch(&mut batch);
-            }
-        }
+    on_base_pool(|| {
+        bank.rc.accounts.scan_all_by_bin(
+            &bank.ancestors,
+            bank.bank_id(),
+            || Part {
+                leaves: Vec::new(),
+                lt_hash: LtHash::identity(),
+            },
+            |part, address, account, _slot| {
+                if account.lamports() == 0 {
+                    return;
+                }
+                let account_lt_hash = AccountsDb::lt_hash_account(&account, address);
+                part.lt_hash.mix_in(&account_lt_hash.0);
+                part.leaves
+                    .push((address.to_bytes(), lt_hash_prefix(&account_lt_hash.0)));
+                if part.leaves.len() >= SCAN_BATCH {
+                    give_leaves(&mut part.leaves);
+                }
+            },
+            |mut part| {
+                give_leaves(&mut part.leaves);
+                lt_hash.lock().unwrap().mix_in(&part.lt_hash);
+            },
+        )
     })
     .map_err(|err| format!("scan of bank {} failed: {err}", bank.slot()))?;
-    hash_batch(&mut batch);
+    let (sorter, failure) = sorter.into_inner().unwrap();
     if let Some(failure) = failure {
         return Err(failure);
     }
-    if lt_hash != bank.accounts_lt_hash.lock().unwrap().0 {
+    if lt_hash.into_inner().unwrap() != bank.accounts_lt_hash.lock().unwrap().0 {
         return Err(format!(
             "the scanned state of bank {} does not match its accounts lattice hash",
             bank.slot()
