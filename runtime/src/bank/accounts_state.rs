@@ -390,7 +390,8 @@ impl AccountsStateBases {
     /// The base of `id` from the leaves this node has on disk, for a prover
     /// that serves blocks of a generation no bank holds any more: the cell
     /// some bank still holds, or a new one whose tree is read from the file
-    /// on a background thread. `None` if there is neither.
+    /// on a background thread. `None` if there is neither. The base of a
+    /// chain that starts at a block without a parent is empty.
     ///
     /// Nothing here says the file has the leaves of that base: the caller
     /// must check the root it gets against a commitment it trusts. The new
@@ -399,8 +400,14 @@ impl AccountsStateBases {
         if let Some(cell) = self.cells.lock().unwrap().get(&id).and_then(Weak::upgrade) {
             return Some(cell);
         }
-        let storage = self.dir.open(&id)?;
         let cell = Arc::new(BaseCell::new(id, None, false));
+        if id.parent.is_none() {
+            // A chain that starts at a block without a parent: its base
+            // state is empty, and has no file.
+            cell.finish(Ok(BaseTree::empty()));
+            return Some(cell);
+        }
+        let storage = self.dir.open(&id)?;
         spawn_base_job(vec![cell.clone()], move || {
             tree_from_storage(storage)
                 .map(|tree| vec![tree])
