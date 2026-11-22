@@ -144,6 +144,8 @@ fn serve_light_client_proofs(config: &mut ValidatorConfig) {
     // `default_for_test` has the full RPC API.
     assert!(config.rpc_config.full_api);
     config.rpc_config.enable_light_client_proofs = true;
+    // Every node of these clusters is this build.
+    config.rpc_config.light_client_proof_gossip_marker = true;
     // Ground truth: getTransaction, getBlock.
     config.rpc_config.enable_rpc_transaction_history = true;
     // Log messages, to compare events with.
@@ -2491,8 +2493,11 @@ fn test_light_client_restart_from_snapshot() {
 /// that generation ended and from the base leaves on disk.
 ///
 /// Epochs have 160 slots: generation 1 is used from slot 240 to slot 399,
-/// and its base leaves stay on disk until epoch 3 starts at slot 480. The
-/// node is stopped between the two.
+/// and a node removes its base leaves when it replays the first block of
+/// epoch 3, at slot 480. The node is stopped between the two, and started
+/// again only when the cluster is past slot 480, so how long it was down
+/// does not matter: the leaves are still on its disk when it starts, and
+/// it opens them then, before it replays slot 480 while it catches up.
 #[test]
 #[serial]
 fn test_light_client_restart_after_switch_slot() {
@@ -2537,8 +2542,8 @@ fn test_light_client_restart_after_switch_slot() {
     let program_hash = hash_of(&tc.program, &program_account.unwrap());
 
     // The node is stopped as soon as it has rooted a block after the switch
-    // slot: 76 slots (30 seconds) before the base leaves of generation 1
-    // are removed. No snapshot is waited for: on restart the node replays
+    // slot, 76 slots (30 seconds) before it would remove the base leaves of
+    // generation 1. No snapshot is waited for: on restart the node replays
     // its own ledger from its latest snapshot, whichever that is, up to
     // its last root, and the banks it has from there on hold generation 2
     // only.
@@ -2551,6 +2556,8 @@ fn test_light_client_restart_after_switch_slot() {
         rooted_before + 8 < BASE_REMOVED,
         "the node was stopped too late for this test (slot {rooted_before})"
     );
+    // The rest of the cluster goes on into epoch 3.
+    wait_for_finalized(&rpc, BASE_REMOVED + 8);
     let finalized_before = finalized_slot(&rpc);
     tc.cluster
         .restart_node(&pubkey, info, SocketAddrSpace::Unspecified);
