@@ -17,7 +17,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
-    agave_snapshots::snapshot_archive_info::SnapshotArchiveInfoGetter,
+    agave_snapshots::{SnapshotArchiveKind, snapshot_archive_info::SnapshotArchiveInfoGetter},
     bitvec::{order::Lsb0, vec::BitVec},
     log::*,
     serial_test::serial,
@@ -25,6 +25,7 @@ use {
     solana_clock::{Epoch, Slot},
     solana_commitment_config::CommitmentConfig,
     solana_core::validator::ValidatorConfig,
+    solana_download_utils::download_snapshot_archive,
     solana_genesis_config::GenesisConfig,
     solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction},
@@ -66,6 +67,7 @@ use {
         custom_error::{
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BASE_TREE_NOT_READY,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL,
+            JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_CERTIFICATES_NOT_AVAILABLE,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
             JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_FEATURE_INACTIVE,
@@ -133,6 +135,12 @@ fn light_client_validator_config() -> ValidatorConfig {
     let mut config = ValidatorConfig::default_for_test();
     // As in test_alpenglow_nodes_basic: all nodes start together.
     config.wait_for_supermajority = Some(0);
+    serve_light_client_proofs(&mut config);
+    config
+}
+
+/// Makes a node with `config` serve light-client proofs.
+fn serve_light_client_proofs(config: &mut ValidatorConfig) {
     // `default_for_test` has the full RPC API.
     assert!(config.rpc_config.full_api);
     config.rpc_config.enable_light_client_proofs = true;
@@ -140,7 +148,6 @@ fn light_client_validator_config() -> ValidatorConfig {
     config.rpc_config.enable_rpc_transaction_history = true;
     // Log messages, to compare events with.
     config.rpc_config.enable_extended_tx_metadata_storage = true;
-    config
 }
 
 /// Starts an Alpenglow cluster of `stakes.len()` validators with these
@@ -165,6 +172,17 @@ fn start_cluster_with_accounts(
     validator_configs: Vec<ValidatorConfig>,
     genesis_accounts: Vec<(Pubkey, AccountSharedData)>,
 ) -> TestCluster {
+    start_cluster_with_epochs(stakes, validator_configs, genesis_accounts, SLOTS_PER_EPOCH)
+}
+
+/// As [`start_cluster_with_accounts`], with epochs of `slots_per_epoch`
+/// slots.
+fn start_cluster_with_epochs(
+    stakes: &[u64],
+    validator_configs: Vec<ValidatorConfig>,
+    genesis_accounts: Vec<(Pubkey, AccountSharedData)>,
+    slots_per_epoch: u64,
+) -> TestCluster {
     let num_nodes = stakes.len();
     let node_keys: Vec<_> = (0..num_nodes)
         .map(|i| ValidatorKeys {
@@ -177,8 +195,8 @@ fn start_cluster_with_accounts(
         validator_configs,
         validator_keys: Some(node_keys.iter().cloned().map(|keys| (keys, true)).collect()),
         node_stakes: stakes.to_vec(),
-        slots_per_epoch: SLOTS_PER_EPOCH,
-        stakers_slot_offset: SLOTS_PER_EPOCH,
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
         skip_warmup_slots: true,
         poh_config: PohConfig {
             target_tick_duration: PohConfig::default().target_tick_duration,
@@ -2347,7 +2365,8 @@ fn test_light_client_restart_from_snapshot() {
         }
     }
     info!(
-        "after the restart: the accounts state of {states_served} of those blocks is served,          and of {ended_served} of the {} blocks of the generation that ended",
+        "after the restart: the accounts state of {states_served} of those blocks is served, \
+         and of {ended_served} of the {} blocks of the generation that ended",
         ended_served + ended_not_served
     );
     info!(
@@ -2463,6 +2482,328 @@ fn test_light_client_restart_from_snapshot() {
         BASE_TREE_NOT_READY.load(Ordering::Relaxed),
         verifier.through_descendant
     );
+    info!("test took {:?}", started.elapsed());
+}
+
+/// A node restarted just after a switch slot. The banks it has after the
+/// restart no longer hold the generation that the blocks before the switch
+/// slot use; it serves their account states from the overlay it wrote when
+/// that generation ended and from the base leaves on disk.
+///
+/// Epochs have 160 slots: generation 1 is used from slot 240 to slot 399,
+/// and its base leaves stay on disk until epoch 3 starts at slot 480. The
+/// node is stopped between the two.
+#[test]
+#[serial]
+fn test_light_client_restart_after_switch_slot() {
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
+    let started = Instant::now();
+    const EPOCH: u64 = 160;
+    const FIRST_USE: Slot = EPOCH + EPOCH / 2;
+    const SWITCH: Slot = 2 * EPOCH + EPOCH / 2;
+    const BASE_REMOVED: Slot = 3 * EPOCH;
+    let stakes: Vec<u64> = [8, 5, 4, 3]
+        .into_iter()
+        .map(|units| units * DEFAULT_NODE_STAKE)
+        .collect();
+    const RESTARTED: usize = 3;
+    let snapshot_config = setup_snapshot_validator_config(NonZeroU64::new(16).unwrap(), 1);
+    let mut validator_configs =
+        make_identical_validator_configs(&light_client_validator_config(), stakes.len());
+    validator_configs[RESTARTED].snapshot_config =
+        snapshot_config.validator_config.snapshot_config.clone();
+    validator_configs[RESTARTED].validator_exit_backpressure = snapshot_config
+        .validator_config
+        .validator_exit_backpressure
+        .clone();
+    let mut tc = start_cluster_with_epochs(&stakes, validator_configs, vec![], EPOCH);
+    let schedule = tc.epoch_schedule().clone();
+    let rpc = tc.rpc(0);
+    let mut verifier = Verifier::from_genesis(tc.genesis_config());
+
+    // A transfer in a block that uses generation 1, before the switch slot.
+    wait_for_finalized(&rpc, 2 * EPOCH + 4);
+    let mint = tc.cluster.funding_keypair.insecure_clone();
+    let recipient = Keypair::new().pubkey();
+    let blockhash = rpc.get_latest_blockhash().unwrap();
+    let t0 = tc.send(
+        &rpc,
+        &system_transaction::transfer(&mint, &recipient, 1_000_000, blockhash),
+    );
+    assert!(t0.slot < SWITCH, "the transfer landed in slot {}", t0.slot);
+    let (_, account) = finalized_account(&rpc, &recipient);
+    let recipient_hash = hash_of(&recipient, &account.unwrap());
+    let (_, program_account) = finalized_account(&rpc, &tc.program);
+    let program_hash = hash_of(&tc.program, &program_account.unwrap());
+
+    // A snapshot at or after the switch slot, then the restart, before the
+    // base leaves of generation 1 are removed.
+    wait_for_finalized(&rpc, SWITCH + 2);
+    let snapshot = loop {
+        let snapshot = tc.cluster.wait_for_next_full_snapshot(
+            &snapshot_config
+                .validator_config
+                .snapshot_config
+                .full_snapshot_archives_dir,
+            Some(TIMEOUT),
+        );
+        if snapshot.slot() >= SWITCH {
+            break snapshot;
+        }
+    };
+    let pubkey = tc.node_pubkey(RESTARTED);
+    let rooted_before = finalized_slot(&tc.rpc(RESTARTED));
+    let info = tc.cluster.exit_node(&pubkey);
+    info!(
+        "snapshot of node {RESTARTED} at slot {}; it had finalized slot {rooted_before} when it \
+         was stopped",
+        snapshot.slot()
+    );
+    assert!(
+        rooted_before + 8 < BASE_REMOVED,
+        "the node was stopped too late for this test (slot {rooted_before})"
+    );
+    let finalized_before = finalized_slot(&rpc);
+    tc.cluster
+        .restart_node(&pubkey, info, SocketAddrSpace::Unspecified);
+    let rpc_restarted = tc.rpc(RESTARTED);
+    let first_new = wait_for(
+        format!("node {RESTARTED} to serve a finality proof after its restart"),
+        TIMEOUT,
+        || {
+            let finalized = rpc_restarted
+                .get_slot_with_commitment(CommitmentConfig::finalized())
+                .ok()?;
+            (finalized > finalized_before)
+                .then(|| {
+                    rooted_slots(&rpc_restarted, finalized_before + 1, finalized)
+                        .into_iter()
+                        .find(|slot| rpc_restarted.get_finality_proof(*slot).is_ok())
+                })
+                .flatten()
+        },
+    );
+    info!("node {RESTARTED} serves proofs again from slot {first_new}");
+
+    // The account state at a block before the switch slot, from the
+    // restarted node. It reads the ended generation back on a thread of its
+    // own, and says "not available" until that is done.
+    let state_after_restart = |address: &Pubkey, slot: Slot| {
+        let response = wait_for(
+            format!("the account state of {address} at {slot} after the restart"),
+            TIMEOUT,
+            || match rpc_restarted
+                .get_account_state_proof(address, RpcAccountStateProofConfig { slot: Some(slot) })
+            {
+                Ok(response) => Some(response),
+                Err(err) => match rpc_error(&err) {
+                    Some((
+                        JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE
+                        | JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BASE_TREE_NOT_READY,
+                        _,
+                    )) => None,
+                    _ => panic!("getAccountStateProof({address}, {slot}): {err}"),
+                },
+            },
+        );
+        AccountStateResponse::try_from(&response).unwrap()
+    };
+    // Every rooted block that uses generation 1.
+    let slots = rooted_slots(&rpc, FIRST_USE, SWITCH - 1);
+    assert!(slots.len() > 64, "{slots:?}");
+    for slot in &slots {
+        let block = verifier.verify_block(&rpc_restarted, *slot);
+        // An account unchanged since genesis: in the base tree.
+        let generation = state_after_restart(&tc.program, *slot)
+            .proof
+            .verify(&block, &tc.program, &program_hash)
+            .unwrap();
+        assert_eq!(generation, 1, "slot {slot}");
+    }
+    // An account changed in one of them: in the overlay.
+    let block = verifier.verify_block(&rpc_restarted, t0.slot);
+    let generation = state_after_restart(&recipient, t0.slot)
+        .proof
+        .verify(&block, &recipient, &recipient_hash)
+        .unwrap();
+    assert_eq!(generation, 1);
+    // And not there in the block before.
+    let before = *slots.iter().rev().find(|slot| **slot < t0.slot).unwrap();
+    let block = verifier.verify_block(&rpc_restarted, before);
+    state_after_restart(&recipient, before)
+        .proof
+        .verify_nonexistent(&block, &recipient)
+        .unwrap();
+    // The blocks of the generation in use since the switch slot too.
+    let block = verifier.verify_block(&rpc_restarted, snapshot.slot());
+    verify_state(
+        &rpc_restarted,
+        &schedule,
+        &block,
+        &recipient,
+        Some(&recipient_hash),
+    );
+    info!(
+        "after the restart: the accounts state of the {} blocks from {FIRST_USE} to {} is served \
+         from the ended generation",
+        slots.len(),
+        SWITCH - 1
+    );
+    info!("test took {:?}", started.elapsed());
+}
+
+/// A node that joins from a snapshot another node made. Its blockstore
+/// does not have the blocks before the snapshot, so it cannot build their
+/// history leaves itself: it finds the other nodes in gossip, asks them for
+/// the leaves, and then proves blocks from before its snapshot.
+#[test]
+#[serial]
+fn test_light_client_history_from_peers_after_snapshot_download() {
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
+    let started = Instant::now();
+    let stakes: Vec<u64> = [8, 5, 4]
+        .into_iter()
+        .map(|units| units * DEFAULT_NODE_STAKE)
+        .collect();
+    let source_snapshots = setup_snapshot_validator_config(NonZeroU64::new(40).unwrap(), 1);
+    let mut validator_configs =
+        make_identical_validator_configs(&light_client_validator_config(), stakes.len());
+    validator_configs[0].snapshot_config =
+        source_snapshots.validator_config.snapshot_config.clone();
+    validator_configs[0].validator_exit_backpressure = source_snapshots
+        .validator_config
+        .validator_exit_backpressure
+        .clone();
+    let mut tc = start_cluster_with(&stakes, validator_configs);
+    let rpc = tc.rpc(0);
+    let mut verifier = Verifier::from_genesis(tc.genesis_config());
+
+    // A transfer, then a snapshot after it.
+    let mint = tc.cluster.funding_keypair.insecure_clone();
+    let recipient = Keypair::new().pubkey();
+    let blockhash = rpc.get_latest_blockhash().unwrap();
+    let t0 = tc.send(
+        &rpc,
+        &system_transaction::transfer(&mint, &recipient, 1_000_000, blockhash),
+    );
+    let (block_t0, _, _) = verify_transaction(&mut verifier, &rpc, &t0);
+    let snapshot = loop {
+        let snapshot = tc.cluster.wait_for_next_full_snapshot(
+            &source_snapshots
+                .validator_config
+                .snapshot_config
+                .full_snapshot_archives_dir,
+            Some(TIMEOUT),
+        );
+        if snapshot.slot() > t0.slot + 8 {
+            break snapshot;
+        }
+    };
+    info!("snapshot of node 0 at slot {}", snapshot.slot());
+
+    // The new node: the snapshot is downloaded from node 0, as a validator
+    // that bootstraps does; no stake, no history peer named.
+    let mut joiner_snapshots = setup_snapshot_validator_config(NonZeroU64::new(40).unwrap(), 1);
+    let joiner_config = &mut joiner_snapshots.validator_config;
+    serve_light_client_proofs(joiner_config);
+    assert!(
+        joiner_config
+            .rpc_config
+            .light_client_proof_history_peers
+            .is_empty()
+    );
+    download_snapshot_archive(
+        &tc.cluster.entry_point_info.rpc().unwrap(),
+        &joiner_config.snapshot_config.full_snapshot_archives_dir,
+        &joiner_config
+            .snapshot_config
+            .incremental_snapshot_archives_dir,
+        (snapshot.slot(), *snapshot.hash()),
+        SnapshotArchiveKind::Full,
+        joiner_config
+            .snapshot_config
+            .maximum_full_snapshot_archives_to_retain,
+        joiner_config
+            .snapshot_config
+            .maximum_incremental_snapshot_archives_to_retain,
+        false,
+        &mut None,
+    )
+    .unwrap();
+    let joiner = tc.cluster.add_validator_listener(
+        joiner_config,
+        0,
+        &ValidatorKeys::new(),
+        true,
+        SocketAddrSpace::Unspecified,
+    );
+    let rpc_joiner = RpcClient::new_with_commitment(
+        format!(
+            "http://{}",
+            tc.cluster.validators[&joiner]
+                .info
+                .contact_info
+                .rpc()
+                .unwrap()
+        ),
+        CommitmentConfig::finalized(),
+    );
+
+    // A block the new node rooted itself.
+    let first_new = wait_for("the new node to serve a finality proof", TIMEOUT, || {
+        let finalized = rpc_joiner
+            .get_slot_with_commitment(CommitmentConfig::finalized())
+            .ok()?;
+        rooted_slots(&rpc_joiner, snapshot.slot() + 1, finalized)
+            .into_iter()
+            .find(|slot| rpc_joiner.get_finality_proof(*slot).is_ok())
+    });
+    // The signer sets of the epochs up to that block come from node 0: the
+    // new node does not have the blocks that commit to them.
+    let schedule = tc.epoch_schedule().clone();
+    while verifier.client.epoch() < schedule.get_epoch(first_new) {
+        verifier.advance_epoch(&rpc);
+    }
+    let block_new = verifier.verify_block(&rpc_joiner, first_new);
+    info!("the new node serves proofs from slot {first_new}");
+    // It never had the block of the transfer: no finality proof of its own.
+    assert!(t0.slot < snapshot.slot());
+    let err = rpc_joiner.get_finality_proof(t0.slot).unwrap_err();
+    assert!(
+        matches!(
+            rpc_error(&err),
+            Some((
+                JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_FINAL
+                    | JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_BLOCK_NOT_RETAINED,
+                _
+            ))
+        ),
+        "{err}"
+    );
+    // The block of the transfer, proven from the new block by the new
+    // node, with history leaves it took from the other nodes.
+    let response = wait_for(
+        "the new node to prove a block from before its snapshot",
+        TIMEOUT,
+        || match rpc_joiner.get_block_history_proof(t0.slot, first_new) {
+            Ok(response) => Some(response),
+            Err(err) => match rpc_error(&err) {
+                Some((JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE, _)) => None,
+                _ => panic!("getBlockHistoryProof({}, {first_new}): {err}", t0.slot),
+            },
+        },
+    );
+    let response = BlockHistoryResponse::try_from(&response).unwrap();
+    let ancestor = verifier
+        .client
+        .verify_ancestor(&block_new, &response.history)
+        .unwrap();
+    assert_eq!(ancestor.commitment_root(), block_t0.commitment_root());
+    // The same proof as a node that was there all along gives.
+    let from_node_0 =
+        BlockHistoryResponse::try_from(&rpc.get_block_history_proof(t0.slot, first_new).unwrap())
+            .unwrap();
+    assert_eq!(response.history, from_node_0.history);
     info!("test took {:?}", started.elapsed());
 }
 
