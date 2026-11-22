@@ -65,9 +65,13 @@
 //! `P` get different bases and forks with the same `P` share one job.
 //!
 //! A bank that must compute slot 5 with generation `E` (at or after
-//! `switch_slot(E)`) waits for its base. If the job failed, the bank rebuilds
-//! the base synchronously by a scan of its parent (verified the same way)
-//! and, if that fails too, has a [`CommitmentFailure`].
+//! `switch_slot(E)`) waits for its base. A job that fails is run again in
+//! the background, a few times with growing pauses, so that the half epoch
+//! it has is used. If it fails for good, the bank rebuilds the base
+//! synchronously by a scan of its parent (verified the same way) and, if
+//! that fails too, has a [`CommitmentFailure`]. A base whose job failed for
+//! good, or is still running a quarter of the epoch in, is logged once with
+//! a metric, well before a block needs it.
 //!
 //! # Cost
 //!
@@ -110,6 +114,7 @@ use {
         },
         keyed_tree::{Fork, Sequential},
     },
+    solana_metrics::datapoint_warn,
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
@@ -118,6 +123,7 @@ use {
             Arc, Condvar, LazyLock, Mutex, Weak,
             atomic::{AtomicBool, Ordering},
         },
+        time::Duration,
     },
 };
 
@@ -195,6 +201,8 @@ pub struct BaseCell {
     /// snapshot bank, started with its first child.
     from_snapshot: bool,
     rebuild_started: AtomicBool,
+    /// Set once this cell was reported as late or failed.
+    reported: AtomicBool,
 }
 
 impl std::fmt::Debug for BaseCell {
@@ -215,7 +223,23 @@ impl BaseCell {
             ready: Condvar::new(),
             from_snapshot,
             rebuild_started: AtomicBool::new(false),
+            reported: AtomicBool::new(false),
         }
+    }
+
+    /// Why an operator should look at this base now, if there is a reason
+    /// and it was not given before: its job failed for good, or (`late`)
+    /// its root is still not known well into the time it has. `None` for a
+    /// base whose root came with a snapshot: no block waits for it.
+    fn problem_to_report(&self, late: bool) -> Option<String> {
+        let problem = match &*self.state.lock().unwrap() {
+            BaseState::Failed(reason) => format!("its job failed: {reason}"),
+            BaseState::Pending if late && self.known_root.is_none() => {
+                "its job is still running".to_string()
+            }
+            _ => return None,
+        };
+        (!self.reported.swap(true, Ordering::Relaxed)).then_some(problem)
     }
 
     pub fn id(&self) -> BaseId {
@@ -359,7 +383,7 @@ impl AccountsStateBases {
     fn request(
         &self,
         id: BaseId,
-        job: impl FnOnce() -> Result<BaseTree, String> + Send + 'static,
+        mut job: impl FnMut() -> Result<BaseTree, String> + Send + 'static,
     ) -> Arc<BaseCell> {
         let mut cells = self.cells.lock().unwrap();
         if let Some(cell) = cells.get(&id).and_then(Weak::upgrade) {
@@ -405,8 +429,12 @@ impl AccountsStateBases {
             cell.finish(Ok(BaseTree::empty()));
             return Some(cell);
         }
-        let storage = self.dir.open(&id)?;
+        self.dir.open(&id)?;
+        let dir = self.dir.clone();
         spawn_base_job(vec![cell.clone()], move || {
+            let storage = dir
+                .open(&id)
+                .ok_or("the base leaves are no longer on disk")?;
             tree_from_storage(storage)
                 .map(|tree| vec![tree])
                 .map_err(|err| format!("{err:?}"))
@@ -423,33 +451,75 @@ impl AccountsStateBases {
     }
 }
 
+/// How many times a base job is run before its failure is final.
+const BASE_JOB_ATTEMPTS: u32 = 6;
+
+/// Time before a failed base job is run again; doubled after each failure
+/// (with six attempts, about five minutes of pauses in all).
+const BASE_JOB_RETRY_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(5)
+} else {
+    Duration::from_secs(10)
+};
+
 /// Runs `job` on a new thread and stores its trees in `cells`, in order.
+///
+/// A job that fails is run again after a pause, up to
+/// [`BASE_JOB_ATTEMPTS`] times, while a bank still holds one of the cells:
+/// a base is started half an epoch before a block needs it, and a failure
+/// that passes (a full disk, a read error) should not be left for that
+/// block to repair with a scan of every account. The cells stay pending
+/// until the job succeeds or the last attempt fails.
 fn spawn_base_job(
     cells: Vec<Arc<BaseCell>>,
-    job: impl FnOnce() -> Result<Vec<BaseTree>, String> + Send + 'static,
+    mut job: impl FnMut() -> Result<Vec<BaseTree>, String> + Send + 'static,
 ) {
     let thread_cells = cells.clone();
     let spawned = std::thread::Builder::new()
         .name("solAcctStBase".to_string())
         .spawn(move || {
-            let start = std::time::Instant::now();
-            let result = job();
-            let us = start.elapsed().as_micros();
-            match result {
-                Ok(trees) => {
-                    for (cell, tree) in thread_cells.iter().zip(trees) {
-                        info!(
-                            "accounts state base {:?}: {} leaves, root {}, computed in {us} us",
-                            cell.id,
-                            tree.len(),
-                            tree.root()
-                        );
-                        cell.finish(Ok(tree));
+            let ids: Vec<_> = thread_cells.iter().map(|cell| cell.id).collect();
+            let mut pause = BASE_JOB_RETRY_PAUSE;
+            for attempt in 1..=BASE_JOB_ATTEMPTS {
+                let start = std::time::Instant::now();
+                let result = job();
+                let us = start.elapsed().as_micros();
+                match result {
+                    Ok(trees) => {
+                        for (cell, tree) in thread_cells.iter().zip(trees) {
+                            info!(
+                                "accounts state base {:?}: {} leaves, root {}, computed in {us} \
+                                 us",
+                                cell.id,
+                                tree.len(),
+                                tree.root()
+                            );
+                            cell.finish(Ok(tree));
+                        }
+                        return;
                     }
-                }
-                Err(reason) => {
-                    for cell in &thread_cells {
-                        cell.finish(Err(reason.clone()));
+                    Err(reason) => {
+                        // Only this thread holds the cells: no bank will
+                        // ask for these bases.
+                        let abandoned =
+                            thread_cells.iter().all(|cell| Arc::strong_count(cell) == 1);
+                        if attempt == BASE_JOB_ATTEMPTS || abandoned {
+                            for cell in &thread_cells {
+                                cell.finish(Err(reason.clone()));
+                            }
+                            return;
+                        }
+                        warn!(
+                            "accounts state base {ids:?} failed (attempt {attempt} of \
+                             {BASE_JOB_ATTEMPTS}): {reason}; trying again in {pause:?}"
+                        );
+                        datapoint_warn!(
+                            "accounts_state_base_retry",
+                            ("epoch", ids.first().map_or(0, |id| id.epoch), i64),
+                            ("attempt", attempt, i64),
+                        );
+                        std::thread::sleep(pause);
+                        pause = pause.saturating_mul(2);
                     }
                 }
             }
@@ -902,7 +972,41 @@ impl Bank {
             .map(|(entry, before)| (entry.address, (*before, entry.account_hash)))
             .collect();
         update_overlays(&mut generations, &changes);
+        self.report_base_problems(&generations, switch);
         Ok(AccountsState { generations })
+    }
+
+    /// Logs, once per base, a base of this bank's epoch that will not be
+    /// ready in time: its job failed for good, or is still running a
+    /// quarter of the epoch in (the base is needed from `switch`, half of
+    /// the epoch in). The first block that needs a base that is not there
+    /// waits for it, or rebuilds it with a scan of every account.
+    fn report_base_problems(&self, generations: &[Generation], switch: Slot) {
+        let epoch = self.epoch();
+        let first_slot = self.epoch_schedule.get_first_slot_in_epoch(epoch);
+        let late_from = first_slot.saturating_add(switch.saturating_sub(first_slot) / 2);
+        if self.slot() >= switch {
+            return;
+        }
+        for generation in generations.iter().filter(|g| g.epoch == epoch) {
+            let late = self.slot() >= late_from;
+            if let Some(problem) = generation.base.problem_to_report(late) {
+                let slots_left = switch.saturating_sub(self.slot());
+                warn!(
+                    "accounts state base {:?} is not ready at slot {}: {problem}. Blocks need \
+                     it from slot {switch}, in {slots_left} slots; the first that does will \
+                     wait for it or rebuild it by a scan of every account",
+                    generation.base.id,
+                    self.slot(),
+                );
+                datapoint_warn!(
+                    "accounts_state_base_not_ready",
+                    ("epoch", epoch, i64),
+                    ("slot", self.slot(), i64),
+                    ("slots_left", slots_left, i64),
+                );
+            }
+        }
     }
 
     /// The base cell of generation `epoch` for a chain whose last block before

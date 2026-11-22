@@ -861,6 +861,68 @@ fn test_failed_base_job_is_rebuilt_synchronously() {
     assert!(cell.wait_root().is_ok());
 }
 
+/// A base job that fails is run again: the cell stays pending and gets the
+/// tree of the attempt that succeeds. After the last attempt the failure is
+/// final. Nobody holding the cell ends the attempts.
+#[test]
+fn test_base_job_is_run_again_after_a_failure() {
+    let id = |epoch| BaseId {
+        epoch,
+        parent: None,
+    };
+    let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let run = |cell: &Arc<BaseCell>, succeed_at: u32| {
+        attempts.store(0, Ordering::Relaxed);
+        let attempts = attempts.clone();
+        spawn_base_job(vec![cell.clone()], move || {
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+            if attempt >= succeed_at {
+                Ok(vec![BaseTree::empty()])
+            } else {
+                Err(format!("attempt {attempt} failed"))
+            }
+        });
+    };
+
+    let cell = Arc::new(BaseCell::new(id(1), None, false));
+    run(&cell, 3);
+    assert_eq!(cell.wait_root(), Ok(BaseTree::empty().root()));
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    assert!(cell.problem_to_report(true).is_none());
+
+    let cell = Arc::new(BaseCell::new(id(2), None, false));
+    // Still running a quarter of the epoch in: reported once.
+    assert!(cell.problem_to_report(false).is_none());
+    assert!(cell.problem_to_report(true).unwrap().contains("running"));
+    assert!(cell.problem_to_report(true).is_none());
+    run(&cell, u32::MAX);
+    assert_eq!(
+        cell.wait_root(),
+        Err(format!("attempt {BASE_JOB_ATTEMPTS} failed"))
+    );
+    assert_eq!(attempts.load(Ordering::Relaxed), BASE_JOB_ATTEMPTS);
+
+    // A failure for good is reported at any time, once.
+    let cell = Arc::new(BaseCell::new(id(3), None, false));
+    cell.fail_for_tests("injected");
+    assert!(cell.problem_to_report(false).unwrap().contains("injected"));
+    assert!(cell.problem_to_report(false).is_none());
+    // A base whose root came with a snapshot is not late.
+    let cell = Arc::new(BaseCell::new(id(4), Some(Hash::new_unique()), true));
+    assert!(cell.problem_to_report(true).is_none());
+
+    // No bank holds the cell: one attempt.
+    let weak = {
+        let cell = Arc::new(BaseCell::new(id(5), None, false));
+        run(&cell, u32::MAX);
+        Arc::downgrade(&cell)
+    };
+    while weak.strong_count() > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(attempts.load(Ordering::Relaxed) < BASE_JOB_ATTEMPTS);
+}
+
 /// Neither the state nor any base job exists while the feature is inactive,
 /// and slot 5 is zero.
 #[test]
