@@ -1839,6 +1839,18 @@ fn test_ended_generation_after_restart() {
     assert_eq!(states(&restarted), states_before);
     close(restarted);
 
+    // The same when the base leaves are removed before the first block is
+    // rooted, as the first bank of the next epoch does: the store opened
+    // them when it started.
+    let bases = chain.bank(160).accounts_state_bases();
+    let held = open();
+    assert_eq!(held.hold_ended_bases(bases), 1);
+    bases.remove_from_disk_for_tests();
+    held.on_rooted_banks(&[chain.bank(160).clone(), bank161.clone()]);
+    held.finish_rebuild();
+    assert_eq!(states(&held), states_before);
+    close(held);
+
     // Without the file, the blocks before the switch slot have no state;
     // block 160 has.
     std::fs::remove_file(directory.join("ended-overlays").join("1")).unwrap();

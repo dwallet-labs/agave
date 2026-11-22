@@ -431,4 +431,29 @@ mod test {
         let wincode_values = wincode::deserialize::<Vec<CrdsValue>>(&bytes).unwrap();
         assert_eq!(wincode_values, values);
     }
+
+    /// A contact info with an extension of a type this build does not know
+    /// is still accepted, and is passed on as it was signed.
+    #[test]
+    fn test_unknown_contact_info_extension() {
+        let keypair = Keypair::new();
+        let mut node = ContactInfo::new_localhost(&keypair.pubkey(), 1);
+        node.set_serves_light_client_proofs(true);
+        let mut data = wincode::serialize(&CrdsData::ContactInfo(node)).unwrap();
+        // The record is the last thing in the contact info: type, length,
+        // one byte. Give it a type this build does not know.
+        let record = data.len() - 3;
+        assert_eq!(data[record..], [76, 1, 1]);
+        data[record] = 200;
+        let signature = keypair.sign_message(&data);
+        let mut bytes = signature.as_ref().to_vec();
+        bytes.extend_from_slice(&data);
+        let value: CrdsValue = wincode::deserialize(&bytes).unwrap();
+        assert!(value.verify());
+        assert_eq!(wincode::serialize(&value).unwrap(), bytes);
+        let CrdsData::ContactInfo(node) = value.data() else {
+            panic!("not a contact info");
+        };
+        assert!(!node.serves_light_client_proofs());
+    }
 }

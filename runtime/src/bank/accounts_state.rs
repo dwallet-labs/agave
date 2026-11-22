@@ -112,8 +112,8 @@ use {
     solana_merkle_tree::{
         accounts_delta::{AccountsDelta, Address},
         accounts_state::{
-            AccountProof, AccountsStateOpening, BaseTree, DeriveError, OverlayEntry,
-            OverlaySubstitution, OverlayTree, account_lookup, accounts_state_root,
+            AccountProof, AccountsStateOpening, BaseLeafStorage, BaseTree, DeriveError,
+            OverlayEntry, OverlaySubstitution, OverlayTree, account_lookup, accounts_state_root,
             apply_block_changes_batch, apply_overlay_into, new_overlay,
         },
         keyed_tree::{Fork, Sequential},
@@ -191,6 +191,19 @@ enum BaseState {
 
 fn snapshot_mismatch_reason(snapshot: &Hash, rebuilt: &Hash) -> String {
     format!("rebuilt base root {rebuilt} differs from the snapshot's base root {snapshot}")
+}
+
+/// The leaves of a base on disk, kept open (see
+/// [`AccountsStateBases::hold_on_disk`]).
+pub struct HeldBase {
+    id: BaseId,
+    storage: Box<dyn BaseLeafStorage>,
+}
+
+impl HeldBase {
+    pub fn id(&self) -> BaseId {
+        self.id
+    }
 }
 
 /// The base tree of one generation on one chain, computed by a background
@@ -453,17 +466,51 @@ impl AccountsStateBases {
             cell.finish(Ok(BaseTree::empty()));
             return Some(cell);
         }
-        self.dir.open(&id)?;
-        let dir = self.dir.clone();
-        spawn_base_job(vec![cell.clone()], move || {
-            let storage = dir
-                .open(&id)
+        let storage = self.dir.open(&id)?;
+        self.read_base(cell.clone(), storage);
+        Some(cell)
+    }
+
+    /// Opens the leaves of base `id` on disk and keeps them open, without
+    /// reading them: the file may be removed afterwards, and
+    /// [`Self::open_held`] still reads the base from it. `None` if the
+    /// leaves are not on disk.
+    pub fn hold_on_disk(&self, id: BaseId) -> Option<HeldBase> {
+        let storage = self.dir.open(&id)?;
+        Some(HeldBase { id, storage })
+    }
+
+    /// As [`Self::open_from_disk`], from leaves that were kept open.
+    pub fn open_held(&self, held: HeldBase) -> Arc<BaseCell> {
+        let HeldBase { id, storage } = held;
+        if let Some(cell) = self.cells.lock().unwrap().get(&id).and_then(Weak::upgrade) {
+            return cell;
+        }
+        let cell = Arc::new(BaseCell::new(id, None, false));
+        self.read_base(cell.clone(), storage);
+        cell
+    }
+
+    /// Removes the leaves of every base from disk.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn remove_from_disk_for_tests(&self) {
+        self.dir.retain_epochs(|_| false);
+    }
+
+    /// Builds the tree of `cell` from `storage` on a background thread.
+    fn read_base(&self, cell: Arc<BaseCell>, storage: Box<dyn BaseLeafStorage>) {
+        let (id, dir) = (cell.id, self.dir.clone());
+        let mut storage = Some(storage);
+        spawn_base_job(vec![cell], move || {
+            // If it is run again, from the file.
+            let storage = storage
+                .take()
+                .or_else(|| dir.open(&id))
                 .ok_or("the base leaves are no longer on disk")?;
             tree_from_storage(storage)
                 .map(|tree| vec![tree])
                 .map_err(|err| format!("{err:?}"))
         });
-        Some(cell)
     }
 
     /// A cell loaded from a snapshot, rebuilt later by a scan of the snapshot

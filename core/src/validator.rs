@@ -1241,11 +1241,26 @@ impl Validator {
                     },
                     blockstore.clone(),
                 ));
+                // Before any block is replayed.
+                let held = store.hold_ended_bases(
+                    bank_forks
+                        .read()
+                        .unwrap()
+                        .root_bank()
+                        .accounts_state_bases(),
+                );
+                if held > 0 {
+                    info!("light-client proofs: kept {held} ended base file(s) open");
+                }
                 // Without `--light-client-proof-history-peer`, the nodes
                 // to ask are found in gossip.
                 store.set_history_peer_source(gossip_history_peers(cluster_info.clone()));
-                // Other nodes find this one the same way.
-                cluster_info.set_serves_light_client_proofs(true);
+                // Other nodes find this one faster when it says so in its
+                // contact info, but nodes that drop unknown extensions then
+                // reject the contact info, so it is said only when asked.
+                if config.rpc_config.light_client_proof_gossip_marker {
+                    cluster_info.set_serves_light_client_proofs(true);
+                }
                 store
             });
             let rpc_svc_config = JsonRpcServiceConfig {

@@ -910,6 +910,10 @@ impl ClusterInfo {
 
     /// Says in this node's contact info whether it serves light-client
     /// proofs over its RPC address, and publishes the change.
+    ///
+    /// Only for a cluster where every node keeps the extension records it
+    /// does not know: a node that drops them rejects this node's contact
+    /// info (see `contact_info::Extension`).
     pub fn set_serves_light_client_proofs(&self, serves: bool) {
         self.my_contact_info
             .write()

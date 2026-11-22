@@ -207,6 +207,10 @@ pub struct JsonRpcConfig {
     /// JSON RPC URLs of nodes asked for the block history leaves this node
     /// does not have (see `LightClientProofConfig::history_peers`).
     pub light_client_proof_history_peers: Vec<String>,
+    /// Say in gossip that this node serves light-client proofs. Off by
+    /// default: nodes of a build that drops unknown contact-info extensions
+    /// reject the contact info of a node that says so.
+    pub light_client_proof_gossip_marker: bool,
 }
 
 impl Default for JsonRpcConfig {
@@ -231,6 +235,7 @@ impl Default for JsonRpcConfig {
             enable_light_client_proofs: false,
             light_client_proof_retained_blocks: DEFAULT_RETAINED_BLOCKS,
             light_client_proof_history_peers: Vec::new(),
+            light_client_proof_gossip_marker: false,
         }
     }
 }

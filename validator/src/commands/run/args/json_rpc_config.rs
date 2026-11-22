@@ -77,6 +77,8 @@ impl FromClapArgMatches for JsonRpcConfig {
                 .values_of("light_client_proof_history_peers")
                 .map(|urls| urls.map(str::to_string).collect())
                 .unwrap_or_default(),
+            light_client_proof_gossip_marker: matches
+                .is_present("light_client_proof_gossip_marker"),
         })
     }
 }
@@ -209,6 +211,16 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
                  elsewhere. What it gives is checked against this node's own blocks. May be \
                  given more than once. Without it, nodes that publish an RPC address in \
                  gossip are asked",
+            ),
+        Arg::with_name("light_client_proof_gossip_marker")
+            .long("light-client-proof-gossip-marker")
+            .takes_value(false)
+            .requires("enable_light_client_proofs")
+            .help(
+                "Say in this node's gossip contact info that it serves light-client proofs, \
+                 so that other nodes ask it first. Use only on a cluster where every node \
+                 keeps contact-info extensions it does not know: other nodes reject the \
+                 contact info of a node that sets this",
             ),
         Arg::with_name("rpc_scan_and_fix_roots")
             .long("rpc-scan-and-fix-roots")
