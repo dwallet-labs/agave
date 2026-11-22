@@ -387,6 +387,28 @@ impl AccountsStateBases {
         cell
     }
 
+    /// The base of `id` from the leaves this node has on disk, for a prover
+    /// that serves blocks of a generation no bank holds any more: the cell
+    /// some bank still holds, or a new one whose tree is read from the file
+    /// on a background thread. `None` if there is neither.
+    ///
+    /// Nothing here says the file has the leaves of that base: the caller
+    /// must check the root it gets against a commitment it trusts. The new
+    /// cell is not given to any bank.
+    pub fn open_from_disk(&self, id: BaseId) -> Option<Arc<BaseCell>> {
+        if let Some(cell) = self.cells.lock().unwrap().get(&id).and_then(Weak::upgrade) {
+            return Some(cell);
+        }
+        let storage = self.dir.open(&id)?;
+        let cell = Arc::new(BaseCell::new(id, None, false));
+        spawn_base_job(vec![cell.clone()], move || {
+            tree_from_storage(storage)
+                .map(|tree| vec![tree])
+                .map_err(|err| format!("{err:?}"))
+        });
+        Some(cell)
+    }
+
     /// A cell loaded from a snapshot, rebuilt later by a scan of the snapshot
     /// bank.
     fn snapshot_cell(&self, id: BaseId, known_root: Option<Hash>) -> Arc<BaseCell> {
@@ -1053,6 +1075,11 @@ impl Bank {
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| "the scan did not give every base".to_string())
         });
+    }
+
+    /// The bases of this node's banks (see [`AccountsStateBases::from_disk`]).
+    pub fn accounts_state_bases(&self) -> &Arc<AccountsStateBases> {
+        &self.accounts_state_bases
     }
 
     /// Commitment slot 5 value, see

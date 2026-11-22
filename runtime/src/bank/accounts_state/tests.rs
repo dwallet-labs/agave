@@ -684,6 +684,10 @@ fn test_base_file_reused_only_with_the_snapshot_root() {
 
     // A later process, on the same directory.
     let bases = AccountsStateBases::for_accounts_path(accounts.path());
+    // A prover can open the file without a snapshot; it checks the root.
+    assert_eq!(bases.open_from_disk(id).unwrap().wait_root(), Ok(tree.root()));
+    let other = BaseId { epoch: 8, ..id };
+    assert!(bases.open_from_disk(other).is_none());
     let cell = bases.snapshot_cell(id, Some(tree.root()));
     assert_eq!(reuse_base_file(&bases.dir, &cell).unwrap(), tree);
     // The snapshot has no root for the base: the file cannot be checked. It
