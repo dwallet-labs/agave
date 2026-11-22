@@ -684,6 +684,10 @@ fn test_base_file_reused_only_with_the_snapshot_root() {
 
     // A later process, on the same directory.
     let bases = AccountsStateBases::for_accounts_path(accounts.path());
+    // A prover can open the file without a snapshot; it checks the root.
+    assert_eq!(bases.open_from_disk(id).unwrap().wait_root(), Ok(tree.root()));
+    let other = BaseId { epoch: 8, ..id };
+    assert!(bases.open_from_disk(other).is_none());
     let cell = bases.snapshot_cell(id, Some(tree.root()));
     assert_eq!(reuse_base_file(&bases.dir, &cell).unwrap(), tree);
     // The snapshot has no root for the base: the file cannot be checked. It
@@ -1147,3 +1151,89 @@ fn test_snapshot_after_switch_slot() {
 }
 
 use solana_sdk_ids::sysvar;
+
+/// Time to apply one block's changed accounts to an overlay that already
+/// has many entries, on the freezing thread and on the overlay threads.
+/// Run with `--ignored --nocapture`; `OVERLAY_BENCH_ENTRIES` and
+/// `OVERLAY_BENCH_CHANGES` set the sizes.
+#[test]
+#[ignore]
+fn bench_overlay_update() {
+    let size = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let entries = size("OVERLAY_BENCH_ENTRIES", 1_000_000);
+    let changes = size("OVERLAY_BENCH_CHANGES", 1_296);
+    let address = |index: u64| solana_sha256_hasher::hash(&index.to_le_bytes()).to_bytes();
+    let hash_of = |index: u64| solana_sha256_hasher::hash(&(index ^ u64::MAX).to_le_bytes());
+    let mut overlay = new_overlay();
+    for index in 0..entries as u64 {
+        overlay.insert(
+            address(index),
+            solana_merkle_tree::accounts_state::overlay_value(&hash_of(index), &hash_of(index)),
+        );
+    }
+    overlay.root();
+    let cell = Arc::new(BaseCell::new(
+        BaseId {
+            epoch: 0,
+            parent: None,
+        },
+        None,
+        false,
+    ));
+    for generations in [1, 2] {
+        for blocks_on_pool in [false, true] {
+            let mut state: Vec<Generation> = (0..generations)
+                .map(|_| Generation::from_parts(overlay.clone(), cell.clone()))
+                .collect();
+            let mut total = std::time::Duration::ZERO;
+            const BLOCKS: u64 = 50;
+            for block in 0..BLOCKS {
+                // Half of the changed accounts are new to the overlay.
+                let mut block_changes: Vec<(Address, (Hash, Hash))> = (0..changes as u64)
+                    .map(|i| {
+                        let index = if i % 2 == 0 {
+                            (block * 7919 + i * 104_729) % entries as u64
+                        } else {
+                            entries as u64 + block * changes as u64 + i
+                        };
+                        (address(index), (hash_of(index), hash_of(index + block + 1)))
+                    })
+                    .collect();
+                block_changes.sort();
+                block_changes.dedup_by_key(|(address, _)| *address);
+                let start = std::time::Instant::now();
+                if blocks_on_pool {
+                    update_overlays(&mut state, &block_changes);
+                } else {
+                    for generation in &mut state {
+                        apply_block_changes_batch(
+                            &mut generation.overlay,
+                            &block_changes,
+                            &Sequential,
+                            usize::MAX,
+                        );
+                    }
+                }
+                for generation in &state {
+                    std::hint::black_box(generation.overlay.root());
+                }
+                total += start.elapsed();
+            }
+            println!(
+                "{entries} entries, {changes} changes, {generations} generation(s), {}: {:.2} ms \
+                 per block",
+                if blocks_on_pool {
+                    "overlay threads"
+                } else {
+                    "one thread"
+                },
+                total.as_secs_f64() * 1000.0 / BLOCKS as f64,
+            );
+        }
+    }
+}

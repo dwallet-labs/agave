@@ -73,9 +73,10 @@
 //!
 //! Per block, for each changed account and each generation in use, one path
 //! update in the overlay (`O(depth)` node copies) and the hashes of the changed
-//! nodes, each hashed once when the root is computed. An overlay entry costs a
-//! leaf node and a branch node (about 250 bytes) and is shared by every bank
-//! that holds the generation.
+//! nodes, each hashed once. A block with many changed accounts is divided
+//! along the top branches of the overlay and spread over a few threads
+//! ([`update_overlays`]). An overlay entry costs a leaf node and a branch node
+//! (about 250 bytes) and is shared by every bank that holds the generation.
 //!
 //! The leaves of a base tree, 64 bytes per account, are in a file that is
 //! mapped, not in memory (see [`base_files`]): the leaves of the two latest
@@ -107,15 +108,16 @@ use {
         accounts_state::{
             AccountProof, AccountsStateOpening, BaseTree, DeriveError, OverlayEntry,
             OverlaySubstitution, OverlayTree, account_lookup, accounts_state_root,
-            apply_block_changes, apply_overlay_into, new_overlay,
+            apply_block_changes_batch, apply_overlay_into, new_overlay,
         },
+        keyed_tree::{Fork, Sequential},
     },
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
         path::Path,
         sync::{
-            Arc, Condvar, Mutex, Weak,
+            Arc, Condvar, LazyLock, Mutex, Weak,
             atomic::{AtomicBool, Ordering},
         },
     },
@@ -385,6 +387,28 @@ impl AccountsStateBases {
         cell
     }
 
+    /// The base of `id` from the leaves this node has on disk, for a prover
+    /// that serves blocks of a generation no bank holds any more: the cell
+    /// some bank still holds, or a new one whose tree is read from the file
+    /// on a background thread. `None` if there is neither.
+    ///
+    /// Nothing here says the file has the leaves of that base: the caller
+    /// must check the root it gets against a commitment it trusts. The new
+    /// cell is not given to any bank.
+    pub fn open_from_disk(&self, id: BaseId) -> Option<Arc<BaseCell>> {
+        if let Some(cell) = self.cells.lock().unwrap().get(&id).and_then(Weak::upgrade) {
+            return Some(cell);
+        }
+        let storage = self.dir.open(&id)?;
+        let cell = Arc::new(BaseCell::new(id, None, false));
+        spawn_base_job(vec![cell.clone()], move || {
+            tree_from_storage(storage)
+                .map(|tree| vec![tree])
+                .map_err(|err| format!("{err:?}"))
+        });
+        Some(cell)
+    }
+
     /// A cell loaded from a snapshot, rebuilt later by a scan of the snapshot
     /// bank.
     fn snapshot_cell(&self, id: BaseId, known_root: Option<Hash>) -> Arc<BaseCell> {
@@ -441,63 +465,64 @@ const SCAN_BATCH: usize = 4096;
 /// generation as of `bank` (an empty overlay gives the state of `bank`
 /// itself).
 ///
-/// The accounts are read by one thread, as the accounts database gives
-/// them, and hashed in batches on the base threads. The leaves go through a
-/// sorter that spills to disk and from there to the file of each base, so
-/// what is held in memory does not grow with the number of accounts.
-///
-/// TODO(simd-accounts-state-root): the read itself is one thread. On mainnet
-/// it should go over the index bins in parallel, as the lattice hash check at
-/// startup does.
+/// The accounts are read and hashed on the base threads, each taking one
+/// bin of the accounts index at a time. The leaves go through a sorter that
+/// spills to disk, so memory does not grow with the number of accounts.
 fn scan_base_trees(
     bank: &Bank,
     dir: &BaseDir,
     bases: &[(BaseId, &OverlayTree)],
 ) -> Result<Vec<BaseTree>, String> {
-    let mut lt_hash = LtHash::identity();
-    let mut sorter = dir.sorter();
-    let mut failure: Option<String> = None;
-    let mut batch = Vec::with_capacity(SCAN_BATCH);
-    let mut hash_batch = |batch: &mut Vec<(Pubkey, _)>| {
-        let hash_one = |(address, account): &(Pubkey, _)| {
-            let account_lt_hash = AccountsDb::lt_hash_account(account, address);
-            (
-                address.to_bytes(),
-                lt_hash_prefix(&account_lt_hash.0),
-                account_lt_hash,
-            )
-        };
-        let hashed: Vec<_> = if batch.len() < SCAN_BATCH {
-            batch.iter().map(hash_one).collect()
-        } else {
-            on_base_pool(|| batch.par_iter().map(hash_one).collect())
-        };
-        batch.clear();
-        for (address, account_hash, account_lt_hash) in hashed {
-            lt_hash.mix_in(&account_lt_hash.0);
+    // What one thread gathers from one bin of the accounts index.
+    struct Part {
+        leaves: Vec<(Address, Hash)>,
+        lt_hash: LtHash,
+    }
+    let sorter = Mutex::new((dir.sorter(), None::<String>));
+    let lt_hash = Mutex::new(LtHash::identity());
+    let give_leaves = |leaves: &mut Vec<(Address, Hash)>| {
+        let mut guard = sorter.lock().unwrap();
+        let (sorter, failure) = &mut *guard;
+        for (address, account_hash) in leaves.drain(..) {
             if failure.is_none()
                 && let Err(err) = sorter.push(&address, &account_hash)
             {
-                failure = Some(format!("cannot sort the scanned accounts: {err}"));
+                *failure = Some(format!("cannot sort the scanned accounts: {err}"));
             }
         }
     };
-    bank.scan_all_accounts(|item| {
-        if let Some((address, account, _slot)) = item
-            && account.lamports() != 0
-        {
-            batch.push((*address, account));
-            if batch.len() == SCAN_BATCH {
-                hash_batch(&mut batch);
-            }
-        }
+    on_base_pool(|| {
+        bank.rc.accounts.scan_all_by_bin(
+            &bank.ancestors,
+            bank.bank_id(),
+            || Part {
+                leaves: Vec::new(),
+                lt_hash: LtHash::identity(),
+            },
+            |part, address, account, _slot| {
+                if account.lamports() == 0 {
+                    return;
+                }
+                let account_lt_hash = AccountsDb::lt_hash_account(&account, address);
+                part.lt_hash.mix_in(&account_lt_hash.0);
+                part.leaves
+                    .push((address.to_bytes(), lt_hash_prefix(&account_lt_hash.0)));
+                if part.leaves.len() >= SCAN_BATCH {
+                    give_leaves(&mut part.leaves);
+                }
+            },
+            |mut part| {
+                give_leaves(&mut part.leaves);
+                lt_hash.lock().unwrap().mix_in(&part.lt_hash);
+            },
+        )
     })
     .map_err(|err| format!("scan of bank {} failed: {err}", bank.slot()))?;
-    hash_batch(&mut batch);
+    let (sorter, failure) = sorter.into_inner().unwrap();
     if let Some(failure) = failure {
         return Err(failure);
     }
-    if lt_hash != bank.accounts_lt_hash.lock().unwrap().0 {
+    if lt_hash.into_inner().unwrap() != bank.accounts_lt_hash.lock().unwrap().0 {
         return Err(format!(
             "the scanned state of bank {} does not match its accounts lattice hash",
             bank.slot()
@@ -562,6 +587,63 @@ fn reuse_base_file(dir: &BaseDir, cell: &BaseCell) -> Option<BaseTree> {
             None
         }
     }
+}
+
+/// A block with fewer changed accounts than this updates its overlays on
+/// the thread that freezes it.
+const MIN_CHANGES_FOR_OVERLAY_POOL: usize = 128;
+
+/// The smallest part of a block's changes that is given to another thread.
+const MIN_CHANGES_PER_OVERLAY_TASK: usize = 32;
+
+/// The threads that update the overlays of a block when it is frozen. Not
+/// the threads of the base trees: those are busy for a minute or more after
+/// each epoch starts, and a block must not wait for them.
+static OVERLAY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get() / 4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.clamp(1, 8))
+        .thread_name(|index| format!("solAcctStOvl{index:02}"))
+        .build()
+        .expect("a thread pool for overlays")
+});
+
+/// Divides a batch with `rayon::join`, on the pool it is called from.
+struct RayonFork;
+
+impl Fork for RayonFork {
+    fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        rayon::join(a, b)
+    }
+}
+
+/// Applies the changed accounts of a block (sorted by address) to the
+/// overlay of each generation, and computes the hashes of the overlay nodes
+/// that change. A block with many changes is spread over the overlay
+/// threads, by parts of the address space and by generation.
+fn update_overlays(generations: &mut [Generation], changes: &[(Address, (Hash, Hash))]) {
+    if changes.len() < MIN_CHANGES_FOR_OVERLAY_POOL {
+        for generation in generations {
+            apply_block_changes_batch(&mut generation.overlay, changes, &Sequential, usize::MAX);
+        }
+        return;
+    }
+    OVERLAY_POOL.install(|| {
+        generations.par_iter_mut().for_each(|generation| {
+            apply_block_changes_batch(
+                &mut generation.overlay,
+                changes,
+                &RayonFork,
+                MIN_CHANGES_PER_OVERLAY_TASK,
+            );
+        });
+    });
 }
 
 /// One generation held by a bank: its epoch, its overlay as of the bank, and
@@ -880,16 +962,14 @@ impl Bank {
             }
         }
         debug_assert_eq!(delta.len(), prior.len());
-        for generation in &mut generations {
-            apply_block_changes(
-                &mut generation.overlay,
-                delta
-                    .entries()
-                    .iter()
-                    .zip(prior)
-                    .map(|(entry, before)| (&entry.address, before, &entry.account_hash)),
-            );
-        }
+        // Sorted by address, as the delta is.
+        let changes: Vec<(Address, (Hash, Hash))> = delta
+            .entries()
+            .iter()
+            .zip(prior)
+            .map(|(entry, before)| (entry.address, (*before, entry.account_hash)))
+            .collect();
+        update_overlays(&mut generations, &changes);
         Ok(AccountsState { generations })
     }
 
@@ -995,6 +1075,11 @@ impl Bank {
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| "the scan did not give every base".to_string())
         });
+    }
+
+    /// The bases of this node's banks (see [`AccountsStateBases::from_disk`]).
+    pub fn accounts_state_bases(&self) -> &Arc<AccountsStateBases> {
+        &self.accounts_state_bases
     }
 
     /// Commitment slot 5 value, see

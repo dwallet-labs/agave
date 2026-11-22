@@ -454,6 +454,32 @@ impl Accounts {
             .scan_accounts(ancestors, bank_id, scan_func, &ScanConfig::default())
     }
 
+    /// The accounts [`Self::scan_all`] gives, read by the threads of the
+    /// rayon pool this is called from, one bin of the accounts index at a
+    /// time on each, in no particular order. A thread calls `new_part` when
+    /// it starts a bin, `scan_func` for each account of the bin, and
+    /// `end_part` with the bin's state once the bin is done.
+    pub fn scan_all_by_bin<P, F>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        new_part: impl Fn() -> P + Sync,
+        scan_func: F,
+        end_part: impl Fn(P) + Sync,
+    ) -> ScanResult<()>
+    where
+        F: Fn(&mut P, &Pubkey, AccountSharedData, Slot) + Sync,
+    {
+        self.accounts_db.scan_accounts_by_bin(
+            ancestors,
+            bank_id,
+            new_part,
+            scan_func,
+            end_part,
+            &ScanConfig::default(),
+        )
+    }
+
     /// This function will prevent multiple threads from modifying the same account state at the
     /// same time, possibly excluding transactions based on prior results
     #[must_use]

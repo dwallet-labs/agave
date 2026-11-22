@@ -16,10 +16,18 @@
 //! | `getAccountStateProof` | `pubkey`, `{slot}`                    |
 //! | `getValidatorSet`      | `epoch`, `{atSlot}`                   |
 //! | `getEpochBoundary`     | `epoch`, `{atSlot}`                   |
+//!
+//! `getBlockHistoryLeaves` (`start`, `limit`, `withFrontier`) is for
+//! another node, not for a light client: it gives the history leaves a node
+//! needs after it starts from a snapshot made elsewhere (see
+//! [`crate::light_client_proofs::history_peer`]).
 
 use {
     super::{JsonRpcRequestProcessor, verify_pubkey, verify_signature},
-    crate::light_client_proofs::LightClientProofStore,
+    crate::light_client_proofs::{
+        LightClientProofStore,
+        history_peer::{MAX_HISTORY_LEAVES_PER_REQUEST, RpcHistoryLeaves},
+    },
     jsonrpc_core::{Error, Result},
     jsonrpc_derive::rpc,
     solana_clock::{Epoch, Slot},
@@ -57,6 +65,18 @@ pub trait LightClient {
         slot: Slot,
         at_slot: Slot,
     ) -> Result<RpcBlockHistoryProof>;
+
+    /// History leaves from index `start` on, for a node that does not
+    /// have them. `limit` is at most 4096 leaves; with `with_frontier`, the
+    /// frontier of the leaves before `start` is given too.
+    #[rpc(meta, name = "getBlockHistoryLeaves")]
+    fn get_block_history_leaves(
+        &self,
+        meta: Self::Metadata,
+        start: u64,
+        limit: Option<usize>,
+        with_frontier: Option<bool>,
+    ) -> Result<RpcHistoryLeaves>;
 
     #[rpc(meta, name = "getTransactionProof")]
     fn get_transaction_proof(
@@ -125,6 +145,23 @@ impl LightClient for LightClientImpl {
             .block_history_proof(slot, at_slot)
             .map_err(proof_error)?;
         Ok(RpcBlockHistoryProof::from(&response))
+    }
+
+    fn get_block_history_leaves(
+        &self,
+        meta: Self::Metadata,
+        start: u64,
+        limit: Option<usize>,
+        with_frontier: Option<bool>,
+    ) -> Result<RpcHistoryLeaves> {
+        debug!("get_block_history_leaves rpc request received: from {start}");
+        meta.light_client_proof_store()?
+            .history_leaves(
+                start,
+                limit.unwrap_or(MAX_HISTORY_LEAVES_PER_REQUEST),
+                with_frontier.unwrap_or(false),
+            )
+            .map_err(proof_error)
     }
 
     fn get_transaction_proof(

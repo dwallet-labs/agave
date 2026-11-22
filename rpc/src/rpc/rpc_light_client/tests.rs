@@ -17,7 +17,10 @@
 
 use {
     super::{LightClient as _, *},
-    crate::light_client_proofs::{LightClientProofConfig, LightClientProofStore},
+    crate::light_client_proofs::{
+        LightClientProofConfig, LightClientProofStore,
+        history_peer::{HistoryPeer, RpcHistoryLeaves},
+    },
     agave_bls_cert_verify::cert_verify::test_create_base2_unverified_certificate,
     agave_feature_set as feature_set,
     agave_votor_messages::{
@@ -1616,6 +1619,213 @@ fn test_accounts_state_and_history_after_restart() {
     let (code, _) = rpc.error("getBlockHistoryProof", json!([65, 164]));
     assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
     rpc.call::<Value>("getBlockHistoryProof", json!([163, 164]))
+        .unwrap();
+}
+
+/// A history peer that answers from a store, through JSON, and may change
+/// what it gives.
+struct StorePeer {
+    store: Arc<LightClientProofStore>,
+    lie: bool,
+}
+
+impl HistoryPeer for StorePeer {
+    fn name(&self) -> String {
+        format!("test peer (lie: {})", self.lie)
+    }
+
+    fn history_leaves(
+        &self,
+        start: u64,
+        limit: usize,
+        with_frontier: bool,
+    ) -> std::result::Result<RpcHistoryLeaves, String> {
+        let mut leaves = self
+            .store
+            .history_leaves(start, limit, with_frontier)
+            .map_err(|err| err.to_string())?;
+        if self.lie {
+            leaves.leaves[0].commitment_root = Hash::new_unique().to_string();
+        }
+        let json = serde_json::to_string(&leaves).unwrap();
+        Ok(serde_json::from_str(&json).unwrap())
+    }
+}
+
+/// A node that starts from a snapshot made elsewhere: its blockstore does
+/// not have the earlier blocks, so the history before its first rooted
+/// block comes from another node. Leaves that do not have this node's
+/// history root are not used.
+#[test]
+fn test_history_from_a_peer() {
+    let chain = build_chain();
+    let peer_store = chain.store(16);
+    // Over JSON RPC, as another node asks.
+    let leaves: RpcHistoryLeaves = chain
+        .rpc(&peer_store)
+        .call("getBlockHistoryLeaves", json!([3, 2, true]))
+        .unwrap();
+    assert_eq!((leaves.start, leaves.leaves.len()), (3, 2));
+    assert_eq!(leaves.frontier.as_ref().unwrap().len(), 2);
+    assert_eq!(leaves.leaves[0].slot, 96);
+    let (code, _) = chain
+        .rpc(&peer_store)
+        .error("getBlockHistoryLeaves", json!([1000]));
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+
+    // The new node: an empty blockstore, and the bank of block 160 first.
+    let ledger_path = solana_ledger::get_tmp_ledger_path!();
+    let new_node = |retained_history: usize, peers: Vec<Arc<dyn HistoryPeer>>| {
+        let store = Arc::new(LightClientProofStore::new(
+            LightClientProofConfig {
+                retained_history,
+                ..LightClientProofConfig::default()
+            },
+            Arc::new(Blockstore::open(&ledger_path).unwrap()),
+        ));
+        store.set_history_peers(peers);
+        store.on_rooted_banks(std::slice::from_ref(chain.bank(160)));
+        store
+    };
+    let history = |store: &Arc<LightClientProofStore>, slot: u64| {
+        chain
+            .rpc(store)
+            .call::<Value>("getBlockHistoryProof", json!([slot, 160]))
+    };
+    let honest: Arc<dyn HistoryPeer> = Arc::new(StorePeer {
+        store: peer_store.clone(),
+        lie: false,
+    });
+    let liar: Arc<dyn HistoryPeer> = Arc::new(StorePeer {
+        store: peer_store.clone(),
+        lie: true,
+    });
+
+    // Without a peer: no leaf before block 160.
+    let alone = new_node(1 << 10, vec![]);
+    alone.finish_history_fetch();
+    assert!(history(&alone, 130).is_err());
+    drop(alone);
+
+    // The first peer lies and is not used; the second is.
+    let node = new_node(1 << 10, vec![liar.clone(), honest.clone()]);
+    node.finish_history_fetch();
+    for slot in [65, 66, 96, 100, 130] {
+        assert_eq!(
+            history(&node, slot).unwrap(),
+            chain
+                .rpc(&peer_store)
+                .call::<Value>("getBlockHistoryProof", json!([slot, 160]))
+                .unwrap(),
+            "slot {slot}"
+        );
+    }
+    drop(node);
+
+    // A node that keeps four leaves asks for the three before its own.
+    let node = new_node(4, vec![honest]);
+    node.finish_history_fetch();
+    history(&node, 96).unwrap();
+    history(&node, 130).unwrap();
+    assert!(history(&node, 66).is_err());
+}
+
+/// A node that restarts just after a switch slot: the banks it has no
+/// longer hold the generation that the kept blocks from before the switch
+/// use. The store wrote that generation's overlay when it ended, and serves
+/// the same account state proofs for those blocks after the restart.
+#[test]
+fn test_ended_generation_after_restart() {
+    let chain = build_chain();
+    let directory = solana_ledger::get_tmp_ledger_path!();
+    let config = LightClientProofConfig {
+        retained_blocks: 8,
+        persist_dir: Some(directory.clone()),
+        ..LightClientProofConfig::default()
+    };
+    let open = || {
+        Arc::new(LightClientProofStore::new(
+            config.clone(),
+            chain.blockstore.clone(),
+        ))
+    };
+    // Blocks 96, 100 and 130 use generation 1; block 160, at the switch
+    // slot of epoch 2, is the first that does not hold it.
+    assert_eq!(chain.bank(130).accounts_state_generation_in_use(), Some(1));
+    assert_eq!(
+        chain
+            .bank(130)
+            .accounts_state()
+            .unwrap()
+            .generations()
+            .len(),
+        2
+    );
+    assert_eq!(
+        chain
+            .bank(160)
+            .accounts_state()
+            .unwrap()
+            .generations()
+            .len(),
+        1
+    );
+    let store = open();
+    let rooted: Vec<_> = chain
+        .banks
+        .range(62..)
+        .map(|(_, bank)| bank.clone())
+        .collect();
+    store.on_rooted_banks(&rooted);
+
+    let absent = Pubkey::new_unique();
+    let addresses = [chain.mint.pubkey(), chain.fresh, chain.quiet, absent];
+    let state_queries: Vec<_> = [96, 100, 130, 160]
+        .into_iter()
+        .flat_map(|slot| {
+            addresses
+                .iter()
+                .map(move |address| json!([address.to_string(), {"slot": slot}]))
+        })
+        .collect();
+    let states = |store: &Arc<LightClientProofStore>| -> Vec<Value> {
+        let rpc = chain.rpc(store);
+        state_queries
+            .iter()
+            .map(|params| {
+                rpc.call::<Value>("getAccountStateProof", params.clone())
+                    .unwrap_or_else(|err| panic!("{params}: {err:?}"))
+            })
+            .collect()
+    };
+    let states_before = states(&store);
+    close(store);
+    let overlays: Vec<_> = std::fs::read_dir(directory.join("ended-overlays"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(overlays, ["1"]);
+
+    // Restarted, with the banks of blocks 160 and 161 only.
+    let bank161 = new_child(chain.bank(160), 161);
+    freeze_and_store(&chain.blockstore, &bank161);
+    chain.blockstore.set_roots([161].iter()).unwrap();
+    let restarted = open();
+    restarted.on_rooted_banks(&[chain.bank(160).clone(), bank161.clone()]);
+    restarted.finish_rebuild();
+    assert_eq!(states(&restarted), states_before);
+    close(restarted);
+
+    // Without the file, the blocks before the switch slot have no state;
+    // block 160 has.
+    std::fs::remove_file(directory.join("ended-overlays").join("1")).unwrap();
+    let without = open();
+    without.on_rooted_banks(std::slice::from_ref(&bank161));
+    without.finish_rebuild();
+    let rpc = chain.rpc(&without);
+    let (code, _) = rpc.error("getAccountStateProof", state_queries[8].clone());
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+    rpc.call::<Value>("getAccountStateProof", state_queries[12].clone())
         .unwrap();
 }
 
