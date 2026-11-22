@@ -38,6 +38,7 @@ use {
         Certificate, CertificateKind, HISTORY_LEAF_LEN, history_leaf,
         solana_merkle_tree::{
             accounts_delta::{AccountsDelta, DeltaEntry},
+            accounts_state::{OVERLAY_VALUE_LEN, OverlayTree, new_overlay},
             commitment_tree::{AppendOnlyFrontier, TreeId, hash_leaf},
             epoch_boundary::EpochBoundary,
             receipt_tree::{
@@ -54,7 +55,7 @@ use {
     std::{
         collections::BTreeSet,
         fs,
-        io::{self, Write},
+        io::{self, BufReader, BufWriter, Read, Write},
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex, RwLock,
@@ -74,6 +75,7 @@ const BLOCKS: &str = "blocks";
 const CERTIFICATES: &str = "certificates";
 const SIGNER_SETS: &str = "signer-sets";
 const HISTORY: &str = "history";
+const ENDED_OVERLAYS: &str = "ended-overlays";
 
 /// Number of history leaves per segment file.
 pub(super) const HISTORY_SEGMENT_LEN: u64 = 4096;
@@ -124,7 +126,7 @@ impl Persistence {
     /// Opens (creating it if needed) the directory. `None`, with a warning,
     /// if it cannot be used: the store then keeps nothing on disk.
     pub fn open(dir: &Path) -> Option<Self> {
-        for sub in [BLOCKS, CERTIFICATES, SIGNER_SETS, HISTORY] {
+        for sub in [BLOCKS, CERTIFICATES, SIGNER_SETS, HISTORY, ENDED_OVERLAYS] {
             if let Err(err) = fs::create_dir_all(dir.join(sub)) {
                 warn!(
                     "light-client proofs: cannot use {}: {err}; proof data will not survive a \
@@ -497,6 +499,160 @@ impl Persistence {
 }
 
 // ---------------------------------------------------------------------------
+// The overlay of a generation that ended.
+
+/// The overlay of a generation as of the last rooted block that held it.
+/// Banks drop it at the switch slot; the blocks kept from before still need
+/// it after a restart (see the module documentation of the store).
+pub(super) struct EndedOverlay {
+    pub base: BaseId,
+    /// Slot of the last rooted block that held the generation.
+    pub as_of: Slot,
+    pub overlay: OverlayTree,
+}
+
+/// What the file of an ended overlay says before its entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EndedOverlayHeader {
+    pub base: BaseId,
+    pub as_of: Slot,
+    pub entries: u64,
+}
+
+const ENDED_OVERLAY_HEADER_LEN: usize = 8 + 1 + 8 + 32 + 8 + 8;
+const ENDED_OVERLAY_ENTRY_LEN: usize = 32 + OVERLAY_VALUE_LEN;
+
+impl EndedOverlayHeader {
+    fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer(Vec::with_capacity(ENDED_OVERLAY_HEADER_LEN));
+        writer.u64(self.base.epoch);
+        let (slot, hash) = self.base.parent.unwrap_or_default();
+        writer.u8(u8::from(self.base.parent.is_some()));
+        writer.u64(slot);
+        writer.hash(&hash);
+        writer.u64(self.as_of);
+        writer.u64(self.entries);
+        writer.0
+    }
+
+    fn decode(bytes: &[u8; ENDED_OVERLAY_HEADER_LEN]) -> Option<Self> {
+        let mut reader = Reader(bytes);
+        let epoch = reader.u64()?;
+        let has_parent = reader.u8()?;
+        let parent = (reader.u64()?, reader.hash()?);
+        Some(Self {
+            base: BaseId {
+                epoch,
+                parent: match has_parent {
+                    0 => None,
+                    1 => Some(parent),
+                    _ => return None,
+                },
+            },
+            as_of: reader.u64()?,
+            entries: reader.u64()?,
+        })
+    }
+}
+
+impl Persistence {
+    /// Writes the overlay as a stream, in key order, and removes the files
+    /// of other generations: one ended generation is kept.
+    pub fn write_ended_overlay(&self, ended: &EndedOverlay) {
+        let epoch = ended.base.epoch;
+        let path = self.path(ENDED_OVERLAYS, epoch);
+        let temporary = path.with_extension("tmp");
+        let header = EndedOverlayHeader {
+            base: ended.base,
+            as_of: ended.as_of,
+            entries: ended.overlay.len(),
+        };
+        let written = fs::File::create(&temporary)
+            .and_then(|file| {
+                let mut file = BufWriter::with_capacity(1 << 20, file);
+                file.write_all(MAGIC)?;
+                file.write_all(&header.encode())?;
+                for (address, value) in ended.overlay.iter() {
+                    file.write_all(address)?;
+                    file.write_all(value)?;
+                }
+                file.write_all(END)?;
+                file.into_inner()?.sync_all()
+            })
+            .and_then(|()| fs::rename(&temporary, &path));
+        match written {
+            Ok(()) => self.changed(ENDED_OVERLAYS),
+            Err(err) => {
+                warn!(
+                    "light-client proofs: cannot write {}: {err}",
+                    path.display()
+                );
+                let _ = fs::remove_file(&temporary);
+                return;
+            }
+        }
+        for other in self.numbers(ENDED_OVERLAYS) {
+            if other != epoch {
+                self.remove(ENDED_OVERLAYS, other);
+            }
+        }
+    }
+
+    fn open_ended_overlay(
+        &self,
+        epoch: Epoch,
+    ) -> Option<(EndedOverlayHeader, BufReader<fs::File>)> {
+        let path = self.path(ENDED_OVERLAYS, epoch);
+        let file = fs::File::open(&path).ok()?;
+        let length = file.metadata().ok()?.len();
+        let mut file = BufReader::with_capacity(1 << 20, file);
+        let mut magic = [0u8; MAGIC.len()];
+        let mut header = [0u8; ENDED_OVERLAY_HEADER_LEN];
+        file.read_exact(&mut magic).ok()?;
+        file.read_exact(&mut header).ok()?;
+        let header = EndedOverlayHeader::decode(&header).filter(|header| {
+            let expected = header
+                .entries
+                .checked_mul(ENDED_OVERLAY_ENTRY_LEN as u64)
+                .and_then(|entries| {
+                    entries.checked_add((MAGIC.len() + ENDED_OVERLAY_HEADER_LEN + END.len()) as u64)
+                });
+            &magic == MAGIC && header.base.epoch == epoch && expected == Some(length)
+        });
+        if header.is_none() {
+            warn!(
+                "light-client proofs: {} is not a whole overlay file, skipping it",
+                path.display()
+            );
+        }
+        Some((header?, file))
+    }
+
+    /// The ended overlays on disk, without their entries.
+    pub fn ended_overlays(&self) -> Vec<EndedOverlayHeader> {
+        self.numbers(ENDED_OVERLAYS)
+            .into_iter()
+            .filter_map(|epoch| Some(self.open_ended_overlay(epoch)?.0))
+            .collect()
+    }
+
+    /// The ended overlay of generation `epoch`. Nothing checks its entries
+    /// here: the caller checks the root of the tree against a commitment.
+    pub fn load_ended_overlay(&self, epoch: Epoch) -> Option<OverlayTree> {
+        let (header, mut file) = self.open_ended_overlay(epoch)?;
+        let mut overlay = new_overlay();
+        let mut entry = [0u8; ENDED_OVERLAY_ENTRY_LEN];
+        for _ in 0..header.entries {
+            file.read_exact(&mut entry).ok()?;
+            let (address, value) = entry.split_at(32);
+            overlay.insert(address.try_into().ok()?, value.try_into().ok()?);
+        }
+        let mut end = [0u8; END.len()];
+        file.read_exact(&mut end).ok()?;
+        (&end == END && overlay.len() == header.entries).then_some(overlay)
+    }
+}
+
 // The thread that writes.
 
 /// Files queued beyond this number are not written: the disk is far behind
@@ -512,6 +668,8 @@ pub(super) enum Job {
     Block(Box<BlockRecord>),
     SignerSet(Epoch, Arc<Vec<Signer>>),
     Certificates(Slot, SlotCertificates),
+    /// The overlay of a generation that ended: one large file per epoch.
+    EndedOverlay(Box<EndedOverlay>),
     RemoveBlock(Slot),
     RemoveCertificatesBefore(Slot),
     RemoveSignerSet(Epoch),
@@ -629,6 +787,7 @@ fn write_jobs(
             Job::Certificates(slot, certificates) => {
                 persistence.write_certificates(slot, &certificates)
             }
+            Job::EndedOverlay(ended) => persistence.write_ended_overlay(&ended),
             Job::RemoveBlock(slot) => persistence.remove_block(slot),
             Job::RemoveCertificatesBefore(oldest) => persistence.remove_certificates_before(oldest),
             Job::RemoveSignerSet(epoch) => persistence.remove_signer_set(epoch),

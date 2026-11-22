@@ -1619,6 +1619,105 @@ fn test_accounts_state_and_history_after_restart() {
         .unwrap();
 }
 
+/// A node that restarts just after a switch slot: the banks it has no
+/// longer hold the generation that the kept blocks from before the switch
+/// use. The store wrote that generation's overlay when it ended, and serves
+/// the same account state proofs for those blocks after the restart.
+#[test]
+fn test_ended_generation_after_restart() {
+    let chain = build_chain();
+    let directory = solana_ledger::get_tmp_ledger_path!();
+    let config = LightClientProofConfig {
+        retained_blocks: 8,
+        persist_dir: Some(directory.clone()),
+        ..LightClientProofConfig::default()
+    };
+    let open = || {
+        Arc::new(LightClientProofStore::new(
+            config.clone(),
+            chain.blockstore.clone(),
+        ))
+    };
+    // Blocks 96, 100 and 130 use generation 1; block 160, at the switch
+    // slot of epoch 2, is the first that does not hold it.
+    assert_eq!(chain.bank(130).accounts_state_generation_in_use(), Some(1));
+    assert_eq!(
+        chain
+            .bank(130)
+            .accounts_state()
+            .unwrap()
+            .generations()
+            .len(),
+        2
+    );
+    assert_eq!(
+        chain
+            .bank(160)
+            .accounts_state()
+            .unwrap()
+            .generations()
+            .len(),
+        1
+    );
+    let store = open();
+    let rooted: Vec<_> = chain
+        .banks
+        .range(62..)
+        .map(|(_, bank)| bank.clone())
+        .collect();
+    store.on_rooted_banks(&rooted);
+
+    let absent = Pubkey::new_unique();
+    let addresses = [chain.mint.pubkey(), chain.fresh, chain.quiet, absent];
+    let state_queries: Vec<_> = [96, 100, 130, 160]
+        .into_iter()
+        .flat_map(|slot| {
+            addresses
+                .iter()
+                .map(move |address| json!([address.to_string(), {"slot": slot}]))
+        })
+        .collect();
+    let states = |store: &Arc<LightClientProofStore>| -> Vec<Value> {
+        let rpc = chain.rpc(store);
+        state_queries
+            .iter()
+            .map(|params| {
+                rpc.call::<Value>("getAccountStateProof", params.clone())
+                    .unwrap_or_else(|err| panic!("{params}: {err:?}"))
+            })
+            .collect()
+    };
+    let states_before = states(&store);
+    close(store);
+    let overlays: Vec<_> = std::fs::read_dir(directory.join("ended-overlays"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(overlays, ["1"]);
+
+    // Restarted, with the banks of blocks 160 and 161 only.
+    let bank161 = new_child(chain.bank(160), 161);
+    freeze_and_store(&chain.blockstore, &bank161);
+    chain.blockstore.set_roots([161].iter()).unwrap();
+    let restarted = open();
+    restarted.on_rooted_banks(&[chain.bank(160).clone(), bank161.clone()]);
+    restarted.finish_rebuild();
+    assert_eq!(states(&restarted), states_before);
+    close(restarted);
+
+    // Without the file, the blocks before the switch slot have no state;
+    // block 160 has.
+    std::fs::remove_file(directory.join("ended-overlays").join("1")).unwrap();
+    let without = open();
+    without.on_rooted_banks(std::slice::from_ref(&bank161));
+    without.finish_rebuild();
+    let rpc = chain.rpc(&without);
+    let (code, _) = rpc.error("getAccountStateProof", state_queries[8].clone());
+    assert_eq!(code, JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE);
+    rpc.call::<Value>("getAccountStateProof", state_queries[12].clone())
+        .unwrap();
+}
+
 /// While the base tree of a new generation is being computed in the
 /// background, `getAccountStateProof` answers "base tree not ready" instead
 /// of waiting, and serves the proof once it is.

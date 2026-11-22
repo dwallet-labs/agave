@@ -89,11 +89,16 @@
 //!   of the first block it has a bank for and steps back from it, block by
 //!   block, undoing each block's changes. Every state rebuilt this way is
 //!   checked against slot 5 of its block. A block is not reached if the
-//!   chain of kept blocks to it is broken, or if its generation ended
-//!   before the first bank after the restart; it answers "not kept" as
-//!   before. A generation ends once per epoch, at the switch slot, so this
-//!   concerns a restart within [`LightClientProofConfig::retained_blocks`]
-//!   blocks after a switch slot, and then only the kept blocks before it.
+//!   chain of kept blocks to it is broken; it answers "not kept" as before.
+//! - **A generation that ended.** Banks drop a generation at the switch
+//!   slot, once per epoch. When a rooted block no longer holds a generation
+//!   its parent held, the overlay of that generation as of the parent is
+//!   written to one file (96 bytes per entry, written as a stream by the
+//!   writer thread; the file of the generation before is removed). After a
+//!   restart past a switch slot, the kept blocks from before it get their
+//!   state from that file and from the base leaves the runtime keeps on
+//!   disk, read back on a thread of the store; they answer "not kept"
+//!   until that is done.
 //!
 //! A durable store would also cache the roots of complete history subtrees,
 //! so that a history proof does not rehash every kept leaf.
@@ -143,7 +148,10 @@ use {
     solana_rpc_client_api::{custom_error::LightClientProofError, light_client::RpcProofSelection},
     solana_runtime::bank::{
         Bank,
-        accounts_state::{AccountsState, AccountsStateProofError, BaseId, BaseWait, Generation},
+        accounts_state::{
+            AccountsState, AccountsStateBases, AccountsStateProofError, BaseId, BaseWait,
+            Generation,
+        },
         block_commitment::CommitmentVector,
         transaction_receipts::RetainedReceipt,
     },
@@ -160,7 +168,7 @@ use {
 
 mod persist;
 
-use persist::{BlockRecord, DiskWriter, Job, Persistence};
+use persist::{BlockRecord, DiskWriter, EndedOverlay, Job, Persistence};
 
 /// Default number of rooted blocks whose proof data is kept.
 pub const DEFAULT_RETAINED_BLOCKS: usize = 1024;
@@ -280,12 +288,14 @@ impl StateRecord {
 /// The accounts state after `block`, from the state after `next`, its child:
 /// the overlay of each generation of `block` is the one of `next` with the
 /// changes of `next` undone. A generation that `next` no longer holds is
+/// taken from `ended`, the generation as of `block` read back from disk, or
 /// left out. `None` if the records do not allow it, or if the result is not
 /// the state `block` committed to in slot 5.
 fn state_before(
     block: &RetainedBlock,
     next: &RetainedBlock,
     next_state: &AccountsState,
+    ended: Option<&Generation>,
 ) -> Option<Arc<AccountsState>> {
     let record = block.state_record.as_deref()?;
     let next_record = next.state_record.as_deref()?;
@@ -303,7 +313,14 @@ fn state_before(
             .iter()
             .find(|later| later.base == generation.base)
             .and_then(|later| later.previous.as_ref());
-        let (Some(later), Some(previous)) = (later, previous) else {
+        let Some(later) = later else {
+            // `next` dropped the generation: `block` is the last that held it.
+            if let Some(ended) = ended.filter(|ended| ended.base().id() == generation.base) {
+                generations.push(ended.clone());
+            }
+            continue;
+        };
+        let Some(previous) = previous else {
             continue;
         };
         let entries = next.accounts_delta.as_ref().map(|delta| delta.entries())?;
@@ -806,6 +823,8 @@ pub struct LightClientProofStore {
     /// Blocks read back from disk may still get their accounts state from
     /// the first banks rooted after the restart.
     states_to_rebuild: AtomicBool,
+    /// The thread that reads back the overlay of an ended generation.
+    ended_rebuild: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl LightClientProofStore {
@@ -831,6 +850,7 @@ impl LightClientProofStore {
             persistence: persistence.filter(|_| writer.is_some()),
             writer,
             states_to_rebuild: AtomicBool::new(false),
+            ended_rebuild: Mutex::default(),
         };
         store.load();
         store.flush_writes();
@@ -993,7 +1013,7 @@ impl LightClientProofStore {
             })
             .collect();
         let new_blocks: Vec<_> = banks
-            .into_iter()
+            .iter()
             .filter(|bank| highest_root.is_none_or(|root| bank.slot() > root))
             .map(|bank| {
                 let signer_sets: Vec<_> = [bank.epoch(), bank.epoch() + 1]
@@ -1025,6 +1045,29 @@ impl LightClientProofStore {
         // The files are queued for the writer thread: neither this thread
         // nor a query waits for the disk.
         if self.writer.is_some() {
+            // A generation the parent of a new block held and the block
+            // does not: it ended. Its overlay goes to disk for the kept
+            // blocks before this one.
+            for bank in &banks {
+                if highest_root.is_some_and(|root| bank.slot() <= root) {
+                    continue;
+                }
+                let (Some(before), Some(after)) =
+                    (states.get(&bank.parent_slot()), states.get(&bank.slot()))
+                else {
+                    continue;
+                };
+                for generation in before.generations() {
+                    let base = generation.base().id();
+                    if after.generations().iter().all(|g| g.base().id() != base) {
+                        self.disk(Job::EndedOverlay(Box::new(EndedOverlay {
+                            base,
+                            as_of: bank.parent_slot(),
+                            overlay: generation.overlay().clone(),
+                        })));
+                    }
+                }
+            }
             for (record, signer_sets) in &new_blocks {
                 self.disk(Job::Block(Box::new(record.clone())));
                 for (epoch, signers) in signer_sets {
@@ -1069,7 +1112,10 @@ impl LightClientProofStore {
             self.prune(&mut inner);
         }
         if rebuild {
-            self.rebuild_accounts_states(&rooted_states);
+            Self::rebuild_accounts_states(&self.inner, &rooted_states, None);
+            if let Some(bank) = banks.first() {
+                self.rebuild_from_ended_overlay(bank.accounts_state_bases());
+            }
             // Once a new block is in, every block that can be reached from
             // a bank has been.
             if ingested {
@@ -1143,15 +1189,13 @@ impl LightClientProofStore {
     /// rooted banks of the same blocks (`rooted`: slot, block id, state,
     /// generation in use), and for the blocks before a block with a state by
     /// undoing that block's changes (see [`state_before`]).
-    fn rebuild_accounts_states(&self, rooted: &[(Slot, Hash, Arc<AccountsState>, Option<Epoch>)]) {
-        let blocks: Vec<Arc<RetainedBlock>> = self
-            .inner
-            .read()
-            .unwrap()
-            .blocks
-            .values()
-            .cloned()
-            .collect();
+    fn rebuild_accounts_states(
+        inner: &RwLock<Inner>,
+        rooted: &[(Slot, Hash, Arc<AccountsState>, Option<Epoch>)],
+        ended: Option<(Slot, &Generation)>,
+    ) {
+        let blocks: Vec<Arc<RetainedBlock>> =
+            inner.read().unwrap().blocks.values().cloned().collect();
         let mut rebuilt: Vec<(Slot, Arc<AccountsState>, Option<Epoch>)> = Vec::new();
         // From the latest block down: `next` is the block after, with its
         // state, while the chain of states is unbroken.
@@ -1173,7 +1217,10 @@ impl LightClientProofStore {
                 .map(|(_, _, state, generation_in_use)| (state.clone(), *generation_in_use));
             let state = from_bank.or_else(|| {
                 let (after, after_state) = next.as_ref()?;
-                let state = state_before(block, after, after_state)?;
+                let ended = ended
+                    .filter(|(as_of, _)| *as_of == block.slot)
+                    .map(|(_, generation)| generation);
+                let state = state_before(block, after, after_state, ended)?;
                 let generation_in_use = block.state_record.as_ref()?.generation_in_use;
                 Some((state, generation_in_use))
             });
@@ -1190,7 +1237,7 @@ impl LightClientProofStore {
             rebuilt.len(),
             rebuilt.last().map(|(slot, ..)| *slot).unwrap_or_default()
         );
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = inner.write().unwrap();
         for (slot, state, generation_in_use) in rebuilt {
             if let Some(block) = inner.blocks.get_mut(&slot) {
                 *block = Arc::new(RetainedBlock {
@@ -1199,6 +1246,72 @@ impl LightClientProofStore {
                     ..RetainedBlock::clone(block)
                 });
             }
+        }
+    }
+
+    /// If a kept block is the last of a generation that ended, has no
+    /// state yet, and the overlay of that generation is on disk: reads the
+    /// overlay and the base back on a thread of its own (at mainnet size
+    /// that takes minutes) and rebuilds the states from that block down.
+    /// The blocks answer "not kept" until then.
+    fn rebuild_from_ended_overlay(&self, bases: &Arc<AccountsStateBases>) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let mut thread = self.ended_rebuild.lock().unwrap();
+        if thread.is_some() {
+            return;
+        }
+        let header = {
+            let inner = self.inner.read().unwrap();
+            persistence.ended_overlays().into_iter().find(|header| {
+                inner.blocks.get(&header.as_of).is_some_and(|block| {
+                    block.accounts_state.is_none()
+                        && block.accounts_state_not_kept
+                        && block.state_record.as_ref().is_some_and(|record| {
+                            record.generations.iter().any(|g| g.base == header.base)
+                        })
+                })
+            })
+        };
+        let Some(header) = header else {
+            return;
+        };
+        let (inner, persistence, bases) = (self.inner.clone(), persistence.clone(), bases.clone());
+        let job = move || {
+            let base_id = header.base;
+            let Some(base) = bases.open_from_disk(base_id) else {
+                info!(
+                    "light-client proofs: the base leaves of {base_id:?} are not on disk; the                      blocks kept from before slot {} stay without accounts state",
+                    header.as_of.saturating_add(1)
+                );
+                return;
+            };
+            // With the base root, every rebuilt state is checked against
+            // slot 5 of its block.
+            if let Err(reason) = base.wait_root() {
+                warn!("light-client proofs: cannot read the base of {base_id:?}: {reason}");
+                return;
+            }
+            let Some(overlay) = persistence.load_ended_overlay(base_id.epoch) else {
+                return;
+            };
+            let generation = Generation::from_parts(overlay, base);
+            Self::rebuild_accounts_states(&inner, &[], Some((header.as_of, &generation)));
+        };
+        *thread = std::thread::Builder::new()
+            .name("solLcProofEnded".to_string())
+            .spawn(job)
+            .map_err(|err| warn!("light-client proofs: cannot start a thread: {err}"))
+            .ok();
+    }
+
+    /// Waits for the thread of [`Self::rebuild_from_ended_overlay`], if it
+    /// was started.
+    pub fn finish_rebuild(&self) {
+        let thread = self.ended_rebuild.lock().unwrap().take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
         }
     }
 
