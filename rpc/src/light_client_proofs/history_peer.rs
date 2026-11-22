@@ -14,9 +14,9 @@
 //! Which nodes are asked: those named in the configuration, if any.
 //! Otherwise the nodes that publish an RPC address in gossip, with this
 //! node's shred version ([`gossip_history_peers`]), as a node that
-//! downloads a snapshot finds its source. Most of them do not serve
-//! light-client proofs and answer with an error; a few are tried in each
-//! round.
+//! downloads a snapshot finds its source. A node that serves light-client
+//! proofs says so in its contact info; those are the ones asked. If none
+//! says so, any node with an RPC address is tried, a few in each round.
 
 use {
     super::{HistoryLog, Inner, persist::HistoryEntry},
@@ -98,16 +98,23 @@ const NAMED_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const GOSSIP_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The nodes that publish an RPC address in gossip with this node's shred
-/// version: at most [`GOSSIP_PEERS_PER_ROUND`] of them per call, others on
-/// the next call.
+/// version and say they serve light-client proofs; if none says so, all
+/// those with an RPC address. At most [`GOSSIP_PEERS_PER_ROUND`] of them
+/// per call, others on the next call.
 pub fn gossip_history_peers(cluster_info: Arc<ClusterInfo>) -> HistoryPeerSource {
     let next = std::sync::atomic::AtomicUsize::new(0);
     Arc::new(move || {
         let shred_version = cluster_info.my_shred_version();
-        let mut urls: Vec<String> = cluster_info
+        let mut nodes: Vec<_> = cluster_info
             .rpc_peers()
             .into_iter()
-            .filter(|node| node.shred_version() == shred_version)
+            .filter(|node| node.shred_version() == shred_version && node.rpc().is_some())
+            .collect();
+        if nodes.iter().any(|node| node.serves_light_client_proofs()) {
+            nodes.retain(|node| node.serves_light_client_proofs());
+        }
+        let mut urls: Vec<String> = nodes
+            .iter()
             .filter_map(|node| Some(format!("http://{}", node.rpc()?)))
             .collect();
         // The order gossip gives changes; a sorted list is walked in turn.
@@ -390,11 +397,27 @@ mod tests {
         for port in 9003..9003 + 2 * GOSSIP_PEERS_PER_ROUND as u16 {
             cluster_info.insert_info(node(7, Some(port)));
         }
-        let source = gossip_history_peers(cluster_info);
+        let source = gossip_history_peers(cluster_info.clone());
         let mut asked: Vec<String> = (0..3).flat_map(|_| names(source())).collect();
         assert_eq!(asked.len(), 3 * GOSSIP_PEERS_PER_ROUND);
         asked.sort_unstable();
         asked.dedup();
         assert_eq!(asked.len(), 2 * GOSSIP_PEERS_PER_ROUND + 2);
+
+        // Nodes that say they serve light-client proofs: only they are
+        // asked.
+        for port in [9900, 9901] {
+            let mut serving = node(7, Some(port));
+            serving.set_serves_light_client_proofs(true);
+            cluster_info.insert_info(serving);
+        }
+        let mut not_ours = node(8, Some(9902));
+        not_ours.set_serves_light_client_proofs(true);
+        cluster_info.insert_info(not_ours);
+        let source = gossip_history_peers(cluster_info);
+        assert_eq!(
+            names(source()),
+            ["http://127.0.0.1:9900", "http://127.0.0.1:9901"]
+        );
     }
 }

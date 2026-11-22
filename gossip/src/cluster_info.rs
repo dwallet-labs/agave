@@ -908,6 +908,15 @@ impl ClusterInfo {
         })
     }
 
+    /// Says in this node's contact info whether it serves light-client
+    /// proofs over its RPC address, and publishes the change.
+    pub fn set_serves_light_client_proofs(&self, serves: bool) {
+        self.my_contact_info
+            .write()
+            .set_serves_light_client_proofs(serves);
+        self.refresh_my_gossip_contact_info();
+    }
+
     fn refresh_my_gossip_contact_info(&self) {
         let keypair = self.keypair();
         let node = {
