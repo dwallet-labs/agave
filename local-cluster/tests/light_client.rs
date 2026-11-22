@@ -2536,29 +2536,17 @@ fn test_light_client_restart_after_switch_slot() {
     let (_, program_account) = finalized_account(&rpc, &tc.program);
     let program_hash = hash_of(&tc.program, &program_account.unwrap());
 
-    // A snapshot at or after the switch slot, then the restart, before the
-    // base leaves of generation 1 are removed.
-    wait_for_finalized(&rpc, SWITCH + 2);
-    let snapshot = loop {
-        let snapshot = tc.cluster.wait_for_next_full_snapshot(
-            &snapshot_config
-                .validator_config
-                .snapshot_config
-                .full_snapshot_archives_dir,
-            Some(TIMEOUT),
-        );
-        if snapshot.slot() >= SWITCH {
-            break snapshot;
-        }
-    };
+    // The node is stopped as soon as it has rooted a block after the switch
+    // slot: 76 slots (30 seconds) before the base leaves of generation 1
+    // are removed. No snapshot is waited for: on restart the node replays
+    // its own ledger from its latest snapshot, whichever that is, up to
+    // its last root, and the banks it has from there on hold generation 2
+    // only.
     let pubkey = tc.node_pubkey(RESTARTED);
+    wait_for_finalized(&tc.rpc(RESTARTED), SWITCH + 4);
     let rooted_before = finalized_slot(&tc.rpc(RESTARTED));
     let info = tc.cluster.exit_node(&pubkey);
-    info!(
-        "snapshot of node {RESTARTED} at slot {}; it had finalized slot {rooted_before} when it \
-         was stopped",
-        snapshot.slot()
-    );
+    info!("node {RESTARTED} had finalized slot {rooted_before} when it was stopped");
     assert!(
         rooted_before + 8 < BASE_REMOVED,
         "the node was stopped too late for this test (slot {rooted_before})"
@@ -2635,7 +2623,7 @@ fn test_light_client_restart_after_switch_slot() {
         .verify_nonexistent(&block, &recipient)
         .unwrap();
     // The blocks of the generation in use since the switch slot too.
-    let block = verifier.verify_block(&rpc_restarted, snapshot.slot());
+    let block = verifier.verify_block(&rpc_restarted, rooted_before);
     verify_state(
         &rpc_restarted,
         &schedule,
