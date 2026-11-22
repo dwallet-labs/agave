@@ -204,7 +204,11 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
             .number_of_values(1)
             .requires("enable_light_client_proofs")
             .help(
-                "JSON RPC URL of a node that serves light-client proofs, asked for the block                  history leaves this node does not have after it starts from a snapshot made                  elsewhere. What it gives is checked against this node's own blocks. May be                  given more than once",
+                "JSON RPC URL of a node that serves light-client proofs, asked for the block \
+                 history leaves this node does not have after it starts from a snapshot made \
+                 elsewhere. What it gives is checked against this node's own blocks. May be \
+                 given more than once. Without it, nodes that publish an RPC address in \
+                 gossip are asked",
             ),
         Arg::with_name("rpc_scan_and_fix_roots")
             .long("rpc-scan-and-fix-roots")

@@ -104,7 +104,9 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rpc::{
-        light_client_proofs::{LightClientProofConfig, LightClientProofStore},
+        light_client_proofs::{
+            LightClientProofConfig, LightClientProofStore, history_peer::gossip_history_peers,
+        },
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
             BankNotificationSenderConfig, OptimisticallyConfirmedBank,
@@ -1230,7 +1232,7 @@ impl Validator {
                 )
             };
             let light_client_proofs = light_client_proofs_enabled(config).then(|| {
-                Arc::new(LightClientProofStore::new(
+                let store = Arc::new(LightClientProofStore::new(
                     LightClientProofConfig {
                         retained_blocks: config.rpc_config.light_client_proof_retained_blocks,
                         history_peers: config.rpc_config.light_client_proof_history_peers.clone(),
@@ -1238,7 +1240,11 @@ impl Validator {
                         ..LightClientProofConfig::default()
                     },
                     blockstore.clone(),
-                ))
+                ));
+                // Without `--light-client-proof-history-peer`, the nodes
+                // to ask are found in gossip.
+                store.set_history_peer_source(gossip_history_peers(cluster_info.clone()));
+                store
             });
             let rpc_svc_config = JsonRpcServiceConfig {
                 rpc_addr,
