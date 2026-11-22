@@ -1244,6 +1244,8 @@ impl Validator {
                 // Without `--light-client-proof-history-peer`, the nodes
                 // to ask are found in gossip.
                 store.set_history_peer_source(gossip_history_peers(cluster_info.clone()));
+                // Other nodes find this one the same way.
+                cluster_info.set_serves_light_client_proofs(true);
                 store
             });
             let rpc_svc_config = JsonRpcServiceConfig {

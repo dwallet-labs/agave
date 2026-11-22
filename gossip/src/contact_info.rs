@@ -143,8 +143,17 @@ define_tlv_enum!(
     /// Always add new TLV records to the end of this enum.
     /// Never reorder or reuse a type.
     /// Ensure new type collisions do not happen.
-    pub(crate) enum Extension {}
+    pub(crate) enum Extension {
+        // The type number is a placeholder of the light-client prototype:
+        // a number must be assigned with the other validator clients
+        // before this is used on a public cluster.
+        76 => LightClientProofs(u8),
+    }
 );
+
+/// Version of the light-client proof methods a node says it serves over
+/// its RPC address (see [`ContactInfo::serves_light_client_proofs`]).
+pub const LIGHT_CLIENT_PROOFS_VERSION: u8 = 1;
 
 // As part of deserialization, self.addrs and self.sockets should be cross
 // verified and self.cache needs to be populated. This type is the raw wire
@@ -287,6 +296,24 @@ impl ContactInfo {
         // Need to update ContactInfo.outset so that this node's contact-info
         // will override older node with the same pubkey.
         self.outset = get_node_outset();
+    }
+
+    /// Whether the node says it serves light-client proofs over its RPC
+    /// address, so that a node looking for one need not ask every RPC node.
+    /// A node that says so is not trusted more for it.
+    pub fn serves_light_client_proofs(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| matches!(extension, Extension::LightClientProofs(_)))
+    }
+
+    pub fn set_serves_light_client_proofs(&mut self, serves: bool) {
+        self.extensions
+            .retain(|extension| !matches!(extension, Extension::LightClientProofs(_)));
+        if serves {
+            self.extensions
+                .push(Extension::LightClientProofs(LIGHT_CLIENT_PROOFS_VERSION));
+        }
     }
 
     pub fn set_wallclock(&mut self, wallclock: u64) {
@@ -905,6 +932,26 @@ mod tests {
         };
         let bytes = wincode::serialize(&node).unwrap();
         assert!(wincode::deserialize::<ContactInfo>(&bytes).is_err());
+    }
+
+    /// The light-client marker survives the wire, and a contact info
+    /// without it is the same bytes as before the marker existed.
+    #[test]
+    fn test_serves_light_client_proofs() {
+        let mut node = ContactInfo::new_localhost(&Pubkey::new_unique(), /*wallclock:*/ 7);
+        assert!(!node.serves_light_client_proofs());
+        let plain = wincode::serialize(&node).unwrap();
+        node.set_serves_light_client_proofs(true);
+        node.set_serves_light_client_proofs(true);
+        assert_eq!(node.extensions.len(), 1);
+        let bytes = wincode::serialize(&node).unwrap();
+        // One record: its type, its length, the version.
+        assert_eq!(bytes.len(), plain.len() + 3);
+        let other: ContactInfo = wincode::deserialize(&bytes).unwrap();
+        assert!(other.serves_light_client_proofs());
+        assert_eq!(other, node);
+        node.set_serves_light_client_proofs(false);
+        assert_eq!(wincode::serialize(&node).unwrap(), plain);
     }
 
     #[test]

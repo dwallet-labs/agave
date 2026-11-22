@@ -67,11 +67,13 @@
 //! A bank that must compute slot 5 with generation `E` (at or after
 //! `switch_slot(E)`) waits for its base. A job that fails is run again in
 //! the background, a few times with growing pauses, so that the half epoch
-//! it has is used. If it fails for good, the bank rebuilds the base
-//! synchronously by a scan of its parent (verified the same way) and, if
-//! that fails too, has a [`CommitmentFailure`]. A base whose job failed for
-//! good, or is still running a quarter of the epoch in, is logged once with
-//! a metric, well before a block needs it.
+//! it has is used. If it fails for good, the next block frozen in the
+//! epoch starts a scan of its parent's state in the background in its
+//! place: another way to the same leaves. If that fails too, the bank that
+//! needs the base rebuilds it synchronously by the same scan (verified the
+//! same way) and, if that fails, has a [`CommitmentFailure`]. A base whose
+//! job failed for good, or is still running a quarter of the epoch in, is
+//! logged once with a metric, well before a block needs it.
 //!
 //! # Cost
 //!
@@ -205,6 +207,9 @@ pub struct BaseCell {
     rebuild_started: AtomicBool,
     /// Set once this cell was reported as late or failed.
     reported: AtomicBool,
+    /// Set once a scan was started in the background because the job of
+    /// this cell failed for good.
+    scan_started: AtomicBool,
 }
 
 impl std::fmt::Debug for BaseCell {
@@ -226,6 +231,7 @@ impl BaseCell {
             from_snapshot,
             rebuild_started: AtomicBool::new(false),
             reported: AtomicBool::new(false),
+            scan_started: AtomicBool::new(false),
         }
     }
 
@@ -242,6 +248,22 @@ impl BaseCell {
             _ => return None,
         };
         (!self.reported.swap(true, Ordering::Relaxed)).then_some(problem)
+    }
+
+    /// Makes a cell whose job failed for good pending again, for one more
+    /// job of another kind, and returns why it failed. `None` if it did not
+    /// fail, or was restarted before.
+    fn restart_after_failure(&self) -> Option<String> {
+        let mut state = self.state.lock().unwrap();
+        let BaseState::Failed(reason) = &*state else {
+            return None;
+        };
+        if self.scan_started.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        let reason = reason.clone();
+        *state = BaseState::Pending;
+        Some(reason)
     }
 
     pub fn id(&self) -> BaseId {
@@ -1051,37 +1073,98 @@ impl Bank {
         Ok(AccountsState { generations })
     }
 
-    /// Logs, once per base, a base of this bank's epoch that will not be
-    /// ready in time: its job failed for good, or is still running a
-    /// quarter of the epoch in (the base is needed from `switch`, half of
-    /// the epoch in). The first block that needs a base that is not there
-    /// waits for it, or rebuilds it with a scan of every account.
-    fn report_base_problems(&self, generations: &[Generation], switch: Slot) {
+    /// Looks, when this bank is frozen, at the bases of its epoch that a
+    /// block will need from `switch` (half of the epoch in), and returns
+    /// those reported now, each once:
+    ///
+    /// - A base whose job failed for good. The job is replaced by a scan of
+    ///   the state of this bank's parent, in the background: another way
+    ///   to the same leaves, which does not depend on what failed.
+    /// - A base whose job is still running a quarter of the epoch in.
+    ///
+    /// The first block that needs a base that is not there waits for it,
+    /// or rebuilds it itself by the same scan.
+    fn report_base_problems(
+        &self,
+        generations: &[Generation],
+        switch: Slot,
+    ) -> Vec<(BaseId, String)> {
         let epoch = self.epoch();
         let first_slot = self.epoch_schedule.get_first_slot_in_epoch(epoch);
         let late_from = first_slot.saturating_add(switch.saturating_sub(first_slot) / 2);
+        let mut problems = Vec::new();
         if self.slot() >= switch {
-            return;
+            return problems;
         }
         for generation in generations.iter().filter(|g| g.epoch == epoch) {
             let late = self.slot() >= late_from;
-            if let Some(problem) = generation.base.problem_to_report(late) {
-                let slots_left = switch.saturating_sub(self.slot());
-                warn!(
-                    "accounts state base {:?} is not ready at slot {}: {problem}. Blocks need \
-                     it from slot {switch}, in {slots_left} slots; the first that does will \
-                     wait for it or rebuild it by a scan of every account",
-                    generation.base.id,
-                    self.slot(),
-                );
-                datapoint_warn!(
-                    "accounts_state_base_not_ready",
-                    ("epoch", epoch, i64),
-                    ("slot", self.slot(), i64),
-                    ("slots_left", slots_left, i64),
-                );
-            }
+            let problem = match self.start_base_scan(generation) {
+                Some(reason) => format!(
+                    "its job failed: {reason}; a scan of the account state was started in its \
+                     place"
+                ),
+                None => match generation.base.problem_to_report(late) {
+                    Some(problem) => problem,
+                    None => continue,
+                },
+            };
+            let slots_left = switch.saturating_sub(self.slot());
+            warn!(
+                "accounts state base {:?} is not ready at slot {}: {problem}. Blocks need it \
+                 from slot {switch}, in {slots_left} slots; the first that does will wait for \
+                 it or rebuild it by a scan of every account",
+                generation.base.id,
+                self.slot(),
+            );
+            datapoint_warn!(
+                "accounts_state_base_not_ready",
+                ("epoch", epoch, i64),
+                ("slot", self.slot(), i64),
+                ("slots_left", slots_left, i64),
+            );
+            problems.push((generation.base.id, problem));
         }
+        problems
+    }
+
+    /// If the job of the base of `generation` failed for good, starts a
+    /// scan of the state of this bank's parent in its place, once per
+    /// base. Returns why the job failed, if the scan was started.
+    fn start_base_scan(&self, generation: &Generation) -> Option<String> {
+        let (parent, overlay) = self.base_scan_source(generation).ok()?;
+        let reason = generation.base.restart_after_failure()?;
+        let id = generation.base.id;
+        let dir = self.accounts_state_bases.dir.clone();
+        spawn_base_job(vec![generation.base.clone()], move || {
+            scan_base_trees(&parent, &dir, &[(id, &overlay)])
+        });
+        Some(reason)
+    }
+
+    /// What a scan needs to rebuild the base of `generation` from the
+    /// parent `X` of this bank: `X` and the overlay of the generation as
+    /// of `X`. `X` is either in the generation's epoch, and then holds
+    /// that overlay, or it is `P` itself, and the overlay is empty.
+    fn base_scan_source(
+        &self,
+        generation: &Generation,
+    ) -> Result<(Arc<Bank>, OverlayTree), String> {
+        let parent = self.parent().ok_or("the bank has no parent")?;
+        let overlay = if parent.epoch() == generation.epoch {
+            parent
+                .accounts_state()
+                .and_then(|state| {
+                    state
+                        .generation(generation.epoch)
+                        .map(|g| g.overlay.clone())
+                })
+                .ok_or("the parent does not hold the generation")?
+        } else if generation.base.id.parent == Some((parent.slot(), parent.hash())) {
+            new_overlay()
+        } else {
+            return Err("the parent is neither in the generation nor its base block".into());
+        };
+        Ok((parent, overlay))
     }
 
     /// The base cell of generation `epoch` for a chain whose last block before
@@ -1267,21 +1350,7 @@ impl Bank {
     /// this bank: `X` is either in the generation's epoch, and then holds its
     /// overlay as of `X`, or it is `P` itself.
     fn rebuild_base_from_parent(&self, generation: &Generation) -> Result<Hash, String> {
-        let parent = self.parent().ok_or("the bank has no parent")?;
-        let overlay = if parent.epoch() == generation.epoch {
-            parent
-                .accounts_state()
-                .and_then(|state| {
-                    state
-                        .generation(generation.epoch)
-                        .map(|g| g.overlay.clone())
-                })
-                .ok_or("the parent does not hold the generation")?
-        } else if generation.base.id.parent == Some((parent.slot(), parent.hash())) {
-            new_overlay()
-        } else {
-            return Err("the parent is neither in the generation nor its base block".into());
-        };
+        let (parent, overlay) = self.base_scan_source(generation)?;
         let tree = scan_base_trees(
             &parent,
             &self.accounts_state_bases.dir,
