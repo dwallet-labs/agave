@@ -31,7 +31,7 @@ use {
     solana_keypair::{Keypair, keypair_from_seed},
     solana_light_client::{
         CertificateKind, CommittedBlock, EpochSchedule, Error as VerifyError, LightClient,
-        SignerSet, account_hash,
+        SignerSet, account_hash, history_leaf,
         rpc::{
             AccountDelta, AccountDeltaResponse, AccountStateResponse, BlockHistoryResponse,
             EpochBoundaryResponse, Finality, FinalityResponse, TransactionResponse,
@@ -39,6 +39,7 @@ use {
         },
         solana_merkle_tree::{
             accounts_state::{AccountLookup, BaseAbsenceProof, BaseLookup},
+            commitment_tree::{AppendOnlyFrontier, TreeId},
             receipt_tree::{EventKind, InstructionAccountMeta, ReceiptStatus, log_data_payload},
         },
     },
@@ -57,6 +58,7 @@ use {
     solana_program_binaries::bpf_loader_upgradeable_program_accounts,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
+    solana_rpc::light_client_proofs::history_peer::{HistoryPeer, RpcHistoryPeer},
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
         client_error::{Error as ClientError, ErrorKind as ClientErrorKind},
@@ -2300,10 +2302,19 @@ fn test_light_client_restart_from_snapshot() {
             Some(epoch)
         }
     };
+    // Those of the generation before, which no bank holds after a restart
+    // past its switch slot, have theirs from the overlay the node wrote
+    // when that generation ended, if the base leaves are still on disk (with
+    // these short epochs they may not be); if not, the node says so.
     let mut states_served = 0;
+    let mut ended_served = 0;
+    let mut ended_not_served = 0;
     for slot in &slots {
         let block = verifier.verify_block(&rpc_restarted, *slot);
-        if generation_of(*slot).is_some() && generation_of(*slot) == generation_of(first_new) {
+        if generation_of(*slot).is_none() {
+            continue;
+        }
+        if generation_of(*slot) == generation_of(first_new) {
             verify_state(
                 &rpc_restarted,
                 &schedule,
@@ -2312,9 +2323,33 @@ fn test_light_client_restart_from_snapshot() {
                 Some(&program_hash),
             );
             states_served += 1;
+            continue;
+        }
+        match rpc_restarted.get_account_state_proof(
+            &tc.program,
+            RpcAccountStateProofConfig { slot: Some(*slot) },
+        ) {
+            Ok(response) => {
+                AccountStateResponse::try_from(&response)
+                    .unwrap()
+                    .proof
+                    .verify(&block, &tc.program, &program_hash)
+                    .unwrap();
+                ended_served += 1;
+            }
+            Err(err) => {
+                expect_proof_error::<()>(
+                    Err(err),
+                    JSON_RPC_SERVER_ERROR_LIGHT_CLIENT_DATA_NOT_AVAILABLE,
+                );
+                ended_not_served += 1;
+            }
         }
     }
-    info!("after the restart: the accounts state of {states_served} of those blocks is served");
+    info!(
+        "after the restart: the accounts state of {states_served} of those blocks is served,          and of {ended_served} of the {} blocks of the generation that ended",
+        ended_served + ended_not_served
+    );
     info!(
         "after the restart: {} blocks from {:?} to {:?} served (the cluster had finalized \
          {finalized_before} before the restart)",
@@ -2335,6 +2370,48 @@ fn test_light_client_restart_from_snapshot() {
         .verify_ancestor(&block_new, &response.history)
         .unwrap();
     assert_eq!(ancestor.commitment_root(), block_t0.commitment_root());
+
+    // The history leaves, as a node that starts from a snapshot made
+    // elsewhere asks another node for them, over JSON RPC: the frontier
+    // and the leaves a node gives have the history root of the verified
+    // block.
+    let leaf_count = response.history.proof.leaf_count;
+    let peer = RpcHistoryPeer::new(rpc.url());
+    let mut frontier: Option<AppendOnlyFrontier> = None;
+    let mut next = 1u64;
+    while next < leaf_count {
+        let page = peer.history_leaves(next, 100, frontier.is_none()).unwrap();
+        assert!(page.leaf_count >= leaf_count);
+        assert_eq!(page.start, next);
+        let frontier = frontier.get_or_insert_with(|| {
+            let roots = page
+                .frontier
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|root| root.parse().unwrap())
+                .collect();
+            AppendOnlyFrontier::from_parts(1, roots).unwrap()
+        });
+        for leaf in page.leaves.iter().take((leaf_count - next) as usize) {
+            frontier
+                .append(
+                    TreeId::BLOCK_HISTORY,
+                    &history_leaf(
+                        leaf.slot,
+                        &leaf.block_id.parse().unwrap(),
+                        &leaf.commitment_root.parse().unwrap(),
+                    ),
+                )
+                .unwrap();
+            next += 1;
+        }
+    }
+    assert_eq!(
+        frontier.unwrap().root(TreeId::BLOCK_HISTORY),
+        response.history.block_history_root
+    );
+    info!("history leaves 1 to {leaf_count} from node 0 have the verified history root");
 
     // After the restart: a transfer to the same account, proven by the
     // restarted node: the receipt, the delta, and the state from the accounts

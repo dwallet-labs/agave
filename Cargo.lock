@@ -9215,6 +9215,7 @@ dependencies = [
  "solana-pubkey 4.4.0",
  "solana-pubsub-client",
  "solana-rent",
+ "solana-rpc",
  "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-runtime",
