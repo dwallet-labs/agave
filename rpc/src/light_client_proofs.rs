@@ -80,8 +80,12 @@
 //!   commitment root in its footer, checked against the history of the
 //!   first new block. If blockstore does not have the blocks of the gap
 //!   (the node started from a snapshot made elsewhere), the history
-//!   restarts at the first new block: older blocks are then served with
-//!   their own certificates only.
+//!   restarts at the first new block, and a thread of the store asks the
+//!   nodes of [`LightClientProofConfig::history_peers`] for the leaves
+//!   before it ([`history_peer`]). What a peer gives is used only if it
+//!   has exactly the history root of that block. Until then, and if no
+//!   peer gives them, older blocks are served with their own certificates
+//!   only.
 //! - **Accounts state.** The trees are not written: they are shared
 //!   between blocks and with the banks. Each block file has instead, for
 //!   every account the block changed, what the overlay held for it before
@@ -166,9 +170,16 @@ use {
     },
 };
 
+pub mod history_peer;
 mod persist;
 
-use persist::{BlockRecord, DiskWriter, EndedOverlay, Job, Persistence};
+use {
+    history_peer::{
+        FetchTarget, HistoryPeer, MAX_HISTORY_LEAVES_PER_REQUEST, RpcHistoryLeaf, RpcHistoryLeaves,
+        RpcHistoryPeer,
+    },
+    persist::{BlockRecord, DiskWriter, EndedOverlay, Job, Persistence},
+};
 
 /// Default number of rooted blocks whose proof data is kept.
 pub const DEFAULT_RETAINED_BLOCKS: usize = 1024;
@@ -189,6 +200,10 @@ pub struct LightClientProofConfig {
     /// Directory to keep the proof data in across restarts. `None`: in
     /// memory only.
     pub persist_dir: Option<PathBuf>,
+    /// JSON RPC URLs of nodes to ask for the history leaves this node does
+    /// not have after it starts from a snapshot made elsewhere (see
+    /// [`history_peer`]). They are not trusted.
+    pub history_peers: Vec<String>,
 }
 
 impl Default for LightClientProofConfig {
@@ -197,6 +212,7 @@ impl Default for LightClientProofConfig {
             retained_blocks: DEFAULT_RETAINED_BLOCKS,
             retained_history: DEFAULT_RETAINED_HISTORY,
             persist_dir: None,
+            history_peers: Vec::new(),
         }
     }
 }
@@ -724,6 +740,14 @@ impl HistorySnapshot {
     }
 }
 
+impl Drop for LightClientProofStore {
+    fn drop(&mut self) {
+        self.closing.store(true, Ordering::Relaxed);
+        self.finish_history_fetch();
+        self.finish_rebuild();
+    }
+}
+
 /// Where the finality of a block comes from, found under the store's lock.
 enum FinalitySource {
     Own(FinalityProof),
@@ -823,6 +847,12 @@ pub struct LightClientProofStore {
     /// Blocks read back from disk may still get their accounts state from
     /// the first banks rooted after the restart.
     states_to_rebuild: AtomicBool,
+    /// The nodes asked for history leaves this node does not have.
+    history_peers: RwLock<Vec<Arc<dyn HistoryPeer>>>,
+    /// The thread that asks them.
+    history_fetch: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set when the store is dropped: the threads of the store stop.
+    closing: Arc<AtomicBool>,
     /// The thread that reads back the overlay of an ended generation.
     ended_rebuild: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -839,7 +869,6 @@ impl LightClientProofStore {
             .as_ref()
             .and_then(|persistence| DiskWriter::start(persistence.clone(), inner.clone()));
         let store = Self {
-            config,
             blockstore,
             inner,
             certificates: Mutex::default(),
@@ -851,6 +880,16 @@ impl LightClientProofStore {
             writer,
             states_to_rebuild: AtomicBool::new(false),
             ended_rebuild: Mutex::default(),
+            history_peers: RwLock::new(
+                config
+                    .history_peers
+                    .iter()
+                    .map(|url| Arc::new(RpcHistoryPeer::new(url.clone())) as Arc<dyn HistoryPeer>)
+                    .collect(),
+            ),
+            history_fetch: Mutex::default(),
+            closing: Arc::default(),
+            config,
         };
         store.load();
         store.flush_writes();
@@ -1083,8 +1122,10 @@ impl LightClientProofStore {
             }
         }
         let ingested = !new_blocks.is_empty();
+        let mut restarted_history = None;
         if ingested {
             let mut inner = self.inner.write().unwrap();
+            let restarts = inner.history.restarts;
             if let Some((kept, leaves)) = backfill
                 && inner.history.len() == kept
             {
@@ -1110,6 +1151,18 @@ impl LightClientProofStore {
                 self.ingest(&mut inner, block, history, parent_slot);
             }
             self.prune(&mut inner);
+            // The history restarted at a frontier: the leaves before it are
+            // not on this node.
+            if inner.history.restarts != restarts && inner.history.base_len() > 1 {
+                restarted_history = Some(FetchTarget {
+                    frontier: inner.history.base.clone(),
+                    restarts: inner.history.restarts,
+                    leaves: self.config.retained_history as u64,
+                });
+            }
+        }
+        if let Some(target) = restarted_history {
+            self.fetch_history_from_peers(target);
         }
         if rebuild {
             Self::rebuild_accounts_states(&self.inner, &rooted_states, None);
@@ -1247,6 +1300,113 @@ impl LightClientProofStore {
                 });
             }
         }
+    }
+
+    /// Starts a thread that asks the history peers for the leaves before
+    /// `target`, if there are peers and no such thread is running.
+    fn fetch_history_from_peers(&self, target: FetchTarget) {
+        let peers = self.history_peers.read().unwrap().clone();
+        if peers.is_empty() {
+            return;
+        }
+        let mut thread = self.history_fetch.lock().unwrap();
+        if thread.as_ref().is_some_and(|thread| !thread.is_finished()) {
+            return;
+        }
+        let (inner, closing) = (self.inner.clone(), self.closing.clone());
+        let retained_history = self.config.retained_history;
+        *thread = std::thread::Builder::new()
+            .name("solLcProofHist".to_string())
+            .spawn(move || {
+                history_peer::fetch_history(&inner, &peers, target, retained_history, &closing)
+            })
+            .map_err(|err| warn!("light-client proofs: cannot start a thread: {err}"))
+            .ok();
+    }
+
+    /// Replaces the nodes asked for history leaves.
+    pub fn set_history_peers(&self, peers: Vec<Arc<dyn HistoryPeer>>) {
+        *self.history_peers.write().unwrap() = peers;
+    }
+
+    /// Waits for the thread of [`Self::fetch_history_from_peers`], if it
+    /// was started.
+    pub fn finish_history_fetch(&self) {
+        let thread = self.history_fetch.lock().unwrap().take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+
+    /// History leaves from index `start` on, at most `limit` and
+    /// [`MAX_HISTORY_LEAVES_PER_REQUEST`], for a node that does not have
+    /// them (see [`history_peer`]). With `with_frontier`, also the frontier
+    /// of the leaves before `start`, which costs one hash per kept leaf
+    /// before `start`.
+    pub fn history_leaves(
+        &self,
+        start: u64,
+        limit: usize,
+        with_frontier: bool,
+    ) -> ProofResult<RpcHistoryLeaves> {
+        let (leaf_count, base, before, entries) = {
+            let inner = self.inner.read().unwrap();
+            let log = &inner.history;
+            let not_kept = || {
+                data_not_available(
+                    inner.highest_root.unwrap_or_default(),
+                    format!(
+                        "history leaf {start} is not kept (kept: {} to {})",
+                        log.base_len(),
+                        log.len()
+                    ),
+                )
+            };
+            let offset = start
+                .checked_sub(log.base_len())
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|offset| *offset < log.entries.len())
+                .ok_or_else(not_kept)?;
+            let end = offset
+                .saturating_add(limit.clamp(1, MAX_HISTORY_LEAVES_PER_REQUEST))
+                .min(log.entries.len());
+            (
+                log.len(),
+                with_frontier.then(|| log.base.clone()),
+                if with_frontier {
+                    log.leaf_hashes[..offset].to_vec()
+                } else {
+                    Vec::new()
+                },
+                log.entries[offset..end].to_vec(),
+            )
+        };
+        // Outside the lock: the frontier before `start`.
+        let frontier = base.map(|mut frontier| {
+            for leaf_hash in before {
+                frontier
+                    .append_leaf_hash(leaf_hash)
+                    .expect("a history never holds 2^64 leaves");
+            }
+            frontier
+                .subtree_roots()
+                .iter()
+                .map(Hash::to_string)
+                .collect()
+        });
+        Ok(RpcHistoryLeaves {
+            leaf_count,
+            start,
+            frontier,
+            leaves: entries
+                .into_iter()
+                .map(|(slot, block_id, commitment_root)| RpcHistoryLeaf {
+                    slot,
+                    block_id: block_id.to_string(),
+                    commitment_root: commitment_root.to_string(),
+                })
+                .collect(),
+        })
     }
 
     /// If a kept block is the last of a generation that ended, has no

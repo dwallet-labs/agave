@@ -73,6 +73,10 @@ impl FromClapArgMatches for JsonRpcConfig {
                 usize
             )
             .unwrap_or(DEFAULT_RETAINED_BLOCKS),
+            light_client_proof_history_peers: matches
+                .values_of("light_client_proof_history_peers")
+                .map(|urls| urls.map(str::to_string).collect())
+                .unwrap_or_default(),
         })
     }
 }
@@ -192,6 +196,16 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
                 "Number of finalized blocks whose light-client proof data is kept in memory \
                  [default: 1024]",
             ),
+        Arg::with_name("light_client_proof_history_peers")
+            .long("light-client-proof-history-peer")
+            .value_name("URL")
+            .takes_value(true)
+            .multiple(true)
+            .number_of_values(1)
+            .requires("enable_light_client_proofs")
+            .help(
+                "JSON RPC URL of a node that serves light-client proofs, asked for the block                  history leaves this node does not have after it starts from a snapshot made                  elsewhere. What it gives is checked against this node's own blocks. May be                  given more than once",
+            ),
         Arg::with_name("rpc_scan_and_fix_roots")
             .long("rpc-scan-and-fix-roots")
             .takes_value(false)
@@ -291,10 +305,11 @@ pub(super) mod tests {
     fn verify_args_struct_by_command_run_with_enable_light_client_proofs() {
         let default_run_args = crate::commands::run::args::RunArgs::default();
         assert!(!default_run_args.json_rpc_config.enable_light_client_proofs);
-        for (args, retained_blocks) in [
+        for (args, retained_blocks, history_peers) in [
             (
                 vec!["--full-rpc-api", "--enable-light-client-proofs"],
                 DEFAULT_RETAINED_BLOCKS,
+                vec![],
             ),
             (
                 vec![
@@ -302,8 +317,16 @@ pub(super) mod tests {
                     "--enable-light-client-proofs",
                     "--light-client-proof-retained-blocks",
                     "77",
+                    "--light-client-proof-history-peer",
+                    "http://a.example:8899",
+                    "--light-client-proof-history-peer",
+                    "http://b.example:8899",
                 ],
                 77,
+                vec![
+                    "http://a.example:8899".to_string(),
+                    "http://b.example:8899".to_string(),
+                ],
             ),
         ] {
             let expected_args = RunArgs {
@@ -311,6 +334,7 @@ pub(super) mod tests {
                     full_api: true,
                     enable_light_client_proofs: true,
                     light_client_proof_retained_blocks: retained_blocks,
+                    light_client_proof_history_peers: history_peers,
                     ..default_run_args.json_rpc_config.clone()
                 },
                 // As set by `--full-rpc-api`.

@@ -9982,6 +9982,7 @@ dependencies = [
  "solana-pubkey 4.4.0",
  "solana-rent",
  "solana-rpc",
+ "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-runtime",
  "solana-runtime-transaction",

@@ -204,6 +204,9 @@ pub struct JsonRpcConfig {
     pub enable_light_client_proofs: bool,
     /// Number of finalized blocks whose light-client proof data is kept.
     pub light_client_proof_retained_blocks: usize,
+    /// JSON RPC URLs of nodes asked for the block history leaves this node
+    /// does not have (see `LightClientProofConfig::history_peers`).
+    pub light_client_proof_history_peers: Vec<String>,
 }
 
 impl Default for JsonRpcConfig {
@@ -227,6 +230,7 @@ impl Default for JsonRpcConfig {
             disable_health_check: Default::default(),
             enable_light_client_proofs: false,
             light_client_proof_retained_blocks: DEFAULT_RETAINED_BLOCKS,
+            light_client_proof_history_peers: Vec::new(),
         }
     }
 }
