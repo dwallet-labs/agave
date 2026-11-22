@@ -164,6 +164,32 @@ impl<V: KeyedValue> Node<V> {
     }
 }
 
+/// How the two halves of a divided batch run (see
+/// [`KeyedTree::update_batch`]).
+pub trait Fork: Sync {
+    fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send;
+}
+
+/// Runs the two halves one after the other, on the calling thread.
+pub struct Sequential;
+
+impl Fork for Sequential {
+    fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        (a(), b())
+    }
+}
+
 /// `(bit, sibling)` pairs of a path.
 type Path = Vec<(u16, Hash)>;
 
@@ -333,6 +359,151 @@ impl<V: KeyedValue> KeyedTree<V> {
             },
             hash: OnceLock::new(),
         });
+    }
+
+    /// Applies a batch of updates and computes the hash of every node it
+    /// changes. The result is the tree that inserting the entries one by one
+    /// with [`Self::insert`] gives.
+    ///
+    /// `updates` are `(key, argument)` pairs sorted by key, with distinct
+    /// keys. The value stored for a key is `value(existing, argument)`, where
+    /// `existing` is the value the key has before the batch.
+    ///
+    /// The batch is divided along the branches at the top of the tree, and
+    /// `fork` decides how the two sides of a division run: [`Sequential`]
+    /// runs one after the other; a caller with a thread pool runs them on
+    /// two threads. A part with at most `min_parallel` updates is not
+    /// divided further.
+    pub fn update_batch<T, F>(
+        &mut self,
+        updates: &[(Key, T)],
+        value: &F,
+        fork: &impl Fork,
+        min_parallel: usize,
+    ) where
+        V: Send + Sync,
+        T: Sync,
+        F: Fn(Option<&V>, &T) -> V + Sync,
+    {
+        debug_assert!(updates.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let Some(((first_key, first), rest)) = updates.split_first() else {
+            return;
+        };
+        let rest = if self.root.is_none() {
+            self.root = Some(Node::leaf(*first_key, value(None, first)));
+            self.len = 1;
+            rest
+        } else {
+            updates
+        };
+        let tree_id = self.tree_id;
+        let root = self.root.as_mut().expect("tree is not empty");
+        self.len += Self::update_below(root, rest, value, fork, min_parallel.max(1), tree_id);
+        root.hash(tree_id);
+    }
+
+    /// Applies `updates` (sorted, not empty unless at the top) below `node`
+    /// and returns the number of new entries. Every key of `updates` agrees
+    /// with every key below `node` at the bits before the bit of the branch
+    /// above `node`, and at that bit.
+    fn update_below<T, F>(
+        node: &mut Arc<Node<V>>,
+        updates: &[(Key, T)],
+        value: &F,
+        fork: &impl Fork,
+        min_parallel: usize,
+        tree_id: TreeId,
+    ) -> u64
+    where
+        V: Send + Sync,
+        T: Sync,
+        F: Fn(Option<&V>, &T) -> V + Sync,
+    {
+        if updates.len() > min_parallel
+            && let NodeKind::Branch { bit, .. } = &node.kind
+            && Self::agree_before(node, updates, *bit)
+        {
+            let node = Arc::make_mut(node);
+            node.hash = OnceLock::new();
+            let NodeKind::Branch { bit, children } = &mut node.kind else {
+                unreachable!("checked above")
+            };
+            let bit = *bit;
+            // Sorted keys that agree before `bit`: those with the bit clear
+            // come first.
+            let (zeros, ones) =
+                updates.split_at(updates.partition_point(|(key, _)| key_bit(key, bit) == 0));
+            let [left, right] = children;
+            let (new_left, new_right) = fork.join(
+                || Self::update_side(left, zeros, value, fork, min_parallel, tree_id),
+                || Self::update_side(right, ones, value, fork, min_parallel, tree_id),
+            );
+            return new_left + new_right;
+        }
+        let mut new_entries = 0;
+        for (key, argument) in updates {
+            let (found, existing) = Self::descend_from(node, key);
+            match first_differing_bit(found, key) {
+                None => {
+                    let new_value = value(Some(existing), argument);
+                    Self::replace_value(Arc::make_mut(node), key, new_value);
+                }
+                Some(split_bit) => {
+                    Self::insert_new(node, *key, value(None, argument), split_bit);
+                    new_entries += 1;
+                }
+            }
+        }
+        new_entries
+    }
+
+    /// [`Self::update_below`] for one side of a divided batch, followed by
+    /// the hashes of that side, so they are computed by the thread that
+    /// changed it.
+    fn update_side<T, F>(
+        node: &mut Arc<Node<V>>,
+        updates: &[(Key, T)],
+        value: &F,
+        fork: &impl Fork,
+        min_parallel: usize,
+        tree_id: TreeId,
+    ) -> u64
+    where
+        V: Send + Sync,
+        T: Sync,
+        F: Fn(Option<&V>, &T) -> V + Sync,
+    {
+        if updates.is_empty() {
+            return 0;
+        }
+        let new_entries = Self::update_below(node, updates, value, fork, min_parallel, tree_id);
+        node.hash(tree_id);
+        new_entries
+    }
+
+    /// Whether every key of `updates` (sorted, not empty) agrees with the
+    /// keys below `node` at all bits before `bit`, the bit of `node`.
+    fn agree_before<T>(node: &Node<V>, updates: &[(Key, T)], bit: u16) -> bool {
+        // The keys between the first and the last share their common prefix.
+        let (Some((first, _)), Some((last, _))) = (updates.first(), updates.last()) else {
+            return false;
+        };
+        let (below, _) = Self::descend_from(node, first);
+        [first, last]
+            .into_iter()
+            .all(|key| first_differing_bit(below, key).is_none_or(|differs| differs >= bit))
+    }
+
+    /// The leaf reached by descending from `node` by the bits of `key`.
+    fn descend_from<'a>(mut node: &'a Node<V>, key: &Key) -> (&'a Key, &'a V) {
+        loop {
+            match &node.kind {
+                NodeKind::Leaf { key, value } => return (key, value),
+                NodeKind::Branch { bit, children } => {
+                    node = &children[usize::from(key_bit(key, *bit))];
+                }
+            }
+        }
     }
 
     /// Removes the entry of `key`. Returns its value. Like an insertion, it
@@ -581,6 +752,88 @@ mod tests {
                     reference_kth(tree_id, &s1).as_ref(),
                 ])
             }
+        }
+    }
+
+    /// Runs the two halves on two threads.
+    struct Threads;
+
+    impl Fork for Threads {
+        fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
+        where
+            A: FnOnce() -> RA + Send,
+            B: FnOnce() -> RB + Send,
+            RA: Send,
+            RB: Send,
+        {
+            std::thread::scope(|scope| {
+                let b = scope.spawn(b);
+                (a(), b.join().unwrap())
+            })
+        }
+    }
+
+    /// Keys in a few clusters that share long prefixes, so that branches
+    /// near the top skip bits and a batch has keys that split above them.
+    fn clustered_key(seed: u64) -> Key {
+        let mut key = hash(&seed.to_le_bytes()).to_bytes();
+        match seed % 4 {
+            0 => {}
+            1 => key[..3].copy_from_slice(&[0xab, 0xcd, 0xef]),
+            2 => key[..2].copy_from_slice(&[0xab, 0x01]),
+            _ => key[..20].fill(0x55),
+        }
+        key
+    }
+
+    #[test]
+    fn test_update_batch_matches_single_inserts() {
+        // The stored value keeps the first argument of a key in its second
+        // half, as the state overlay does.
+        let value = |existing: Option<&[u8; 16]>, argument: &u64| {
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&argument.to_le_bytes());
+            match existing {
+                Some(existing) => value[8..].copy_from_slice(&existing[8..]),
+                None => value[8..].copy_from_slice(&argument.to_le_bytes()),
+            }
+            value
+        };
+        for min_parallel in [1, 3, 1000] {
+            let mut expected = KeyedTree::<[u8; 16]>::new(TID);
+            let mut sequential = expected.clone();
+            let mut threaded = expected.clone();
+            let mut seed = 0u64;
+            for round in 0..40u64 {
+                let earlier = threaded.clone();
+                let earlier_root = earlier.root();
+                // New keys and keys of earlier rounds, sizes from 0 up.
+                let mut updates: Vec<(Key, u64)> = (0..round * 7 % 60)
+                    .map(|i| {
+                        seed += 1;
+                        let source = if i % 3 == 0 { seed / 2 } else { seed };
+                        (clustered_key(source), round * 1000 + i)
+                    })
+                    .collect();
+                updates.sort();
+                updates.dedup_by_key(|(key, _)| *key);
+                for (key, argument) in &updates {
+                    let new_value = value(expected.get(key), argument);
+                    expected.insert(*key, new_value);
+                }
+                sequential.update_batch(&updates, &value, &Sequential, min_parallel);
+                threaded.update_batch(&updates, &value, &Threads, min_parallel);
+                assert_eq!(sequential.len(), expected.len());
+                assert_eq!(sequential.root(), expected.root());
+                assert_eq!(threaded.len(), expected.len());
+                assert_eq!(threaded.root(), expected.root());
+                assert!(threaded.iter().eq(expected.iter()));
+                // A tree cloned before the batch is not changed by it.
+                assert_eq!(earlier.root(), earlier_root);
+            }
+            let entries: Vec<_> = expected.iter().map(|(k, v)| (*k, v.to_vec())).collect();
+            assert!(entries.len() > 500);
+            assert_eq!(threaded.root(), reference_root(TID, &entries));
         }
     }
 

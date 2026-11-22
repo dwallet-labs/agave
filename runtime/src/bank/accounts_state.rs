@@ -73,9 +73,10 @@
 //!
 //! Per block, for each changed account and each generation in use, one path
 //! update in the overlay (`O(depth)` node copies) and the hashes of the changed
-//! nodes, each hashed once when the root is computed. An overlay entry costs a
-//! leaf node and a branch node (about 250 bytes) and is shared by every bank
-//! that holds the generation.
+//! nodes, each hashed once. A block with many changed accounts is divided
+//! along the top branches of the overlay and spread over a few threads
+//! ([`update_overlays`]). An overlay entry costs a leaf node and a branch node
+//! (about 250 bytes) and is shared by every bank that holds the generation.
 //!
 //! The leaves of a base tree, 64 bytes per account, are in a file that is
 //! mapped, not in memory (see [`base_files`]): the leaves of the two latest
@@ -105,15 +106,16 @@ use {
         accounts_state::{
             AccountProof, AccountsStateOpening, BaseTree, DeriveError, OverlayEntry,
             OverlaySubstitution, OverlayTree, account_lookup, accounts_state_root,
-            apply_block_changes, apply_overlay_into, new_overlay,
+            apply_block_changes_batch, apply_overlay_into, new_overlay,
         },
+        keyed_tree::{Fork, Sequential},
     },
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
         path::Path,
         sync::{
-            Arc, Condvar, Mutex, Weak,
+            Arc, Condvar, LazyLock, Mutex, Weak,
             atomic::{AtomicBool, Ordering},
         },
     },
@@ -562,6 +564,63 @@ fn reuse_base_file(dir: &BaseDir, cell: &BaseCell) -> Option<BaseTree> {
     }
 }
 
+/// A block with fewer changed accounts than this updates its overlays on
+/// the thread that freezes it.
+const MIN_CHANGES_FOR_OVERLAY_POOL: usize = 128;
+
+/// The smallest part of a block's changes that is given to another thread.
+const MIN_CHANGES_PER_OVERLAY_TASK: usize = 32;
+
+/// The threads that update the overlays of a block when it is frozen. Not
+/// the threads of the base trees: those are busy for a minute or more after
+/// each epoch starts, and a block must not wait for them.
+static OVERLAY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get() / 4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.clamp(1, 8))
+        .thread_name(|index| format!("solAcctStOvl{index:02}"))
+        .build()
+        .expect("a thread pool for overlays")
+});
+
+/// Divides a batch with `rayon::join`, on the pool it is called from.
+struct RayonFork;
+
+impl Fork for RayonFork {
+    fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        rayon::join(a, b)
+    }
+}
+
+/// Applies the changed accounts of a block (sorted by address) to the
+/// overlay of each generation, and computes the hashes of the overlay nodes
+/// that change. A block with many changes is spread over the overlay
+/// threads, by parts of the address space and by generation.
+fn update_overlays(generations: &mut [Generation], changes: &[(Address, (Hash, Hash))]) {
+    if changes.len() < MIN_CHANGES_FOR_OVERLAY_POOL {
+        for generation in generations {
+            apply_block_changes_batch(&mut generation.overlay, changes, &Sequential, usize::MAX);
+        }
+        return;
+    }
+    OVERLAY_POOL.install(|| {
+        generations.par_iter_mut().for_each(|generation| {
+            apply_block_changes_batch(
+                &mut generation.overlay,
+                changes,
+                &RayonFork,
+                MIN_CHANGES_PER_OVERLAY_TASK,
+            );
+        });
+    });
+}
+
 /// One generation held by a bank: its epoch, its overlay as of the bank, and
 /// its base.
 #[derive(Clone, Debug)]
@@ -805,16 +864,14 @@ impl Bank {
             }
         }
         debug_assert_eq!(delta.len(), prior.len());
-        for generation in &mut generations {
-            apply_block_changes(
-                &mut generation.overlay,
-                delta
-                    .entries()
-                    .iter()
-                    .zip(prior)
-                    .map(|(entry, before)| (&entry.address, before, &entry.account_hash)),
-            );
-        }
+        // Sorted by address, as the delta is.
+        let changes: Vec<(Address, (Hash, Hash))> = delta
+            .entries()
+            .iter()
+            .zip(prior)
+            .map(|(entry, before)| (entry.address, (*before, entry.account_hash)))
+            .collect();
+        update_overlays(&mut generations, &changes);
         Ok(AccountsState { generations })
     }
 
