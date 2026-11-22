@@ -29,7 +29,7 @@ use {
             ACCOUNTS_STATE_ROOT_PREFIX, InclusionProof, TreeId, hash_leaf, hash_root,
             make_inclusion_proof_from_leaf_hashes, tree_hash_from_leaf_hashes,
         },
-        keyed_tree::{KeyedTree, MembershipProof, NonMembershipProof},
+        keyed_tree::{Fork, KeyedTree, MembershipProof, NonMembershipProof},
     },
     solana_hash::Hash,
     solana_sha256_hasher::hashv,
@@ -130,6 +130,29 @@ pub fn apply_block_changes<'a>(
         };
         overlay.insert(*address, overlay_value(after, &base));
     }
+}
+
+/// [`apply_block_changes`] for a whole block at once, with the hashes of the
+/// changed overlay nodes computed too. `changes` are
+/// `(address, (account_hash before the block, account_hash after the block))`
+/// sorted by address, each address once. `fork` and `min_parallel` are those
+/// of [`KeyedTree::update_batch`]: with a `fork` that uses a thread pool, the
+/// work is spread over its threads.
+pub fn apply_block_changes_batch(
+    overlay: &mut OverlayTree,
+    changes: &[(Address, (Hash, Hash))],
+    fork: &impl Fork,
+    min_parallel: usize,
+) {
+    overlay.update_batch(
+        changes,
+        &|existing: Option<&OverlayValue>, (before, after): &(Hash, Hash)| {
+            let base = existing.map_or(*before, |value| split_overlay_value(value).1);
+            overlay_value(after, &base)
+        },
+        fork,
+        min_parallel,
+    );
 }
 
 /// One leaf of the base tree.

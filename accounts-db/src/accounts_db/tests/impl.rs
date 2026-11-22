@@ -905,6 +905,152 @@ fn test_scan_accounts_stays_aborted_across_steps() {
     assert_eq!(visited, 1);
 }
 
+/// The scan by bin, on several threads, gives the accounts the scan on one
+/// thread gives: versions in storage, newer versions in the write cache,
+/// accounts only in the write cache, and nothing of another fork.
+#[test]
+fn test_scan_accounts_by_bin_matches_scan_accounts() {
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let owner = Pubkey::default();
+    let pubkeys: Vec<_> = (0..2000).map(|_| Pubkey::new_unique()).collect();
+    let store = |slot: Slot, range: std::ops::Range<usize>| {
+        let account = AccountSharedData::empty(slot + 1, &owner);
+        let accounts: Vec<_> = pubkeys[range].iter().map(|key| (key, &account)).collect();
+        db.store_for_tests((slot, accounts.as_slice()));
+    };
+    store(1, 0..1000);
+    db.add_root_and_flush_write_cache(1);
+    store(2, 500..1500);
+    db.add_root_and_flush_write_cache(2);
+    // In the write cache: newer versions, and accounts not stored yet.
+    store(3, 900..1800);
+    // Another fork.
+    store(4, 0..2000);
+
+    let ancestors = Ancestors::from(vec![3, 2, 1]);
+    let bank_id = BankId::new(3);
+    let mut expected = Vec::new();
+    db.scan_accounts(
+        &ancestors,
+        bank_id,
+        |item| {
+            let (pubkey, account, slot) = item.unwrap();
+            expected.push((*pubkey, account, slot));
+        },
+        &ScanConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(expected.len(), 1800);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let found = Mutex::new(Vec::new());
+    pool.install(|| {
+        db.scan_accounts_by_bin(
+            &ancestors,
+            bank_id,
+            Vec::new,
+            |part, pubkey, account, slot| part.push((*pubkey, account, slot)),
+            |part| found.lock().unwrap().extend(part),
+            &ScanConfig::default(),
+        )
+    })
+    .unwrap();
+    let mut found = found.into_inner().unwrap();
+    found.sort_by_key(|(pubkey, _, _)| *pubkey);
+    expected.sort_by_key(|(pubkey, _, _)| *pubkey);
+    assert_eq!(found, expected);
+
+    // A removed bank fails the scan.
+    db.scan_tracker.mark_banks_removed([bank_id]);
+    let result = db.scan_accounts_by_bin(
+        &ancestors,
+        bank_id,
+        || (),
+        |_, _, _, _| panic!("the scan must not give accounts"),
+        |_| (),
+        &ScanConfig::default(),
+    );
+    assert_eq!(result, Err(ScanError::SlotRemoved { slot: 3, bank_id }));
+}
+
+/// Time to read every account and compute its lattice hash, on one thread
+/// and by bin on several. Run with `--ignored --nocapture`;
+/// `SCAN_BENCH_ACCOUNTS` and `SCAN_BENCH_THREADS` set the sizes.
+#[test]
+#[ignore]
+fn bench_scan_accounts_by_bin() {
+    let size = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let count = size("SCAN_BENCH_ACCOUNTS", 2_000_000);
+    let threads = size("SCAN_BENCH_THREADS", 3);
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let owner = Pubkey::new_unique();
+    let mut stored = 0;
+    let mut slot = 0;
+    while stored < count {
+        slot += 1;
+        let pubkeys: Vec<_> = (0..100_000.min(count - stored))
+            .map(|_| Pubkey::new_unique())
+            .collect();
+        let account = AccountSharedData::new(1 + slot, 165, &owner);
+        let accounts: Vec<_> = pubkeys.iter().map(|key| (key, &account)).collect();
+        db.store_for_tests((slot, accounts.as_slice()));
+        db.add_root_and_flush_write_cache(slot);
+        stored += pubkeys.len();
+    }
+    let ancestors = Ancestors::from(vec![slot]);
+    let bank_id = BankId::new(slot);
+
+    let start = Instant::now();
+    let mut one_thread = LtHash::identity();
+    db.scan_accounts(
+        &ancestors,
+        bank_id,
+        |item| {
+            let (pubkey, account, _) = item.unwrap();
+            one_thread.mix_in(&AccountsDb::lt_hash_account(&account, pubkey).0);
+        },
+        &ScanConfig::default(),
+    )
+    .unwrap();
+    println!(
+        "{count} accounts, one thread: {:.2} s",
+        start.elapsed().as_secs_f64()
+    );
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+    let start = Instant::now();
+    let by_bin = Mutex::new(LtHash::identity());
+    pool.install(|| {
+        db.scan_accounts_by_bin(
+            &ancestors,
+            bank_id,
+            LtHash::identity,
+            |part, pubkey, account, _| {
+                part.mix_in(&AccountsDb::lt_hash_account(&account, pubkey).0);
+            },
+            |part| by_bin.lock().unwrap().mix_in(&part),
+            &ScanConfig::default(),
+        )
+    })
+    .unwrap();
+    println!(
+        "{count} accounts, {threads} threads by bin: {:.2} s",
+        start.elapsed().as_secs_f64()
+    );
+    assert!(by_bin.into_inner().unwrap() == one_thread);
+}
+
 /// An index scan whose bank is removed via `mark_banks_removed` mid-scan aborts at the next account
 /// instead of scanning to completion.
 #[test]

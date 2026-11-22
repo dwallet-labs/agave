@@ -2483,6 +2483,130 @@ impl AccountsDb {
         Ok(())
     }
 
+    /// The accounts [`Self::scan_accounts`] gives, read by the threads of the
+    /// rayon pool this is called from, one bin of the accounts index at a
+    /// time on each. No order is guaranteed.
+    ///
+    /// A thread calls `new_part` when it starts a bin, `scan_func` for each
+    /// account of the bin, and `end_part` with the bin's state once the bin
+    /// is done. The accounts that are only in the write cache form one more
+    /// part, at the end.
+    pub(crate) fn scan_accounts_by_bin<P, F>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        new_part: impl Fn() -> P + Sync,
+        scan_func: F,
+        end_part: impl Fn(P) + Sync,
+        config: &ScanConfig,
+    ) -> ScanResult<()>
+    where
+        F: Fn(&mut P, &Pubkey, AccountSharedData, Slot) + Sync,
+    {
+        // As in `scan_accounts`: pin the scan, pick its ancestors, and take
+        // the cached versions first.
+        let scan_guard = ScanGuard::try_new(&self.scan_tracker, bank_id, || self.max_root())
+            .ok_or(ScanError::SlotRemoved {
+                slot: ancestors.max_slot(),
+                bank_id,
+            })?;
+        let max_root_ancestors = self.root_as_ancestors(scan_guard.max_root());
+        let ancestors = if scan_guard.should_use_ancestors(ancestors) {
+            ancestors
+        } else {
+            &max_root_ancestors
+        };
+        let mut max_root = scan_guard.max_root();
+        if let Some(min) = ancestors.min_slot() {
+            max_root = max_root.min(min);
+        }
+        let scan_guard = Mutex::new(scan_guard);
+        let stopped = AtomicBool::new(false);
+        let should_stop = || {
+            if !stopped.load(Ordering::Relaxed)
+                && (config.is_aborted() || scan_guard.lock().unwrap().is_bank_removed())
+            {
+                stopped.store(true, Ordering::Relaxed);
+            }
+            stopped.load(Ordering::Relaxed)
+        };
+
+        // The flag is set by the thread that gives the cached version.
+        let cached_pubkeys = self.accounts_cache.cached_pubkeys();
+        let mut cached_versions = ahash::HashMap::with_capacity(cached_pubkeys.len());
+        for pubkey in cached_pubkeys {
+            if should_stop() {
+                break;
+            }
+            if let Some((cached_account, slot)) =
+                self.accounts_cache.load_latest(&pubkey, ancestors)
+            {
+                cached_versions.insert(pubkey, (cached_account, slot, AtomicBool::new(false)));
+            }
+        }
+
+        (0..self.accounts_index.bins())
+            .into_par_iter()
+            .for_each(|bin| {
+                if should_stop() {
+                    return;
+                }
+                let mut part = new_part();
+                self.accounts_index.scan_accounts_in_bin(
+                    bin,
+                    ancestors,
+                    max_root,
+                    |pubkey, slot_list_item| {
+                        let slot = slot_list_item.slot();
+                        if let Some((cached_account, cache_slot, given)) =
+                            cached_versions.get(pubkey)
+                            && *cache_slot >= slot
+                        {
+                            given.store(true, Ordering::Relaxed);
+                            scan_func(
+                                &mut part,
+                                pubkey,
+                                cached_account.account.clone(),
+                                *cache_slot,
+                            );
+                            return;
+                        }
+                        // The cached version is older than the stored one:
+                        // it is not part of the state either way.
+                        if let Some((_, _, given)) = cached_versions.get(pubkey) {
+                            given.store(true, Ordering::Relaxed);
+                        }
+                        let mut account_accessor = self.get_account_accessor(slot_list_item);
+                        let account = account_accessor
+                            .get_loaded_account(|loaded_account| loaded_account.take_account());
+                        scan_func(&mut part, pubkey, account, slot);
+                    },
+                    || stopped.load(Ordering::Relaxed),
+                );
+                end_part(part);
+            });
+
+        // The pubkeys that are in the cache and not in the index at all.
+        let mut part = new_part();
+        for (pubkey, (cached_account, slot, given)) in cached_versions {
+            if should_stop() {
+                break;
+            }
+            if !given.into_inner() {
+                scan_func(&mut part, &pubkey, cached_account.account.clone(), slot);
+            }
+        }
+        end_part(part);
+
+        if scan_guard.into_inner().unwrap().was_scan_corrupted() {
+            return Err(ScanError::SlotRemoved {
+                slot: ancestors.max_slot(),
+                bank_id,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn index_scan_accounts<F>(
         &self,
         ancestors: &Ancestors,
