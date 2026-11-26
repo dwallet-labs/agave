@@ -1804,7 +1804,12 @@ mod serde_snapshot_tests {
                 }
                 if accounts_state.is_some() {
                     // The epoch boundary field between them, absent.
-                    serialize_into(&mut expected, &None::<SerdeEpochBoundary>).unwrap();
+                    serialize_into(
+                        &mut expected,
+                        &None::<SerdeEpochBoundary>,
+                        BANK_SNAPSHOT_CONFIG,
+                    )
+                    .unwrap();
                     serialize_into(&mut expected, &accounts_state, BANK_SNAPSHOT_CONFIG).unwrap();
                 }
                 assert_eq!(to_bytes(&fields), expected);
@@ -1856,9 +1861,24 @@ mod serde_snapshot_tests {
                 accounts_state: (mask & 4 != 0).then(|| accounts_state.clone()),
             };
             let mut encoded = [vec![], vec![], vec![]];
-            serialize_into(&mut encoded[0], &fields.block_commitment).unwrap();
-            serialize_into(&mut encoded[1], &fields.epoch_boundary).unwrap();
-            serialize_into(&mut encoded[2], &fields.accounts_state).unwrap();
+            serialize_into(
+                &mut encoded[0],
+                &fields.block_commitment,
+                BANK_SNAPSHOT_CONFIG,
+            )
+            .unwrap();
+            serialize_into(
+                &mut encoded[1],
+                &fields.epoch_boundary,
+                BANK_SNAPSHOT_CONFIG,
+            )
+            .unwrap();
+            serialize_into(
+                &mut encoded[2],
+                &fields.accounts_state,
+                BANK_SNAPSHOT_CONFIG,
+            )
+            .unwrap();
             let num_written = (0..3)
                 .rev()
                 .find(|i| mask & (1 << i) != 0)
