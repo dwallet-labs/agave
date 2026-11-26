@@ -1426,11 +1426,11 @@ mod serde_snapshot_tests {
         };
         let to_bytes = |fields: &CommitmentExtraFields| {
             let mut buf = vec![];
-            serialize_into(&mut buf, fields).unwrap();
+            serialize_into(&mut buf, fields, BANK_SNAPSHOT_CONFIG).unwrap();
             buf
         };
         let from_bytes = |bytes: &[u8]| -> CommitmentExtraFields {
-            deserialize_wincode_from(&mut BufReader::new(bytes)).unwrap()
+            deserialize_from(&mut BufReader::new(bytes), BANK_SNAPSHOT_CONFIG).unwrap()
         };
         let block_commitment = SerdeBlockCommitment {
             history_leaf_count: 1,
@@ -1458,12 +1458,12 @@ mod serde_snapshot_tests {
                 };
                 let mut expected = vec![];
                 if block_commitment.is_some() || accounts_state.is_some() {
-                    serialize_into(&mut expected, &block_commitment).unwrap();
+                    serialize_into(&mut expected, &block_commitment, BANK_SNAPSHOT_CONFIG).unwrap();
                 }
                 if accounts_state.is_some() {
                     // The place of the epoch boundary field.
                     expected.push(0);
-                    serialize_into(&mut expected, &accounts_state).unwrap();
+                    serialize_into(&mut expected, &accounts_state, BANK_SNAPSHOT_CONFIG).unwrap();
                 }
                 assert_eq!(to_bytes(&fields), expected);
                 assert_eq!(from_bytes(&expected), fields);
@@ -1480,10 +1480,12 @@ mod serde_snapshot_tests {
                     history_len: 5,
                 });
                 let mut with_boundary = vec![];
-                serialize_into(&mut with_boundary, &block_commitment).unwrap();
-                serialize_into(&mut with_boundary, &epoch_boundary).unwrap();
+                serialize_into(&mut with_boundary, &block_commitment, BANK_SNAPSHOT_CONFIG)
+                    .unwrap();
+                serialize_into(&mut with_boundary, &epoch_boundary, BANK_SNAPSHOT_CONFIG).unwrap();
                 if accounts_state.is_some() {
-                    serialize_into(&mut with_boundary, &accounts_state).unwrap();
+                    serialize_into(&mut with_boundary, &accounts_state, BANK_SNAPSHOT_CONFIG)
+                        .unwrap();
                 }
                 let read = from_bytes(&with_boundary);
                 assert_eq!(read.block_commitment, block_commitment);
@@ -1533,20 +1535,26 @@ mod serde_snapshot_tests {
             };
             let (_accounts_dir, dbank_paths) = get_temp_accounts_paths(4).unwrap();
             let copied_accounts = TempDir::new().unwrap();
-            let storage_and_next_append_vec_id =
-                copy_append_vecs(&bank1.rc.accounts.accounts_db, copied_accounts.path()).unwrap();
+            let mut dbank_accounts_db = AccountsDb::new_with_config(
+                dbank_paths,
+                ACCOUNTS_DB_CONFIG_FOR_TESTING,
+                None,
+                Arc::default(),
+            );
+            copy_append_vecs(
+                &bank1.rc.accounts.accounts_db,
+                copied_accounts.path(),
+                &mut dbank_accounts_db,
+            )
+            .unwrap();
             crate::serde_snapshot::bank_from_streams(
                 &mut snapshot_streams,
-                &dbank_paths,
-                storage_and_next_append_vec_id,
+                dbank_accounts_db,
                 &genesis_config,
                 &RuntimeConfig::default(),
                 None,
                 None,
                 false,
-                ACCOUNTS_DB_CONFIG_FOR_TESTING,
-                None,
-                Arc::default(),
             )
             .unwrap()
             .0
