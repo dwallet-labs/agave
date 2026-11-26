@@ -999,7 +999,7 @@ fn bench_scan_accounts_by_bin() {
         let pubkeys: Vec<_> = (0..100_000.min(count - stored))
             .map(|_| Pubkey::new_unique())
             .collect();
-        let account = AccountSharedData::new(1 + slot, 165, &owner);
+        let account = AccountSharedData::new_with_data(1 + slot, vec![0; 165], &owner);
         let accounts: Vec<_> = pubkeys.iter().map(|key| (key, &account)).collect();
         db.store_for_tests((slot, accounts.as_slice()));
         db.add_root_and_flush_write_cache(slot);
