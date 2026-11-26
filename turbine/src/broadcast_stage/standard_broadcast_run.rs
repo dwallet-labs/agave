@@ -1433,8 +1433,8 @@ mod test {
     /// Block Commitment Root: the leader binds the footer's `bank_hash` and
     /// `commitment_root` into the final leaf of the block id exactly as the
     /// receiving blockstore does, and binds nothing for a V1 footer.
-    #[test_case(false ; "footer_v1")]
-    #[test_case(true ; "footer_v2")]
+    #[test_case::test_case(false ; "footer_v1")]
+    #[test_case::test_case(true ; "footer_v2")]
     fn test_block_id_binds_footer(footer_v2: bool) {
         use solana_entry::block_component::{BlockFooterV1, VersionedBlockFooter};
         let (
@@ -1448,12 +1448,8 @@ mod test {
         ) = setup(DATA_SHREDS_PER_FEC_BLOCK as u64);
         let bank = new_child_bank(&parent_bank, 1);
         let (votor_event_sender, _votor_event_receiver) = bounded(1024);
-        let mut bs = StandardBroadcastRun::new(
-            0,
-            Arc::new(MigrationStatus::post_migration_status()),
-            votor_event_sender,
-            test_leader_schedule_cache(&bank),
-        );
+        let mut bs =
+            StandardBroadcastRun::new(0, votor_event_sender, test_leader_schedule_cache(&bank));
 
         let binding = FooterBinding {
             bank_hash: Hash::new_unique(),
