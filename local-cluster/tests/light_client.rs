@@ -1514,11 +1514,7 @@ fn test_light_client_proofs_single_node() {
     );
     let boundary = response.proof.verify(&block_e1, &schedule).unwrap();
     let rooted = rooted_slots(&rpc, 0, in_epoch_1);
-    let last_of_epoch_0 = *rooted
-        .iter()
-        .filter(|slot| **slot < first_slot_1)
-        .last()
-        .unwrap();
+    let last_of_epoch_0 = *rooted.iter().rfind(|slot| **slot < first_slot_1).unwrap();
     let first_of_epoch_1 = *rooted.iter().find(|slot| **slot >= first_slot_1).unwrap();
     assert_eq!(boundary.boundary.parent_slot, last_of_epoch_0);
     assert_eq!(boundary.boundary.first_slot, first_of_epoch_1);
@@ -1972,13 +1968,7 @@ fn test_light_client_epoch_handoff_four_nodes() {
         response.proof.verify(&block, &schedule).unwrap(),
         boundary_2
     );
-    let last_before = |first_slot| {
-        *rooted
-            .iter()
-            .filter(|slot| **slot < first_slot)
-            .last()
-            .unwrap()
-    };
+    let last_before = |first_slot| *rooted.iter().rfind(|slot| **slot < first_slot).unwrap();
     let first_from = |first_slot| *rooted.iter().find(|slot| **slot >= first_slot).unwrap();
     assert_eq!(boundary_1.boundary.parent_slot, last_before(first_slot_1));
     assert_eq!(boundary_1.boundary.first_slot, first_from(first_slot_1));
@@ -2940,11 +2930,7 @@ fn test_light_client_features_activated_on_running_cluster() {
         assert_eq!(feature_activated_at(&rpc, &feature), Some(first_slot_1));
     }
     let rooted = rooted_slots(&rpc, 0, first_slot_1 + 4);
-    let last_of_epoch_0 = *rooted
-        .iter()
-        .filter(|slot| **slot < first_slot_1)
-        .last()
-        .unwrap();
+    let last_of_epoch_0 = *rooted.iter().rfind(|slot| **slot < first_slot_1).unwrap();
     let first_of_epoch_1 = *rooted.iter().find(|slot| **slot >= first_slot_1).unwrap();
     expect_proof_error(
         rpc.get_finality_proof(last_of_epoch_0),
@@ -3059,11 +3045,7 @@ fn test_light_client_features_activated_on_running_cluster() {
     assert_eq!(schedule.get_epoch(committing.slot()), 1);
     assert_eq!(verifier.client.epoch(), 2);
     let rooted = rooted_slots(&rpc, first_slot_1, first_slot_2 + 4);
-    let last_of_epoch_1 = *rooted
-        .iter()
-        .filter(|slot| **slot < first_slot_2)
-        .last()
-        .unwrap();
+    let last_of_epoch_1 = *rooted.iter().rfind(|slot| **slot < first_slot_2).unwrap();
     let first_of_epoch_2 = *rooted.iter().find(|slot| **slot >= first_slot_2).unwrap();
     let block_e2 = verifier.verify_block(&rpc, first_of_epoch_2);
     let response = EpochBoundaryResponse::try_from(&when_final("getEpochBoundary(2)", || {
